@@ -94,6 +94,17 @@ install_node20_if_missing() {
   apt-get install -y nodejs
 }
 
+install_go_if_missing() {
+  if command -v go >/dev/null 2>&1; then
+    log "Go sudah ada: $(go version)"
+    return
+  fi
+  log "Install Go..."
+  apt-get update -y
+  apt-get install -y golang-go
+  log "Go installed: $(go version)"
+}
+
 install_xray() {
   if command -v xray >/dev/null 2>&1; then
     log "Xray sudah ada: $(xray version | head -n1)"
@@ -1024,6 +1035,196 @@ EOF
   node -e "require('sqlite3'); console.log('sqlite3 load ok')"
 }
 
+write_go_mux_files() {
+  log "Menulis Go SSH mux..."
+  mkdir -p "${APP_DIR}/go"
+  cat > "${APP_DIR}/go/ssh_mux.go" <<'EOF'
+package main
+
+import (
+	"bufio"
+	"bytes"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+func envOr(key, fallback string) string {
+	v := strings.TrimSpace(os.Getenv(key))
+	if v == "" {
+		return fallback
+	}
+	return v
+}
+
+func envInt(key string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n <= 0 {
+		return fallback
+	}
+	return n
+}
+
+func writeAll(conn net.Conn, data []byte) error {
+	remaining := data
+	for len(remaining) > 0 {
+		n, err := conn.Write(remaining)
+		if err != nil {
+			return err
+		}
+		remaining = remaining[n:]
+	}
+	return nil
+}
+
+func tunnelBoth(a, b net.Conn) {
+	defer a.Close()
+	defer b.Close()
+	done := make(chan struct{}, 2)
+	go func() {
+		_, _ = io.Copy(a, b)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(b, a)
+		done <- struct{}{}
+	}()
+	<-done
+}
+
+func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int) {
+	defer client.Close()
+	_ = client.SetDeadline(time.Now().Add(3 * time.Minute))
+	reader := bufio.NewReaderSize(client, 64*1024)
+
+	peek, err := reader.Peek(4)
+	if err == nil && string(peek) == "SSH-" {
+		sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+		if err != nil {
+			return
+		}
+		tunnelBoth(client, sshUp)
+		return
+	}
+
+	var raw bytes.Buffer
+	for {
+		line, err := reader.ReadBytes('\n')
+		if err != nil {
+			return
+		}
+		raw.Write(line)
+		if raw.Len() > 128*1024 {
+			return
+		}
+		if bytes.HasSuffix(raw.Bytes(), []byte("\r\n\r\n")) {
+			break
+		}
+	}
+
+	header := strings.ToLower(raw.String())
+	first := strings.ToLower(strings.TrimSpace(strings.SplitN(raw.String(), "\r\n", 2)[0]))
+
+	// CONNECT mode from payload apps.
+	if strings.HasPrefix(first, "connect ") {
+		_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+		raw.Reset()
+		for {
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
+				return
+			}
+			raw.Write(line)
+			if raw.Len() > 128*1024 {
+				return
+			}
+			if bytes.HasSuffix(raw.Bytes(), []byte("\r\n\r\n")) {
+				break
+			}
+		}
+		header = strings.ToLower(raw.String())
+	}
+
+	if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
+		sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+		if err != nil {
+			return
+		}
+		_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+		tunnelBoth(client, sshUp)
+		return
+	}
+
+	// keep API and xray ws paths reachable through the same mux.
+	if strings.Contains(first, " /vps/") || strings.Contains(first, " /vmess") || strings.Contains(first, " /vless") || strings.Contains(first, " /trojan") {
+		httpUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", httpHost, httpPort), 10*time.Second)
+		if err != nil {
+			return
+		}
+		if err := writeAll(httpUp, raw.Bytes()); err != nil {
+			_ = httpUp.Close()
+			return
+		}
+		tunnelBoth(client, httpUp)
+		return
+	}
+
+	// fallback to raw SSH.
+	sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+	if err != nil {
+		return
+	}
+	if err := writeAll(sshUp, raw.Bytes()); err != nil {
+		_ = sshUp.Close()
+		return
+	}
+	tunnelBoth(client, sshUp)
+}
+
+func main() {
+	port := envInt("SSH_WS_PORT", 2082)
+	sshHost := envOr("SSH_WS_TARGET_HOST", "127.0.0.1")
+	sshPort := envInt("SSH_WS_TARGET_PORT", 109)
+	httpHost := envOr("SSH_HTTP_BACKEND_HOST", "127.0.0.1")
+	httpPort := envInt("SSH_HTTP_BACKEND_PORT", 80)
+
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		fmt.Printf("listen error: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("ssh-ws go mux on 127.0.0.1:%d -> ssh %s:%d, http %s:%d\n", port, sshHost, sshPort, httpHost, httpPort)
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		go handleConn(conn, sshHost, sshPort, httpHost, httpPort)
+	}
+}
+EOF
+}
+
+build_go_files() {
+  log "Build Go binaries..."
+  mkdir -p "${APP_DIR}/bin"
+  (
+    cd "${APP_DIR}/go"
+    GO111MODULE=off go build -ldflags "-s -w" -o "${APP_DIR}/bin/ssh-mux" ssh_mux.go
+  )
+  chmod +x "${APP_DIR}/bin/ssh-mux"
+}
+
 write_iplimit_checker() {
   log "Menulis checker limit IP otomatis..."
   cat > "${APP_DIR}/iplimit-checker.js" <<'EOF'
@@ -1311,7 +1512,7 @@ After=network.target ssh.service dropbear.service
 Type=simple
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=${APP_DIR}/.env
-ExecStart=/usr/bin/node ${APP_DIR}/ssh-ws.js
+ExecStart=${APP_DIR}/bin/ssh-mux
 Restart=always
 RestartSec=2
 
@@ -1734,6 +1935,7 @@ main() {
   install_base_packages
   apply_system_optimizations
   install_node20_if_missing
+  install_go_if_missing
   install_xray
   setup_dropbear
   init_db
@@ -1741,6 +1943,8 @@ main() {
   setup_haproxy_tls_mux
   setup_zivpn_service_if_possible
   write_api_files
+  write_go_mux_files
+  build_go_files
   write_iplimit_checker
   setup_services
   write_cli_menu
@@ -1767,6 +1971,7 @@ Catatan:
 - Endpoint /vps/* sudah kompatibel pola bot kamu (create/trial/renew/delete/lock/unlock).
 - WS paths aktif: /ssh-ws, /ws, /vmess, /vless, /trojan (port 80 & 443)
 - Dropbear aktif di port ${DROPBEAR_PORT} dan ${DROPBEAR_ALT_PORT}; ssh-ws bridge default ke ${DROPBEAR_PORT}
+- SSH mux runtime sudah pakai Go binary: ${APP_DIR}/bin/ssh-mux
 - Untuk summary API, tinggal pakai scripts/setup-summary-api.sh di repo ini.
 - Jika binary zivpn belum ada, isi ZIVPN_BIN_URL lalu jalankan ulang script.
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
