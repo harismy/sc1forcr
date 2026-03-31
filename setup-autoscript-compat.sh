@@ -76,6 +76,7 @@ install_base_packages() {
   apt-get install -y \
     curl wget jq sqlite3 openssl uuid-runtime ca-certificates \
     gnupg lsb-release socat cron unzip \
+    haproxy \
     nginx certbot python3-certbot-nginx \
     openssh-server dropbear pwgen \
     build-essential python3 make g++ gcc libc6-dev pkg-config bzip2 zlib1g-dev
@@ -258,18 +259,20 @@ EOF
 }
 
 setup_nginx_and_cert() {
-  log "Setup Nginx vhost..."
+  log "Setup Nginx vhost (80 only)..."
+  mkdir -p /var/www/html
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOF
 server {
     listen 80;
     listen [::]:80;
     server_name ${DOMAIN};
+
+    location /.well-known/acme-challenge/ { root /var/www/html; }
+
     location = /cdn-cgi/trace {
         default_type text/plain;
         return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
     }
-
-    location /.well-known/acme-challenge/ { root /var/www/html; }
 
     location /vps/ {
         proxy_pass http://127.0.0.1:${API_PORT};
@@ -277,26 +280,6 @@ server {
         proxy_set_header Host \$host;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    location /ssh-ws {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /ws {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
     }
 
     location /vmess {
@@ -330,7 +313,6 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_method GET;
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
@@ -344,177 +326,57 @@ EOF
   systemctl enable nginx
   systemctl restart nginx
 
-  log "Issue cert Let's Encrypt..."
-  local cert_ok=0
-  if certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}" --redirect; then
-    cert_ok=1
-  else
-    cert_ok=0
-    log "Let's Encrypt gagal. Tetap lanjut mode HTTP dulu. Cek DNS domain + email lalu ulangi."
+  log "Issue cert Let's Encrypt (webroot)..."
+  if ! certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}"; then
+    log "Let's Encrypt gagal. Lanjut tanpa TLS 443 (haproxy belum diaktifkan)."
   fi
+}
 
-  if [[ "${cert_ok}" -ne 1 ]]; then
+setup_haproxy_tls_mux() {
+  local fullchain privkey pem
+  fullchain="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+  privkey="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
+  pem="/etc/haproxy/certs/${DOMAIN}.pem"
+
+  if [[ ! -s "${fullchain}" || ! -s "${privkey}" ]]; then
+    log "Sertifikat tidak ditemukan untuk ${DOMAIN}, skip setup haproxy 443."
     return 0
   fi
 
-  log "Pasang lokasi WS untuk Xray..."
-  cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOF
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${DOMAIN};
-    location = /cdn-cgi/trace {
-        default_type text/plain;
-        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
-    }
+  log "Setup HAProxy TLS mux di 443..."
+  mkdir -p /etc/haproxy/certs
+  cat "${fullchain}" "${privkey}" > "${pem}"
+  chmod 600 "${pem}"
 
-    location /vps/ {
-        proxy_pass http://127.0.0.1:${API_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
+  cat > /etc/haproxy/haproxy.cfg <<EOF
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    daemon
+    maxconn 50000
 
-    location /ssh-ws {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
+defaults
+    log global
+    mode tcp
+    option tcplog
+    timeout connect 10s
+    timeout client  2m
+    timeout server  2m
 
-    location /ws {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
+frontend ft_443
+    bind *:443 ssl crt ${pem} alpn h2,http/1.1
+    default_backend bk_mux
 
-    location /vmess {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10001;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /vless {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10002;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /trojan {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10003;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location / {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-}
-
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name ${DOMAIN};
-    location = /cdn-cgi/trace {
-        default_type text/plain;
-        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
-    }
-
-    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
-
-    location /vps/ {
-        proxy_pass http://127.0.0.1:${API_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    location /vmess {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10001;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /vless {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10002;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /trojan {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10003;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /ssh-ws {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /ws {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location / {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-}
+backend bk_mux
+    mode tcp
+    server mux_local 127.0.0.1:2082 check
 EOF
 
-  nginx -t
-  systemctl restart nginx
+  haproxy -c -f /etc/haproxy/haproxy.cfg
+  systemctl disable stunnel4 >/dev/null 2>&1 || true
+  systemctl stop stunnel4 >/dev/null 2>&1 || true
+  systemctl enable haproxy >/dev/null 2>&1 || true
+  systemctl restart haproxy >/dev/null 2>&1 || true
 }
 
 resolve_zivpn_bin_url() {
@@ -630,6 +492,8 @@ ZIVPN_CONFIG=/etc/zivpn/config.json
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
 SSH_WS_PORT=2082
 SSH_WS_TARGET_PORT=${DROPBEAR_PORT}
+SSH_HTTP_BACKEND_HOST=127.0.0.1
+SSH_HTTP_BACKEND_PORT=80
 EOF
 
   cat > "${APP_DIR}/api.js" <<'EOF'
@@ -1028,68 +892,125 @@ try { require('dotenv').config(); } catch (_) {}
 const PORT = Number(process.env.SSH_WS_PORT || 2082);
 const SSH_HOST = process.env.SSH_WS_TARGET_HOST || '127.0.0.1';
 const SSH_PORT = Number(process.env.SSH_WS_TARGET_PORT || 109);
+const HTTP_BACKEND_HOST = process.env.SSH_HTTP_BACKEND_HOST || '127.0.0.1';
+const HTTP_BACKEND_PORT = Number(process.env.SSH_HTTP_BACKEND_PORT || 80);
 
-function closePair(a, b) {
-  try { a.destroy(); } catch (_) {}
-  try { b.destroy(); } catch (_) {}
+function firstLine(head) {
+  const i = head.indexOf('\r\n');
+  return (i >= 0 ? head.slice(0, i) : head).trim();
 }
 
-// Compat mode for tunneling apps: accept loose HTTP Upgrade payload and then tunnel raw TCP.
 const server = net.createServer((client) => {
-  let headerDone = false;
-  let stash = Buffer.alloc(0);
   let upstream = null;
   let closed = false;
+  let stage = 'first';
+  let stash = Buffer.alloc(0);
 
-  const finish = () => {
+  const closeAll = () => {
     if (closed) return;
     closed = true;
-    if (upstream) closePair(client, upstream);
-    else { try { client.destroy(); } catch (_) {} }
+    try { client.destroy(); } catch (_) {}
+    try { if (upstream) upstream.destroy(); } catch (_) {}
   };
 
-  const connectUpstream = (firstPayload) => {
-    upstream = net.connect({ host: SSH_HOST, port: SSH_PORT }, () => {
-      const resp =
-        'HTTP/1.1 101 Switching Protocols\r\n' +
-        'Connection: Upgrade\r\n' +
-        'Upgrade: websocket\r\n' +
-        '\r\n';
-      client.write(resp);
+  const startPipeTo = (host, port, firstPayload, firstResponse) => {
+    upstream = net.connect({ host, port }, () => {
+      if (firstResponse) client.write(firstResponse);
       if (firstPayload && firstPayload.length > 0) upstream.write(firstPayload);
       client.pipe(upstream);
       upstream.pipe(client);
+      stage = 'tunnel';
     });
-    upstream.on('error', finish);
-    upstream.on('close', finish);
-    upstream.setTimeout(180000, finish);
+    upstream.on('error', closeAll);
+    upstream.on('close', closeAll);
+    upstream.setTimeout(180000, closeAll);
   };
 
-  client.on('data', (chunk) => {
-    if (headerDone) return;
+  const startRawSshTunnel = (firstPayload) => {
+    startPipeTo(SSH_HOST, SSH_PORT, firstPayload, null);
+  };
+
+  const startWsSshTunnel = (leftover) => {
+    startPipeTo(
+      SSH_HOST,
+      SSH_PORT,
+      leftover,
+      'HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n'
+    );
+  };
+
+  const startHttpProxy = (firstPayload) => {
+    startPipeTo(HTTP_BACKEND_HOST, HTTP_BACKEND_PORT, firstPayload, null);
+  };
+
+  const handleHttpLike = (chunk) => {
     stash = Buffer.concat([stash, chunk]);
     const idx = stash.indexOf('\r\n\r\n');
     if (idx < 0) {
-      if (stash.length > 16384) finish();
+      if (stash.length > 65536) {
+        // Payload terlalu random, fallback sebagai raw SSH.
+        startRawSshTunnel(stash);
+        stash = Buffer.alloc(0);
+      }
       return;
     }
-    headerDone = true;
-    const head = stash.slice(0, idx).toString('utf8').toLowerCase();
+
+    const headRaw = stash.slice(0, idx).toString('utf8');
+    const head = headRaw.toLowerCase();
+    const line = firstLine(headRaw).toLowerCase();
+    const parts = line.split(/\s+/);
+    const method = parts[0] || '';
+    const path = parts[1] || '';
     const rest = stash.slice(idx + 4);
-    if (!head.includes('upgrade: websocket')) {
-      client.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+    stash = Buffer.alloc(0);
+
+    if (stage === 'first' && method === 'connect') {
+      client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      stage = 'wait-upgrade';
+      if (rest.length > 0) handleHttpLike(rest);
       return;
     }
-    connectUpstream(rest);
+
+    if (head.includes('upgrade: websocket') || (head.includes('upgrade:') && head.includes('host:'))) {
+      startWsSshTunnel(rest);
+      return;
+    }
+
+    if (path.startsWith('/vps/') || path.startsWith('/vmess') || path.startsWith('/vless') || path.startsWith('/trojan')) {
+      const req = Buffer.concat([Buffer.from(headRaw + '\r\n\r\n', 'utf8'), rest]);
+      startHttpProxy(req);
+      return;
+    }
+
+    if (method && (method.startsWith('get') || method.startsWith('post') || method.startsWith('head') || method.startsWith('options'))) {
+      client.write('HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n');
+      stage = 'wait-upgrade';
+      if (rest.length > 0) handleHttpLike(rest);
+      return;
+    }
+
+    // Fallback: raw SSH.
+    startRawSshTunnel(Buffer.concat([Buffer.from(headRaw + '\r\n\r\n', 'utf8'), rest]));
+  };
+
+  client.on('data', (chunk) => {
+    if (stage === 'tunnel') return;
+
+    if (stage === 'first' && chunk.length >= 4 && chunk.slice(0, 4).toString() === 'SSH-') {
+      startRawSshTunnel(chunk);
+      return;
+    }
+
+    handleHttpLike(chunk);
   });
 
-  client.on('error', finish);
-  client.on('close', finish);
-  client.setTimeout(180000, finish);
+  client.on('error', closeAll);
+  client.on('close', closeAll);
+  client.setTimeout(180000, closeAll);
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log(`ssh-ws compat bridge on 127.0.0.1:${PORT} -> ${SSH_HOST}:${SSH_PORT}`);
+  console.log(`ssh-ws mux on 127.0.0.1:${PORT} -> ssh ${SSH_HOST}:${SSH_PORT}, http ${HTTP_BACKEND_HOST}:${HTTP_BACKEND_PORT}`);
 });
 EOF
 
@@ -1607,11 +1528,12 @@ service_menu() {
       systemctl status xray --no-pager | head -n 12
       systemctl status sc-1forcr-api --no-pager | head -n 12
       systemctl status sc-1forcr-sshws --no-pager | head -n 12
+      systemctl status haproxy --no-pager | head -n 12 || true
       systemctl status dropbear --no-pager | head -n 12 || true
       systemctl status "${ZIVPN_SERVICE}" --no-pager | head -n 12 || true
       ;;
     2)
-      systemctl restart ssh dropbear nginx xray sc-1forcr-api sc-1forcr-sshws
+      systemctl restart ssh dropbear nginx haproxy xray sc-1forcr-api sc-1forcr-sshws
       systemctl restart "${ZIVPN_SERVICE}" || true
       echo "Restart selesai."
       ;;
@@ -1646,7 +1568,7 @@ backup_restore_menu() {
 }
 
 change_domain_menu() {
-  local new_domain email app_env
+  local new_domain email app_env pem
   read -rp "Masukkan domain baru: " new_domain
   if [[ -z "${new_domain}" ]]; then
     echo "Domain tidak boleh kosong."
@@ -1655,247 +1577,17 @@ change_domain_menu() {
   read -rp "Masukkan email Let's Encrypt [admin@${new_domain}]: " email
   email="${email:-admin@${new_domain}}"
 
-  cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOFNGX
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${new_domain};
-    location = /cdn-cgi/trace {
-        default_type text/plain;
-        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
-    }
+  DOMAIN="${new_domain}"
+  EMAIL="${email}"
+  setup_nginx_and_cert
+  setup_haproxy_tls_mux
 
-    location /.well-known/acme-challenge/ { root /var/www/html; }
-
-    location /vps/ {
-        proxy_pass http://127.0.0.1:${API_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    location /ssh-ws {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /ws {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /vmess {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10001;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /vless {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10002;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /trojan {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10003;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location / {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-}
-EOFNGX
-
-  nginx -t && systemctl restart nginx
-  if ! certbot --nginx -d "${new_domain}" --non-interactive --agree-tos -m "${email}" --redirect; then
+  pem="/etc/haproxy/certs/${new_domain}.pem"
+  if [[ ! -s "${pem}" ]]; then
     echo "Gagal issue cert untuk domain ${new_domain}."
     echo "Pastikan A record domain mengarah ke VPS, lalu ulangi."
     return
   fi
-
-  cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOFNGX
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${new_domain};
-    location = /cdn-cgi/trace {
-        default_type text/plain;
-        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
-    }
-
-    location /vps/ {
-        proxy_pass http://127.0.0.1:${API_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    location /ssh-ws {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /ws {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /vmess {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10001;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /vless {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10002;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /trojan {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10003;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location / {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-}
-
-server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
-    server_name ${new_domain};
-    location = /cdn-cgi/trace {
-        default_type text/plain;
-        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
-    }
-
-    ssl_certificate /etc/letsencrypt/live/${new_domain}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${new_domain}/privkey.pem;
-
-    location /vps/ {
-        proxy_pass http://127.0.0.1:${API_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
-
-    location /vmess {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10001;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /vless {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10002;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /trojan {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:10003;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /ssh-ws {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location /ws {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-
-    location / {
-        proxy_redirect off;
-        proxy_pass http://127.0.0.1:2082;
-        proxy_http_version 1.1;
-        proxy_method GET;
-        proxy_set_header Upgrade "websocket";
-        proxy_set_header Connection "Upgrade";
-        proxy_set_header Host \$host;
-    }
-}
-EOFNGX
-  nginx -t && systemctl restart nginx
 
   if [[ -f /etc/sc-1forcr.env ]]; then
     if grep -q '^DOMAIN=' /etc/sc-1forcr.env; then
@@ -1917,8 +1609,7 @@ EOFNGX
     fi
   fi
 
-  DOMAIN="${new_domain}"
-  systemctl restart sc-1forcr-api
+  systemctl restart sc-1forcr-api sc-1forcr-sshws haproxy nginx
   echo "Domain berhasil diubah ke ${new_domain}"
 }
 
@@ -2010,6 +1701,8 @@ systemctl stop sc-1forcr-api >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-api >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-sshws >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-sshws >/dev/null 2>&1 || true
+systemctl stop haproxy >/dev/null 2>&1 || true
+systemctl disable haproxy >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-iplimit.service >/dev/null 2>&1 || true
@@ -2045,6 +1738,7 @@ main() {
   setup_dropbear
   init_db
   setup_nginx_and_cert
+  setup_haproxy_tls_mux
   setup_zivpn_service_if_possible
   write_api_files
   write_iplimit_checker
