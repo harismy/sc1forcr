@@ -18,6 +18,9 @@ set -euo pipefail
 #   ZIVPN_BIN_URL=https://.../zivpn-linux-amd64   (opsional)
 #   ZIVPN_RELEASE_TAG=udp-zivpn_1.4.9             (opsional, default dari repo zahidbd2/udp-zivpn)
 #   ZIVPN_SERVICE_NAME=zivpn
+#   DROPBEAR_PORT=109
+#   DROPBEAR_ALT_PORT=143
+#   DROPBEAR_VERSION=2019.78
 #   DB_PATH=/usr/sbin/potatonc/potato.db
 #   APP_DIR=/opt/sc-1forcr
 
@@ -30,6 +33,9 @@ API_PORT="${API_PORT:-8088}"
 ZIVPN_BIN_URL="${ZIVPN_BIN_URL:-}"
 ZIVPN_RELEASE_TAG="${ZIVPN_RELEASE_TAG:-udp-zivpn_1.4.9}"
 ZIVPN_SERVICE_NAME="${ZIVPN_SERVICE_NAME:-zivpn}"
+DROPBEAR_PORT="${DROPBEAR_PORT:-109}"
+DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
+DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}"
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Jalankan sebagai root."
@@ -71,8 +77,8 @@ install_base_packages() {
     curl wget jq sqlite3 openssl uuid-runtime ca-certificates \
     gnupg lsb-release socat cron unzip \
     nginx certbot python3-certbot-nginx \
-    openssh-server pwgen \
-    build-essential python3 make g++ gcc libc6-dev pkg-config
+    openssh-server dropbear pwgen \
+    build-essential python3 make g++ gcc libc6-dev pkg-config bzip2 zlib1g-dev
 }
 
 install_node20_if_missing() {
@@ -94,6 +100,68 @@ install_xray() {
   fi
   log "Install Xray..."
   bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+}
+setup_dropbear() {
+  log "Setup Dropbear..."
+
+  local main_port alt_port
+  main_port="$(echo "${DROPBEAR_PORT}" | tr -cd '0-9')"
+  alt_port="$(echo "${DROPBEAR_ALT_PORT}" | tr -cd '0-9')"
+  [[ -z "${main_port}" ]] && main_port="109"
+  [[ -z "${alt_port}" ]] && alt_port="143"
+  if [[ "${main_port}" -lt 1 || "${main_port}" -gt 65535 ]]; then main_port="109"; fi
+  if [[ "${alt_port}" -lt 1 || "${alt_port}" -gt 65535 ]]; then alt_port="143"; fi
+
+  cat > /etc/default/dropbear <<EOF
+NO_START=0
+DROPBEAR_PORT=${main_port}
+DROPBEAR_EXTRA_ARGS="-p ${alt_port}"
+DROPBEAR_BANNER=""
+DROPBEAR_RECEIVE_WINDOW=65536
+EOF
+
+  local src_dir archive_url archive_path build_dir custom_bin
+  src_dir="/usr/local/src"
+  archive_url="https://matt.ucc.asn.au/dropbear/releases/dropbear-${DROPBEAR_VERSION}.tar.bz2"
+  archive_path="${src_dir}/dropbear-${DROPBEAR_VERSION}.tar.bz2"
+  build_dir="${src_dir}/dropbear-${DROPBEAR_VERSION}"
+  custom_bin="/usr/local/sbin/dropbear-${DROPBEAR_VERSION}"
+
+  if [[ ! -x "${custom_bin}" ]]; then
+    log "Build Dropbear ${DROPBEAR_VERSION} from source..."
+    mkdir -p "${src_dir}"
+    rm -rf "${build_dir}"
+    curl -fL --retry 5 --retry-delay 2 "${archive_url}" -o "${archive_path}"
+    tar -xjf "${archive_path}" -C "${src_dir}"
+    (
+      cd "${build_dir}"
+      ./configure --prefix=/usr/local --sysconfdir=/etc/dropbear
+      make -j"$(nproc || echo 1)"
+      cp -f dropbear "${custom_bin}"
+      if [[ -x ./dropbearkey ]]; then
+        cp -f ./dropbearkey /usr/local/bin/dropbearkey-sc1
+      fi
+    )
+    chmod 755 "${custom_bin}"
+  fi
+
+  mkdir -p /etc/dropbear
+  if [[ -x /usr/local/bin/dropbearkey-sc1 ]]; then
+    [[ -s /etc/dropbear/dropbear_rsa_host_key ]] || /usr/local/bin/dropbearkey-sc1 -t rsa -f /etc/dropbear/dropbear_rsa_host_key >/dev/null 2>&1 || true
+    [[ -s /etc/dropbear/dropbear_ecdsa_host_key ]] || /usr/local/bin/dropbearkey-sc1 -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key >/dev/null 2>&1 || true
+    [[ -s /etc/dropbear/dropbear_ed25519_host_key ]] || /usr/local/bin/dropbearkey-sc1 -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key >/dev/null 2>&1 || true
+  fi
+
+  mkdir -p /etc/systemd/system/dropbear.service.d
+  cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
+[Service]
+ExecStart=
+ExecStart=${custom_bin} -R -E -F -p ${main_port} -p ${alt_port}
+EOF
+
+  systemctl daemon-reload
+  systemctl enable dropbear >/dev/null 2>&1 || true
+  systemctl restart dropbear >/dev/null 2>&1 || true
 }
 
 init_db() {
@@ -196,6 +264,10 @@ server {
     listen 80;
     listen [::]:80;
     server_name ${DOMAIN};
+    location = /cdn-cgi/trace {
+        default_type text/plain;
+        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
+    }
 
     location /.well-known/acme-challenge/ { root /var/www/html; }
 
@@ -211,8 +283,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -220,8 +293,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -229,8 +303,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10001;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -238,8 +312,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10002;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -247,8 +321,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10003;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -256,8 +330,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 }
@@ -288,6 +363,10 @@ server {
     listen 80;
     listen [::]:80;
     server_name ${DOMAIN};
+    location = /cdn-cgi/trace {
+        default_type text/plain;
+        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
+    }
 
     location /vps/ {
         proxy_pass http://127.0.0.1:${API_PORT};
@@ -301,8 +380,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -310,8 +390,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -319,8 +400,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10001;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -328,8 +409,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10002;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -337,8 +418,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10003;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -346,8 +427,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 }
@@ -356,6 +438,10 @@ server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
     server_name ${DOMAIN};
+    location = /cdn-cgi/trace {
+        default_type text/plain;
+        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
+    }
 
     ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
@@ -372,8 +458,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10001;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -381,8 +467,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10002;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -390,8 +476,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10003;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -399,8 +485,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -408,8 +495,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -417,8 +505,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 }
@@ -540,6 +629,7 @@ AUTH_TOKEN=${API_AUTH_TOKEN}
 ZIVPN_CONFIG=/etc/zivpn/config.json
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
 SSH_WS_PORT=2082
+SSH_WS_TARGET_PORT=${DROPBEAR_PORT}
 EOF
 
   cat > "${APP_DIR}/api.js" <<'EOF'
@@ -938,7 +1028,7 @@ try { require('dotenv').config(); } catch (_) {}
 
 const PORT = Number(process.env.SSH_WS_PORT || 2082);
 const SSH_HOST = process.env.SSH_WS_TARGET_HOST || '127.0.0.1';
-const SSH_PORT = Number(process.env.SSH_WS_TARGET_PORT || 22);
+const SSH_PORT = Number(process.env.SSH_WS_TARGET_PORT || 109);
 
 const wss = new WebSocketServer({
   port: PORT,
@@ -1268,7 +1358,7 @@ EOF
   cat > /etc/systemd/system/sc-1forcr-sshws.service <<EOF
 [Unit]
 Description=SC 1FORCR SSH WebSocket Bridge
-After=network.target ssh.service
+After=network.target ssh.service dropbear.service
 
 [Service]
 Type=simple
@@ -1317,6 +1407,8 @@ EOF
 
   systemctl enable ssh || true
   systemctl restart ssh || true
+  systemctl enable dropbear || true
+  systemctl restart dropbear || true
 }
 
 write_cli_menu() {
@@ -1328,6 +1420,8 @@ API_PORT=${API_PORT}
 AUTH_TOKEN=${API_AUTH_TOKEN}
 DB_PATH=${DB_PATH}
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
+DROPBEAR_PORT=${DROPBEAR_PORT}
+DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 EOF
   chmod 600 /etc/sc-1forcr.env
 
@@ -1487,10 +1581,11 @@ service_menu() {
       systemctl status xray --no-pager | head -n 12
       systemctl status sc-1forcr-api --no-pager | head -n 12
       systemctl status sc-1forcr-sshws --no-pager | head -n 12
+      systemctl status dropbear --no-pager | head -n 12 || true
       systemctl status "${ZIVPN_SERVICE}" --no-pager | head -n 12 || true
       ;;
     2)
-      systemctl restart ssh nginx xray sc-1forcr-api sc-1forcr-sshws
+      systemctl restart ssh dropbear nginx xray sc-1forcr-api sc-1forcr-sshws
       systemctl restart "${ZIVPN_SERVICE}" || true
       echo "Restart selesai."
       ;;
@@ -1539,6 +1634,10 @@ server {
     listen 80;
     listen [::]:80;
     server_name ${new_domain};
+    location = /cdn-cgi/trace {
+        default_type text/plain;
+        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
+    }
 
     location /.well-known/acme-challenge/ { root /var/www/html; }
 
@@ -1554,8 +1653,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1563,8 +1663,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1572,8 +1673,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10001;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1581,8 +1682,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10002;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1590,8 +1691,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10003;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1599,8 +1700,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 }
@@ -1618,6 +1720,10 @@ server {
     listen 80;
     listen [::]:80;
     server_name ${new_domain};
+    location = /cdn-cgi/trace {
+        default_type text/plain;
+        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
+    }
 
     location /vps/ {
         proxy_pass http://127.0.0.1:${API_PORT};
@@ -1631,8 +1737,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1640,8 +1747,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1649,8 +1757,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10001;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1658,8 +1766,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10002;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1667,8 +1775,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10003;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1676,8 +1784,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 }
@@ -1686,6 +1795,10 @@ server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
     server_name ${new_domain};
+    location = /cdn-cgi/trace {
+        default_type text/plain;
+        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
+    }
 
     ssl_certificate /etc/letsencrypt/live/${new_domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${new_domain}/privkey.pem;
@@ -1702,8 +1815,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10001;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1711,8 +1824,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10002;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1720,8 +1833,8 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10003;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1729,8 +1842,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1738,8 +1852,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 
@@ -1747,8 +1862,9 @@ server {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
+        proxy_method GET;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
     }
 }
@@ -1900,6 +2016,7 @@ main() {
   apply_system_optimizations
   install_node20_if_missing
   install_xray
+  setup_dropbear
   init_db
   setup_nginx_and_cert
   setup_zivpn_service_if_possible
@@ -1929,6 +2046,7 @@ curl -s -X POST "https://${DOMAIN}/vps/sshvpn" \\
 Catatan:
 - Endpoint /vps/* sudah kompatibel pola bot kamu (create/trial/renew/delete/lock/unlock).
 - WS paths aktif: /ssh-ws, /ws, /vmess, /vless, /trojan (port 80 & 443)
+- Dropbear aktif di port ${DROPBEAR_PORT} dan ${DROPBEAR_ALT_PORT}; ssh-ws bridge default ke ${DROPBEAR_PORT}
 - Untuk summary API, tinggal pakai scripts/setup-summary-api.sh di repo ini.
 - Jika binary zivpn belum ada, isi ZIVPN_BIN_URL lalu jalankan ulang script.
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
