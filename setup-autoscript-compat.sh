@@ -22,7 +22,7 @@ set -euo pipefail
 #   APP_DIR=/opt/sc-1forcr
 
 DOMAIN="${DOMAIN:-}"
-EMAIL="${EMAIL:-admin@${DOMAIN:-example.com}}"
+EMAIL="${EMAIL:-}"
 API_AUTH_TOKEN="${API_AUTH_TOKEN:-}"
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
 APP_DIR="${APP_DIR:-/opt/sc-1forcr}"
@@ -42,6 +42,17 @@ fi
 
 if [[ -z "${DOMAIN}" ]]; then
   echo "DOMAIN wajib diisi."
+  exit 1
+fi
+
+if [[ -z "${EMAIL}" ]]; then
+  read -r -p "Masukkan email Let's Encrypt [admin@${DOMAIN}]: " EMAIL
+  EMAIL="${EMAIL:-admin@${DOMAIN}}"
+fi
+
+if [[ "${EMAIL}" == "admin@example.com" || "${EMAIL}" == *"@example.com" ]]; then
+  echo "EMAIL default ${EMAIL} tidak valid untuk Let's Encrypt."
+  echo "Gunakan email asli. Contoh: EMAIL=admin@${DOMAIN}"
   exit 1
 fi
 
@@ -204,7 +215,17 @@ EOF
   systemctl restart nginx
 
   log "Issue cert Let's Encrypt..."
-  certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}" --redirect || true
+  local cert_ok=0
+  if certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}" --redirect; then
+    cert_ok=1
+  else
+    cert_ok=0
+    log "Let's Encrypt gagal. Tetap lanjut mode HTTP dulu. Cek DNS domain + email lalu ulangi."
+  fi
+
+  if [[ "${cert_ok}" -ne 1 ]]; then
+    return 0
+  fi
 
   log "Pasang lokasi WS untuk Xray..."
   cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOF
@@ -1118,13 +1139,13 @@ api_call() {
 }
 
 pick_type() {
-  echo "Pilih tipe:"
-  echo "1) ssh"
-  echo "2) vmess"
-  echo "3) vless"
-  echo "4) trojan"
-  echo "5) zivpn"
-  read -rp "Input [1-5]: " t
+  echo "Pilih tipe:" >&2
+  echo "1) ssh" >&2
+  echo "2) vmess" >&2
+  echo "3) vless" >&2
+  echo "4) trojan" >&2
+  echo "5) zivpn" >&2
+  read -rp "Input [1-5]: " t </dev/tty
   case "$t" in
     1) echo "ssh" ;;
     2) echo "vmess" ;;
