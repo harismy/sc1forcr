@@ -382,6 +382,7 @@ write_api_files() {
   "private": true,
   "main": "api.js",
   "dependencies": {
+    "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "sqlite3": "^5.1.7"
   }
@@ -403,7 +404,7 @@ const fs = require('fs');
 const sqlite3 = require('sqlite3').verbose();
 const { execFileSync } = require('child_process');
 const crypto = require('crypto');
-require('dotenv').config();
+try { require('dotenv').config(); } catch (_) {}
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
