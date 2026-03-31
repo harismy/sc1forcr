@@ -132,8 +132,49 @@ CREATE TABLE IF NOT EXISTS account_trojans (
   limitip INTEGER DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS temp_ip_locks (
+  account_type TEXT NOT NULL,
+  username TEXT NOT NULL,
+  locked_until INTEGER NOT NULL,
+  zivpn_removed INTEGER DEFAULT 0,
+  created_at INTEGER DEFAULT (strftime('%s','now')),
+  PRIMARY KEY (account_type, username)
+);
+
 INSERT OR IGNORE INTO servers("key") VALUES('${API_AUTH_TOKEN}');
 SQL
+}
+
+apply_system_optimizations() {
+  log "Apply basic optimization (1GB RAM friendly)..."
+
+  if ! swapon --show | grep -q .; then
+    if [[ ! -f /swapfile ]]; then
+      fallocate -l 1G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=1024
+      chmod 600 /swapfile
+      mkswap /swapfile >/dev/null
+    fi
+    swapon /swapfile || true
+    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  fi
+
+  cat > /etc/sysctl.d/99-sc-1forcr.conf <<'EOF'
+vm.swappiness=10
+vm.vfs_cache_pressure=50
+net.core.somaxconn=1024
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_max_syn_backlog=4096
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+
+  mkdir -p /etc/systemd/journald.conf.d
+  cat > /etc/systemd/journald.conf.d/limit.conf <<'EOF'
+[Journal]
+SystemMaxUse=100M
+RuntimeMaxUse=50M
+EOF
+  systemctl restart systemd-journald || true
 }
 
 setup_nginx_and_cert() {
@@ -466,7 +507,11 @@ async function renderAndReloadXray() {
   const trojanRows = await all("SELECT username, password FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
 
   const cfg = {
-    log: { loglevel: 'warning' },
+    log: {
+      access: '/var/log/xray/access.log',
+      error: '/var/log/xray/error.log',
+      loglevel: 'warning'
+    },
     inbounds: [
       {
         port: 10001, listen: '127.0.0.1', protocol: 'vmess',
@@ -721,6 +766,266 @@ EOF
   npm install --omit=dev
 }
 
+write_iplimit_checker() {
+  log "Menulis checker limit IP otomatis..."
+  cat > "${APP_DIR}/iplimit-checker.js" <<'EOF'
+const fs = require('fs');
+const sqlite3 = require('sqlite3').verbose();
+const { execFileSync } = require('child_process');
+
+const DB_PATH = process.env.DB_PATH || '/usr/sbin/potatonc/potato.db';
+const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
+const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
+const LOCK_SECONDS = 15 * 60;
+
+const db = new sqlite3.Database(DB_PATH);
+
+function run(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function onRun(err) {
+      if (err) return reject(err);
+      resolve(this);
+    });
+  });
+}
+function all(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)));
+  });
+}
+function get(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
+  });
+}
+function safeExec(cmd, args) {
+  try {
+    execFileSync(cmd, args, { stdio: 'ignore' });
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function parseWhoMap() {
+  const map = new Map();
+  let out = '';
+  try {
+    out = execFileSync('who', [], { encoding: 'utf8' });
+  } catch (_) {}
+  for (const line of String(out || '').split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    const parts = t.split(/\s+/);
+    const user = String(parts[0] || '').trim();
+    const hostMatch = t.match(/\(([^\)]+)\)/);
+    const host = String(hostMatch?.[1] || '').trim();
+    if (!user || !host) continue;
+    if (!map.has(user)) map.set(user, new Set());
+    map.get(user).add(host);
+  }
+  return map;
+}
+
+function parseXrayRecentIpMap() {
+  const map = new Map();
+  const path = '/var/log/xray/access.log';
+  if (!fs.existsSync(path)) return map;
+  const lines = fs.readFileSync(path, 'utf8').split('\n').slice(-20000);
+  for (const lineRaw of lines) {
+    const line = String(lineRaw || '').trim();
+    if (!line) continue;
+    const emailJson = line.match(/"email":"([^"]+)"/);
+    const emailTxt = line.match(/\bemail:\s*([^\s]+)/i);
+    const email = String(emailJson?.[1] || emailTxt?.[1] || '').trim();
+    if (!email) continue;
+    const srcJson = line.match(/"source":"([^"]+)"/);
+    const srcTxt = line.match(/\bfrom\s+([0-9a-fA-F\.:]+)/i);
+    const src = String(srcJson?.[1] || srcTxt?.[1] || '').trim();
+    const ip = src.split(':')[0];
+    if (!ip) continue;
+    if (!map.has(email)) map.set(email, new Set());
+    map.get(email).add(ip);
+  }
+  return map;
+}
+
+function removeZivpnUser(username) {
+  try {
+    if (!fs.existsSync(ZIVPN_CONFIG)) return false;
+    const root = JSON.parse(fs.readFileSync(ZIVPN_CONFIG, 'utf8'));
+    if (!root.auth || typeof root.auth !== 'object') return false;
+    if (!Array.isArray(root.auth.config)) return false;
+    const before = root.auth.config.length;
+    root.auth.config = root.auth.config.filter((u) => String(u || '').trim().toLowerCase() !== String(username || '').trim().toLowerCase());
+    const changed = root.auth.config.length !== before;
+    if (changed) fs.writeFileSync(ZIVPN_CONFIG, JSON.stringify(root, null, 2));
+    return changed;
+  } catch (_) {
+    return false;
+  }
+}
+
+function addZivpnUser(username) {
+  try {
+    let root = { auth: { mode: 'passwords', config: [] } };
+    if (fs.existsSync(ZIVPN_CONFIG)) root = JSON.parse(fs.readFileSync(ZIVPN_CONFIG, 'utf8'));
+    if (!root.auth || typeof root.auth !== 'object') root.auth = {};
+    if (!Array.isArray(root.auth.config)) root.auth.config = [];
+    const key = String(username || '').trim().toLowerCase();
+    const set = new Set(root.auth.config.map((u) => String(u || '').trim().toLowerCase()).filter(Boolean));
+    set.add(key);
+    root.auth.config = Array.from(set);
+    fs.writeFileSync(ZIVPN_CONFIG, JSON.stringify(root, null, 2));
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function restartService(service) {
+  if (!service) return;
+  if (!safeExec('systemctl', ['restart', service])) safeExec('service', [service, 'restart']);
+}
+
+async function ensureTables() {
+  await run(`CREATE TABLE IF NOT EXISTS temp_ip_locks (
+    account_type TEXT NOT NULL,
+    username TEXT NOT NULL,
+    locked_until INTEGER NOT NULL,
+    zivpn_removed INTEGER DEFAULT 0,
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (account_type, username)
+  )`);
+}
+
+async function unlockExpired(nowTs) {
+  const rows = await all("SELECT account_type, username, zivpn_removed FROM temp_ip_locks WHERE locked_until <= ?", [nowTs]);
+  if (rows.length === 0) return { xrayChanged: false, zivpnChanged: false };
+
+  let xrayChanged = false;
+  let zivpnChanged = false;
+  for (const row of rows) {
+    const t = String(row.account_type || '');
+    const u = String(row.username || '');
+    if (t === 'ssh') {
+      safeExec('passwd', ['-u', u]);
+      await run("UPDATE account_sshs SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
+      if (Number(row.zivpn_removed || 0) === 1) {
+        if (addZivpnUser(u)) zivpnChanged = true;
+      }
+    } else if (t === 'vmess') {
+      await run("UPDATE account_vmesses SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
+      xrayChanged = true;
+    } else if (t === 'vless') {
+      await run("UPDATE account_vlesses SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
+      xrayChanged = true;
+    } else if (t === 'trojan') {
+      await run("UPDATE account_trojans SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
+      xrayChanged = true;
+    }
+    await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+  }
+  return { xrayChanged, zivpnChanged };
+}
+
+async function lockIfExceeded(nowTs) {
+  const sshMap = parseWhoMap();
+  const xrayMap = parseXrayRecentIpMap();
+  let xrayChanged = false;
+  let zivpnChanged = false;
+
+  const sshRows = await all("SELECT username, limitip FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(limitip,0) AS INTEGER) > 0");
+  for (const r of sshRows) {
+    const user = String(r.username || '').trim();
+    const lim = Number(r.limitip || 0);
+    const cnt = sshMap.has(user) ? sshMap.get(user).size : 0;
+    if (cnt <= lim) continue;
+    const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]);
+    if (exists) continue;
+    safeExec('passwd', ['-l', user]);
+    const removed = removeZivpnUser(user) ? 1 : 0;
+    if (removed) zivpnChanged = true;
+    await run("UPDATE account_sshs SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
+    await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES('ssh', ?, ?, ?)", [user, nowTs + LOCK_SECONDS, removed]).catch(() => {});
+  }
+
+  const scan = [
+    { type: 'vmess', table: 'account_vmesses' },
+    { type: 'vless', table: 'account_vlesses' },
+    { type: 'trojan', table: 'account_trojans' }
+  ];
+  for (const item of scan) {
+    const rows = await all(`SELECT username, limitip FROM ${item.table} WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(limitip,0) AS INTEGER) > 0`);
+    for (const r of rows) {
+      const user = String(r.username || '').trim();
+      const lim = Number(r.limitip || 0);
+      const cnt = xrayMap.has(user) ? xrayMap.get(user).size : 0;
+      if (cnt <= lim) continue;
+      const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type=? AND username=?", [item.type, user]);
+      if (exists) continue;
+      await run(`UPDATE ${item.table} SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
+      await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES(?, ?, ?, 0)", [item.type, user, nowTs + LOCK_SECONDS]).catch(() => {});
+      xrayChanged = true;
+    }
+  }
+  return { xrayChanged, zivpnChanged };
+}
+
+async function rebuildXrayFromDb() {
+  const vmessRows = await all("SELECT username, uuid FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
+  const vlessRows = await all("SELECT username, uuid FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
+  const trojanRows = await all("SELECT username, password FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
+
+  const cfg = {
+    log: {
+      access: '/var/log/xray/access.log',
+      error: '/var/log/xray/error.log',
+      loglevel: 'warning'
+    },
+    inbounds: [
+      {
+        port: 10001, listen: '127.0.0.1', protocol: 'vmess',
+        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        streamSettings: { network: 'ws', wsSettings: { path: '/vmess' } }
+      },
+      {
+        port: 10002, listen: '127.0.0.1', protocol: 'vless',
+        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/vless' } }
+      },
+      {
+        port: 10003, listen: '127.0.0.1', protocol: 'trojan',
+        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/trojan' } }
+      }
+    ],
+    outbounds: [{ protocol: 'freedom', tag: 'direct' }]
+  };
+  fs.mkdirSync('/usr/local/etc/xray', { recursive: true });
+  fs.writeFileSync('/usr/local/etc/xray/config.json', JSON.stringify(cfg, null, 2));
+  restartService('xray');
+}
+
+async function main() {
+  const now = Math.floor(Date.now() / 1000);
+  await ensureTables();
+  const u = await unlockExpired(now);
+  const l = await lockIfExceeded(now);
+
+  if (u.xrayChanged || l.xrayChanged) await rebuildXrayFromDb();
+  if (u.zivpnChanged || l.zivpnChanged) restartService(ZIVPN_SERVICE);
+  db.close();
+}
+
+main().catch((e) => {
+  try { db.close(); } catch (_) {}
+  console.error('[iplimit-checker] error:', e?.message || e);
+  process.exit(1);
+});
+EOF
+}
+
 setup_services() {
   log "Setup service sc-1forcr-api..."
   cat > /etc/systemd/system/sc-1forcr-api.service <<EOF
@@ -742,6 +1047,34 @@ EOF
   systemctl daemon-reload
   systemctl enable sc-1forcr-api
   systemctl restart sc-1forcr-api
+
+  cat > /etc/systemd/system/sc-1forcr-iplimit.service <<EOF
+[Unit]
+Description=SC 1FORCR IP Limit Checker
+After=network.target sc-1forcr-api.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=${APP_DIR}/.env
+ExecStart=/usr/bin/node ${APP_DIR}/iplimit-checker.js
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-iplimit.timer <<'EOF'
+[Unit]
+Description=Run SC 1FORCR IP Limit Checker every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Unit=sc-1forcr-iplimit.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now sc-1forcr-iplimit.timer
 
   systemctl enable ssh || true
   systemctl restart ssh || true
@@ -951,6 +1284,149 @@ backup_restore_menu() {
   esac
 }
 
+change_domain_menu() {
+  local new_domain email app_env
+  read -rp "Masukkan domain baru: " new_domain
+  if [[ -z "${new_domain}" ]]; then
+    echo "Domain tidak boleh kosong."
+    return
+  fi
+  read -rp "Masukkan email Let's Encrypt [admin@${new_domain}]: " email
+  email="${email:-admin@${new_domain}}"
+
+  cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOFNGX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${new_domain};
+
+    location /.well-known/acme-challenge/ { root /var/www/html; }
+
+    location /vps/ {
+        proxy_pass http://127.0.0.1:${API_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOFNGX
+
+  nginx -t && systemctl restart nginx
+  if ! certbot --nginx -d "${new_domain}" --non-interactive --agree-tos -m "${email}" --redirect; then
+    echo "Gagal issue cert untuk domain ${new_domain}."
+    echo "Pastikan A record domain mengarah ke VPS, lalu ulangi."
+    return
+  fi
+
+  cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOFNGX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${new_domain};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${new_domain};
+
+    ssl_certificate /etc/letsencrypt/live/${new_domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${new_domain}/privkey.pem;
+
+    location /vps/ {
+        proxy_pass http://127.0.0.1:${API_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location /vmess {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /vless {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10002;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /trojan {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10003;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+}
+EOFNGX
+  nginx -t && systemctl restart nginx
+
+  if [[ -f /etc/sc-1forcr.env ]]; then
+    if grep -q '^DOMAIN=' /etc/sc-1forcr.env; then
+      sed -i "s/^DOMAIN=.*/DOMAIN=${new_domain}/" /etc/sc-1forcr.env
+    else
+      echo "DOMAIN=${new_domain}" >> /etc/sc-1forcr.env
+    fi
+  fi
+
+  app_env="/opt/sc-1forcr/.env"
+  if [[ ! -f "${app_env}" ]]; then
+    app_env="/opt/potato-compat/.env"
+  fi
+  if [[ -f "${app_env}" ]]; then
+    if grep -q '^DOMAIN=' "${app_env}"; then
+      sed -i "s/^DOMAIN=.*/DOMAIN=${new_domain}/" "${app_env}"
+    else
+      echo "DOMAIN=${new_domain}" >> "${app_env}"
+    fi
+  fi
+
+  DOMAIN="${new_domain}"
+  systemctl restart sc-1forcr-api
+  echo "Domain berhasil diubah ke ${new_domain}"
+}
+
+monitor_temp_lock_menu() {
+  echo "=== AKUN LOCK SEMENTARA (IP LIMIT) ==="
+  if [[ ! -f "${DB_PATH}" ]]; then
+    echo "DB tidak ditemukan: ${DB_PATH}"
+    return
+  fi
+
+  local count
+  count="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='temp_ip_locks';" 2>/dev/null || echo 0)"
+  if [[ "${count}" != "1" ]]; then
+    echo "Tabel temp_ip_locks belum ada."
+    return
+  fi
+
+  sqlite3 -header -column "${DB_PATH}" "
+    SELECT
+      account_type AS type,
+      username,
+      datetime(locked_until, 'unixepoch', 'localtime') AS unlock_at,
+      CASE
+        WHEN (locked_until - strftime('%s','now')) > 0
+          THEN CAST((locked_until - strftime('%s','now')) AS INTEGER)
+        ELSE 0
+      END AS remain_sec
+    FROM temp_ip_locks
+    ORDER BY locked_until ASC;
+  " || true
+}
+
 while true; do
   clear
   echo "===================================="
@@ -964,7 +1440,9 @@ while true; do
   echo "4) List Account"
   echo "5) Service Menu"
   echo "6) Backup/Restore ZIVPN Config"
-  echo "7) Uninstall SC 1FORCR"
+  echo "7) Ganti Domain + Renew SSL"
+  echo "8) Monitor Lock Sementara (IP Limit)"
+  echo "9) Uninstall SC 1FORCR"
   echo "x) Exit"
   echo
   read -rp "Pilih menu: " m
@@ -975,7 +1453,9 @@ while true; do
     4) list_accounts ;;
     5) service_menu ;;
     6) backup_restore_menu ;;
-    7) /usr/local/sbin/uninstall-sc-1forcr ;;
+    7) change_domain_menu ;;
+    8) monitor_temp_lock_menu ;;
+    9) /usr/local/sbin/uninstall-sc-1forcr ;;
     x|X) exit 0 ;;
     *) echo "Pilihan tidak valid." ;;
   esac
@@ -1004,7 +1484,13 @@ fi
 
 systemctl stop sc-1forcr-api >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-api >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-iplimit.service >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/sc-1forcr-api.service
+rm -f /etc/systemd/system/sc-1forcr-iplimit.service
+rm -f /etc/systemd/system/sc-1forcr-iplimit.timer
 rm -f /etc/systemd/system/potato-compat-api.service
 systemctl daemon-reload
 
@@ -1026,12 +1512,14 @@ EOF
 
 main() {
   install_base_packages
+  apply_system_optimizations
   install_node20_if_missing
   install_xray
   init_db
   setup_nginx_and_cert
   setup_zivpn_service_if_possible
   write_api_files
+  write_iplimit_checker
   setup_services
   write_cli_menu
 
@@ -1059,6 +1547,7 @@ Catatan:
 - Jika binary zivpn belum ada, isi ZIVPN_BIN_URL lalu jalankan ulang script.
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
 - Uninstall helper: uninstall-sc-1forcr
+- Auto lock IP limit: timer systemd sc-1forcr-iplimit.timer (cek tiap 15 menit, lock sementara 15 menit)
 EOF
 }
 
