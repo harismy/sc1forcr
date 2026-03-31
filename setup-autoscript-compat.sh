@@ -71,7 +71,8 @@ install_base_packages() {
     curl wget jq sqlite3 openssl uuid-runtime ca-certificates \
     gnupg lsb-release socat cron unzip \
     nginx certbot python3-certbot-nginx \
-    openssh-server pwgen
+    openssh-server pwgen \
+    build-essential python3 make g++ gcc libc6-dev pkg-config
 }
 
 install_node20_if_missing() {
@@ -784,7 +785,13 @@ app.listen(PORT, '127.0.0.1', () => {
 EOF
 
   cd "${APP_DIR}"
-  npm install --omit=dev
+  rm -rf node_modules package-lock.json
+  npm cache clean --force >/dev/null 2>&1 || true
+  export npm_config_build_from_source=true
+  export npm_config_fallback_to_build=true
+  export npm_config_update_binary=false
+  npm install --omit=dev --foreground-scripts
+  node -e "require('sqlite3'); console.log('sqlite3 load ok')"
 }
 
 write_iplimit_checker() {
