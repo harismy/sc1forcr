@@ -206,6 +206,55 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
+
+    location /ssh-ws {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /ws {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /vmess {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /vless {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10002;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /trojan {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10003;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
 }
 EOF
 
@@ -234,7 +283,63 @@ server {
     listen 80;
     listen [::]:80;
     server_name ${DOMAIN};
-    return 301 https://\$host\$request_uri;
+
+    location /vps/ {
+        proxy_pass http://127.0.0.1:${API_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location /ssh-ws {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /ws {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /vmess {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /vless {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10002;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /trojan {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10003;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
 }
 
 server {
@@ -274,6 +379,24 @@ server {
     location /trojan {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10003;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /ssh-ws {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /ws {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -384,7 +507,8 @@ write_api_files() {
   "dependencies": {
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "sqlite3": "^5.1.7"
+    "sqlite3": "^5.1.7",
+    "ws": "^8.18.1"
   }
 }
 EOF
@@ -396,6 +520,7 @@ DOMAIN=${DOMAIN}
 AUTH_TOKEN=${API_AUTH_TOKEN}
 ZIVPN_CONFIG=/etc/zivpn/config.json
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
+SSH_WS_PORT=2082
 EOF
 
   cat > "${APP_DIR}/api.js" <<'EOF'
@@ -570,6 +695,8 @@ function sshPayload(username, password, expDate, limitip) {
     exp: expDate,
     time: nowTime(),
     port: { tls: '443', none: '80', ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpcustom: '1-65535' },
+    ws_path: '/ssh-ws',
+    ws_alt_path: '/ws',
     limitip: String(limitip || 0)
   };
 }
@@ -783,6 +910,52 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, '127.0.0.1', () => {
   console.log(`sc-1forcr-api on 127.0.0.1:${PORT}`);
 });
+EOF
+
+  cat > "${APP_DIR}/ssh-ws.js" <<'EOF'
+const net = require('net');
+const { WebSocketServer } = require('ws');
+try { require('dotenv').config(); } catch (_) {}
+
+const PORT = Number(process.env.SSH_WS_PORT || 2082);
+const SSH_HOST = process.env.SSH_WS_TARGET_HOST || '127.0.0.1';
+const SSH_PORT = Number(process.env.SSH_WS_TARGET_PORT || 22);
+
+const wss = new WebSocketServer({
+  port: PORT,
+  perMessageDeflate: false,
+  clientTracking: false
+});
+
+wss.on('connection', (ws) => {
+  const sock = net.connect({ host: SSH_HOST, port: SSH_PORT });
+  let closed = false;
+
+  const closeAll = () => {
+    if (closed) return;
+    closed = true;
+    try { ws.close(); } catch (_) {}
+    try { sock.destroy(); } catch (_) {}
+  };
+
+  ws.on('message', (buf, isBinary) => {
+    if (!isBinary && typeof buf === 'string') sock.write(Buffer.from(buf));
+    else sock.write(buf);
+  });
+  ws.on('close', closeAll);
+  ws.on('error', closeAll);
+
+  sock.on('data', (chunk) => {
+    if (ws.readyState === ws.OPEN) {
+      try { ws.send(chunk, { binary: true }); } catch (_) { closeAll(); }
+    }
+  });
+  sock.on('error', closeAll);
+  sock.on('close', closeAll);
+  sock.setTimeout(180000, closeAll);
+});
+
+console.log(`ssh-ws bridge listening on 127.0.0.1:${PORT} -> ${SSH_HOST}:${SSH_PORT}`);
 EOF
 
   cd "${APP_DIR}"
@@ -1073,9 +1246,27 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 EOF
+  cat > /etc/systemd/system/sc-1forcr-sshws.service <<EOF
+[Unit]
+Description=SC 1FORCR SSH WebSocket Bridge
+After=network.target ssh.service
+
+[Service]
+Type=simple
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=${APP_DIR}/.env
+ExecStart=/usr/bin/node ${APP_DIR}/ssh-ws.js
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
   systemctl daemon-reload
   systemctl enable sc-1forcr-api
   systemctl restart sc-1forcr-api
+  systemctl enable sc-1forcr-sshws
+  systemctl restart sc-1forcr-sshws
 
   cat > /etc/systemd/system/sc-1forcr-iplimit.service <<EOF
 [Unit]
@@ -1276,10 +1467,11 @@ service_menu() {
       systemctl status nginx --no-pager | head -n 12
       systemctl status xray --no-pager | head -n 12
       systemctl status sc-1forcr-api --no-pager | head -n 12
+      systemctl status sc-1forcr-sshws --no-pager | head -n 12
       systemctl status "${ZIVPN_SERVICE}" --no-pager | head -n 12 || true
       ;;
     2)
-      systemctl restart ssh nginx xray sc-1forcr-api
+      systemctl restart ssh nginx xray sc-1forcr-api sc-1forcr-sshws
       systemctl restart "${ZIVPN_SERVICE}" || true
       echo "Restart selesai."
       ;;
@@ -1338,6 +1530,55 @@ server {
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
+
+    location /ssh-ws {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /ws {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /vmess {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /vless {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10002;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /trojan {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10003;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
 }
 EOFNGX
 
@@ -1353,7 +1594,63 @@ server {
     listen 80;
     listen [::]:80;
     server_name ${new_domain};
-    return 301 https://\$host\$request_uri;
+
+    location /vps/ {
+        proxy_pass http://127.0.0.1:${API_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location /ssh-ws {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /ws {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /vmess {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /vless {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10002;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /trojan {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10003;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
 }
 
 server {
@@ -1393,6 +1690,24 @@ server {
     location /trojan {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10003;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /ssh-ws {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /ws {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -1513,11 +1828,14 @@ fi
 
 systemctl stop sc-1forcr-api >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-api >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-sshws >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-sshws >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-iplimit.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-iplimit.service >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/sc-1forcr-api.service
+rm -f /etc/systemd/system/sc-1forcr-sshws.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.timer
 rm -f /etc/systemd/system/potato-compat-api.service
@@ -1572,6 +1890,7 @@ curl -s -X POST "https://${DOMAIN}/vps/sshvpn" \\
 
 Catatan:
 - Endpoint /vps/* sudah kompatibel pola bot kamu (create/trial/renew/delete/lock/unlock).
+- WS paths aktif: /ssh-ws, /ws, /vmess, /vless, /trojan (port 80 & 443)
 - Untuk summary API, tinggal pakai scripts/setup-summary-api.sh di repo ini.
 - Jika binary zivpn belum ada, isi ZIVPN_BIN_URL lalu jalankan ulang script.
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
