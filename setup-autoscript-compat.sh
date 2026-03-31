@@ -1023,48 +1023,74 @@ EOF
 
   cat > "${APP_DIR}/ssh-ws.js" <<'EOF'
 const net = require('net');
-const { WebSocketServer } = require('ws');
 try { require('dotenv').config(); } catch (_) {}
 
 const PORT = Number(process.env.SSH_WS_PORT || 2082);
 const SSH_HOST = process.env.SSH_WS_TARGET_HOST || '127.0.0.1';
 const SSH_PORT = Number(process.env.SSH_WS_TARGET_PORT || 109);
 
-const wss = new WebSocketServer({
-  port: PORT,
-  perMessageDeflate: false,
-  clientTracking: false
-});
+function closePair(a, b) {
+  try { a.destroy(); } catch (_) {}
+  try { b.destroy(); } catch (_) {}
+}
 
-wss.on('connection', (ws) => {
-  const sock = net.connect({ host: SSH_HOST, port: SSH_PORT });
+// Compat mode for tunneling apps: accept loose HTTP Upgrade payload and then tunnel raw TCP.
+const server = net.createServer((client) => {
+  let headerDone = false;
+  let stash = Buffer.alloc(0);
+  let upstream = null;
   let closed = false;
 
-  const closeAll = () => {
+  const finish = () => {
     if (closed) return;
     closed = true;
-    try { ws.close(); } catch (_) {}
-    try { sock.destroy(); } catch (_) {}
+    if (upstream) closePair(client, upstream);
+    else { try { client.destroy(); } catch (_) {} }
   };
 
-  ws.on('message', (buf, isBinary) => {
-    if (!isBinary && typeof buf === 'string') sock.write(Buffer.from(buf));
-    else sock.write(buf);
-  });
-  ws.on('close', closeAll);
-  ws.on('error', closeAll);
+  const connectUpstream = (firstPayload) => {
+    upstream = net.connect({ host: SSH_HOST, port: SSH_PORT }, () => {
+      const resp =
+        'HTTP/1.1 101 Switching Protocols\r\n' +
+        'Connection: Upgrade\r\n' +
+        'Upgrade: websocket\r\n' +
+        '\r\n';
+      client.write(resp);
+      if (firstPayload && firstPayload.length > 0) upstream.write(firstPayload);
+      client.pipe(upstream);
+      upstream.pipe(client);
+    });
+    upstream.on('error', finish);
+    upstream.on('close', finish);
+    upstream.setTimeout(180000, finish);
+  };
 
-  sock.on('data', (chunk) => {
-    if (ws.readyState === ws.OPEN) {
-      try { ws.send(chunk, { binary: true }); } catch (_) { closeAll(); }
+  client.on('data', (chunk) => {
+    if (headerDone) return;
+    stash = Buffer.concat([stash, chunk]);
+    const idx = stash.indexOf('\r\n\r\n');
+    if (idx < 0) {
+      if (stash.length > 16384) finish();
+      return;
     }
+    headerDone = true;
+    const head = stash.slice(0, idx).toString('utf8').toLowerCase();
+    const rest = stash.slice(idx + 4);
+    if (!head.includes('upgrade: websocket')) {
+      client.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
+      return;
+    }
+    connectUpstream(rest);
   });
-  sock.on('error', closeAll);
-  sock.on('close', closeAll);
-  sock.setTimeout(180000, closeAll);
+
+  client.on('error', finish);
+  client.on('close', finish);
+  client.setTimeout(180000, finish);
 });
 
-console.log(`ssh-ws bridge listening on 127.0.0.1:${PORT} -> ${SSH_HOST}:${SSH_PORT}`);
+server.listen(PORT, '127.0.0.1', () => {
+  console.log(`ssh-ws compat bridge on 127.0.0.1:${PORT} -> ${SSH_HOST}:${SSH_PORT}`);
+});
 EOF
 
   cd "${APP_DIR}"
