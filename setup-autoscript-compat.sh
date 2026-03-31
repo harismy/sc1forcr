@@ -1,0 +1,1065 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# AutoScript kompatibel BotVPN/Potato
+# Target OS: Debian 12+ / Ubuntu 22+
+#
+# Fitur:
+# - SSH
+# - VMess / VLESS / Trojan (Xray + Nginx + Let's Encrypt)
+# - UDP/ZIVPN (jika binary zivpn tersedia)
+# - HTTP API kompatibel endpoint /vps/* yang dipakai bot
+# - Database kompatibel potato.db untuk summary API
+#
+# Env opsional:
+#   DOMAIN=example.com
+#   EMAIL=admin@example.com
+#   API_AUTH_TOKEN=token-rahasia
+#   ZIVPN_BIN_URL=https://.../zivpn-linux-amd64   (opsional)
+#   ZIVPN_RELEASE_TAG=udp-zivpn_1.4.9             (opsional, default dari repo zahidbd2/udp-zivpn)
+#   ZIVPN_SERVICE_NAME=zivpn
+#   DB_PATH=/usr/sbin/potatonc/potato.db
+#   APP_DIR=/opt/sc-1forcr
+
+DOMAIN="${DOMAIN:-}"
+EMAIL="${EMAIL:-admin@${DOMAIN:-example.com}}"
+API_AUTH_TOKEN="${API_AUTH_TOKEN:-}"
+DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
+APP_DIR="${APP_DIR:-/opt/sc-1forcr}"
+API_PORT="${API_PORT:-8088}"
+ZIVPN_BIN_URL="${ZIVPN_BIN_URL:-}"
+ZIVPN_RELEASE_TAG="${ZIVPN_RELEASE_TAG:-udp-zivpn_1.4.9}"
+ZIVPN_SERVICE_NAME="${ZIVPN_SERVICE_NAME:-zivpn}"
+
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "Jalankan sebagai root."
+  exit 1
+fi
+
+if [[ -z "${DOMAIN}" ]]; then
+  read -r -p "Masukkan domain server: " DOMAIN
+fi
+
+if [[ -z "${DOMAIN}" ]]; then
+  echo "DOMAIN wajib diisi."
+  exit 1
+fi
+
+if [[ -z "${API_AUTH_TOKEN}" ]]; then
+  API_AUTH_TOKEN="$(openssl rand -hex 24)"
+fi
+
+log() {
+  echo "[autoscript-compat] $*"
+}
+
+install_base_packages() {
+  log "Install paket dasar..."
+  apt-get update -y
+  apt-get install -y \
+    curl wget jq sqlite3 openssl uuid-runtime ca-certificates \
+    gnupg lsb-release socat cron unzip \
+    nginx certbot python3-certbot-nginx \
+    openssh-server pwgen
+}
+
+install_node20_if_missing() {
+  if command -v node >/dev/null 2>&1; then
+    log "Node sudah ada: $(node -v)"
+    return
+  fi
+  log "Install Node.js 20..."
+  apt-get update -y
+  apt-get install -y curl ca-certificates gnupg
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+}
+
+install_xray() {
+  if command -v xray >/dev/null 2>&1; then
+    log "Xray sudah ada: $(xray version | head -n1)"
+    return
+  fi
+  log "Install Xray..."
+  bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+}
+
+init_db() {
+  log "Inisialisasi DB: ${DB_PATH}"
+  mkdir -p "$(dirname "${DB_PATH}")"
+
+  sqlite3 "${DB_PATH}" <<SQL
+PRAGMA journal_mode=WAL;
+
+CREATE TABLE IF NOT EXISTS servers (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key TEXT UNIQUE NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS account_sshs (
+  username TEXT PRIMARY KEY,
+  password TEXT,
+  date_exp TEXT,
+  status TEXT DEFAULT 'AKTIF',
+  quota INTEGER DEFAULT 0,
+  limitip INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS account_vmesses (
+  username TEXT PRIMARY KEY,
+  uuid TEXT,
+  date_exp TEXT,
+  status TEXT DEFAULT 'AKTIF',
+  quota INTEGER DEFAULT 0,
+  limitip INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS account_vlesses (
+  username TEXT PRIMARY KEY,
+  uuid TEXT,
+  date_exp TEXT,
+  status TEXT DEFAULT 'AKTIF',
+  quota INTEGER DEFAULT 0,
+  limitip INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS account_trojans (
+  username TEXT PRIMARY KEY,
+  password TEXT,
+  date_exp TEXT,
+  status TEXT DEFAULT 'AKTIF',
+  quota INTEGER DEFAULT 0,
+  limitip INTEGER DEFAULT 0
+);
+
+INSERT OR IGNORE INTO servers("key") VALUES('${API_AUTH_TOKEN}');
+SQL
+}
+
+setup_nginx_and_cert() {
+  log "Setup Nginx vhost..."
+  cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
+
+    location /.well-known/acme-challenge/ { root /var/www/html; }
+
+    location /vps/ {
+        proxy_pass http://127.0.0.1:${API_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+EOF
+
+  ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
+  rm -f /etc/nginx/sites-enabled/default
+  nginx -t
+  systemctl enable nginx
+  systemctl restart nginx
+
+  log "Issue cert Let's Encrypt..."
+  certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}" --redirect || true
+
+  log "Pasang lokasi WS untuk Xray..."
+  cat > /etc/nginx/sites-available/sc-1forcr.conf <<EOF
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${DOMAIN};
+    return 301 https://\$host\$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${DOMAIN};
+
+    ssl_certificate /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+
+    location /vps/ {
+        proxy_pass http://127.0.0.1:${API_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location /vmess {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /vless {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10002;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /trojan {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10003;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+}
+EOF
+
+  nginx -t
+  systemctl restart nginx
+}
+
+resolve_zivpn_bin_url() {
+  if [[ -n "${ZIVPN_BIN_URL}" ]]; then
+    echo "${ZIVPN_BIN_URL}"
+    return 0
+  fi
+
+  local arch raw_arch
+  raw_arch="$(uname -m)"
+  case "${raw_arch}" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *)
+      echo ""
+      return 0
+      ;;
+  esac
+
+  echo "https://github.com/zahidbd2/udp-zivpn/releases/download/${ZIVPN_RELEASE_TAG}/udp-zivpn-linux-${arch}"
+  return 0
+}
+
+setup_zivpn_service_if_possible() {
+  mkdir -p /etc/zivpn
+  if [[ ! -f /etc/zivpn/config.json ]]; then
+    cat > /etc/zivpn/config.json <<'EOF'
+{
+  "auth": {
+    "mode": "passwords",
+    "config": []
+  },
+  "network": {
+    "tcp": true,
+    "udp": true
+  },
+  "listen": ":7300"
+}
+EOF
+  fi
+
+  if command -v zivpn >/dev/null 2>&1; then
+    log "Binary zivpn sudah ada."
+  else
+    local resolved_url
+    resolved_url="$(resolve_zivpn_bin_url)"
+    if [[ -z "${resolved_url}" ]]; then
+      log "Arsitektur $(uname -m) belum didukung auto-download ZIVPN. Isi ZIVPN_BIN_URL manual."
+    else
+      log "Download binary zivpn: ${resolved_url}"
+      if curl -fL --retry 5 --retry-delay 2 "${resolved_url}" -o /usr/local/bin/zivpn; then
+        chmod +x /usr/local/bin/zivpn
+      else
+        log "Gagal download binary zivpn. Lanjut tanpa service ZIVPN."
+      fi
+    fi
+  fi
+
+  if command -v zivpn >/dev/null 2>&1; then
+    if ! /usr/local/bin/zivpn --help >/dev/null 2>&1; then
+      log "Peringatan: binary /usr/local/bin/zivpn terdeteksi tapi tidak bisa dijalankan normal."
+    fi
+  else
+    log "Binary zivpn belum ada. Service ZIVPN tidak diaktifkan."
+  fi
+
+  if command -v zivpn >/dev/null 2>&1; then
+    cat > /etc/systemd/system/${ZIVPN_SERVICE_NAME}.service <<EOF
+[Unit]
+Description=zivpn VPN Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/zivpn server -c /etc/zivpn/config.json
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "${ZIVPN_SERVICE_NAME}" || true
+    systemctl restart "${ZIVPN_SERVICE_NAME}" || true
+  fi
+}
+
+write_api_files() {
+  log "Menulis API kompatibilitas..."
+  mkdir -p "${APP_DIR}"
+
+  cat > "${APP_DIR}/package.json" <<'EOF'
+{
+  "name": "sc-1forcr-api",
+  "version": "1.0.0",
+  "private": true,
+  "main": "api.js",
+  "dependencies": {
+    "express": "^4.21.2",
+    "sqlite3": "^5.1.7"
+  }
+}
+EOF
+
+  cat > "${APP_DIR}/.env" <<EOF
+PORT=${API_PORT}
+DB_PATH=${DB_PATH}
+DOMAIN=${DOMAIN}
+AUTH_TOKEN=${API_AUTH_TOKEN}
+ZIVPN_CONFIG=/etc/zivpn/config.json
+ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
+EOF
+
+  cat > "${APP_DIR}/api.js" <<'EOF'
+const express = require('express');
+const fs = require('fs');
+const sqlite3 = require('sqlite3').verbose();
+const { execFileSync } = require('child_process');
+const crypto = require('crypto');
+require('dotenv').config();
+
+const app = express();
+app.use(express.json({ limit: '1mb' }));
+
+const PORT = Number(process.env.PORT || 8088);
+const DB_PATH = process.env.DB_PATH || '/usr/sbin/potatonc/potato.db';
+const DOMAIN = String(process.env.DOMAIN || '').trim();
+const AUTH_TOKEN = String(process.env.AUTH_TOKEN || '').trim();
+const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
+const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
+
+const db = new sqlite3.Database(DB_PATH);
+
+function ok(res, data, message = 'success') {
+  return res.json({ meta: { code: 200, message }, data });
+}
+function fail(res, code, message) {
+  return res.status(code).json({ meta: { code, message }, message });
+}
+function auth(req, res, next) {
+  const token = String(req.headers.authorization || '').trim();
+  if (!token || token !== AUTH_TOKEN) return fail(res, 401, 'unauthorized');
+  next();
+}
+function ymdPlusDays(days) {
+  const d = new Date();
+  d.setDate(d.getDate() + Number(days || 0));
+  return d.toISOString().slice(0, 10);
+}
+function nowTime() {
+  return new Date().toTimeString().slice(0, 8);
+}
+function run(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.run(sql, params, function onRun(err) {
+      if (err) return reject(err);
+      resolve(this);
+    });
+  });
+}
+function get(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
+  });
+}
+function all(sql, params = []) {
+  return new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows)));
+  });
+}
+
+function safeExec(cmd, args, input) {
+  try {
+    const opts = { stdio: ['pipe', 'ignore', 'ignore'] };
+    if (input) opts.input = input;
+    execFileSync(cmd, args, opts);
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function ensureLinuxUser(username, password, expDate) {
+  const exists = safeExec('id', ['-u', username]);
+  if (!exists) safeExec('useradd', ['-m', '-d', `/home/${username}`, '-s', '/bin/bash', username]);
+  safeExec('chpasswd', [], `${username}:${password}\n`);
+  safeExec('usermod', ['-s', '/bin/bash', username]);
+  if (expDate) safeExec('chage', ['-E', expDate, username]);
+}
+
+function deleteLinuxUser(username) {
+  safeExec('userdel', ['-r', username]);
+}
+
+function lockLinuxUser(username) {
+  safeExec('passwd', ['-l', username]);
+}
+
+function unlockLinuxUser(username) {
+  safeExec('passwd', ['-u', username]);
+}
+
+function zivpnReload() {
+  if (!safeExec('systemctl', ['restart', ZIVPN_SERVICE])) {
+    safeExec('service', [ZIVPN_SERVICE, 'restart']);
+  }
+}
+
+function syncZivpnUser(username, addMode) {
+  try {
+    let root = { auth: { mode: 'passwords', config: [] } };
+    if (fs.existsSync(ZIVPN_CONFIG)) root = JSON.parse(fs.readFileSync(ZIVPN_CONFIG, 'utf8'));
+    if (!root.auth || typeof root.auth !== 'object') root.auth = {};
+    if (!Array.isArray(root.auth.config)) root.auth.config = [];
+    const set = new Set(root.auth.config.map((v) => String(v || '').trim().toLowerCase()).filter(Boolean));
+    const key = String(username || '').trim().toLowerCase();
+    if (!key) return;
+    if (addMode) set.add(key);
+    else set.delete(key);
+    root.auth.config = Array.from(set);
+    fs.writeFileSync(ZIVPN_CONFIG, JSON.stringify(root, null, 2));
+    zivpnReload();
+  } catch (_) {}
+}
+
+function vmessLink(host, id, tls) {
+  const payload = {
+    v: '2', ps: `vmess-${host}`, add: host, port: tls ? '443' : '80', id, aid: '0',
+    net: 'ws', type: 'none', host, path: '/vmess', tls: tls ? 'tls' : 'none', sni: host
+  };
+  return `vmess://${Buffer.from(JSON.stringify(payload)).toString('base64')}`;
+}
+function vlessLink(host, id, tls) {
+  return `vless://${id}@${host}:${tls ? '443' : '80'}?type=ws&path=%2Fvless&security=${tls ? 'tls' : 'none'}&sni=${host}#vless-${host}`;
+}
+function trojanLink(host, pass, tls) {
+  return `trojan://${pass}@${host}:${tls ? '443' : '80'}?type=ws&path=%2Ftrojan&security=${tls ? 'tls' : 'none'}&sni=${host}#trojan-${host}`;
+}
+
+async function renderAndReloadXray() {
+  const vmessRows = await all("SELECT username, uuid FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
+  const vlessRows = await all("SELECT username, uuid FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
+  const trojanRows = await all("SELECT username, password FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
+
+  const cfg = {
+    log: { loglevel: 'warning' },
+    inbounds: [
+      {
+        port: 10001, listen: '127.0.0.1', protocol: 'vmess',
+        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        streamSettings: { network: 'ws', wsSettings: { path: '/vmess' } }
+      },
+      {
+        port: 10002, listen: '127.0.0.1', protocol: 'vless',
+        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/vless' } }
+      },
+      {
+        port: 10003, listen: '127.0.0.1', protocol: 'trojan',
+        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/trojan' } }
+      }
+    ],
+    outbounds: [{ protocol: 'freedom', tag: 'direct' }]
+  };
+  fs.mkdirSync('/usr/local/etc/xray', { recursive: true });
+  fs.writeFileSync('/usr/local/etc/xray/config.json', JSON.stringify(cfg, null, 2));
+  safeExec('systemctl', ['restart', 'xray']);
+}
+
+app.get('/vps/health', (_req, res) => ok(res, { ok: true, domain: DOMAIN }));
+app.use('/vps', auth);
+
+function sshPayload(username, password, expDate, limitip) {
+  return {
+    hostname: DOMAIN,
+    username,
+    password,
+    exp: expDate,
+    time: nowTime(),
+    port: { tls: '443', none: '80', ovpntcp: '1194', ovpnudp: '2200', sshohp: '8181', udpcustom: '1-65535' },
+    limitip: String(limitip || 0)
+  };
+}
+
+async function createOrUpdateSshFromBody(body, forcedDays = null) {
+  const username = String(body?.username || '').trim();
+  const password = String(body?.password || username || '').trim() || username;
+  const expDays = forcedDays === null ? Number(body?.expired || 30) : Number(forcedDays || 1);
+  const quota = Number(body?.kuota || 0);
+  const limitip = Number(body?.limitip || 0);
+  if (!username) throw new Error('username required');
+  const expDate = ymdPlusDays(expDays);
+  ensureLinuxUser(username, password, expDate);
+  await run(
+    "INSERT OR REPLACE INTO account_sshs(username,password,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)",
+    [username, password, expDate, 'AKTIF', quota, limitip]
+  );
+  syncZivpnUser(username, true);
+  return sshPayload(username, password, expDate, limitip);
+}
+
+app.post('/vps/sshvpn', async (req, res) => {
+  try {
+    return ok(res, await createOrUpdateSshFromBody(req.body, null));
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+
+app.post('/vps/trialsshvpn', async (req, res) => {
+  try {
+    return ok(res, await createOrUpdateSshFromBody(req.body, 1));
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+
+app.delete('/vps/deletesshvpn/:username', async (req, res) => {
+  try {
+    const username = String(req.params.username || '').trim();
+    deleteLinuxUser(username);
+    await run("DELETE FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]);
+    syncZivpnUser(username, false);
+    return ok(res, { username });
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+
+app.post('/vps/renewsshvpn/:username/:exp', async (req, res) => {
+  try {
+    const username = String(req.params.username || '').trim();
+    const exp = Number(req.params.exp || 30);
+    const expDate = ymdPlusDays(exp);
+    const row = await get("SELECT password,limitip FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]);
+    const pass = String(row?.password || username);
+    ensureLinuxUser(username, pass, expDate);
+    await run("UPDATE account_sshs SET date_exp=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)", [expDate, username]);
+    return ok(res, { username, exp: expDate, time: nowTime() });
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+
+app.patch('/vps/locksshvpn/:username', async (req, res) => {
+  const username = String(req.params.username || '').trim();
+  lockLinuxUser(username);
+  await run("UPDATE account_sshs SET status='LOCK' WHERE LOWER(username)=LOWER(?)", [username]).catch(() => {});
+  return ok(res, { username });
+});
+
+app.patch('/vps/unlocksshvpn/:username', async (req, res) => {
+  const username = String(req.params.username || '').trim();
+  unlockLinuxUser(username);
+  await run("UPDATE account_sshs SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [username]).catch(() => {});
+  return ok(res, { username });
+});
+app.patch('/vps/unlocksshvpn/:username/pw', async (req, res) => {
+  const username = String(req.params.username || '').trim();
+  unlockLinuxUser(username);
+  await run("UPDATE account_sshs SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [username]).catch(() => {});
+  return ok(res, { username });
+});
+
+async function createXray(protocol, username, expDays, quota, limitip, trial) {
+  const expDate = ymdPlusDays(trial ? 1 : expDays);
+  let data = null;
+  if (protocol === 'vmess') {
+    const uuid = crypto.randomUUID();
+    await run("INSERT OR REPLACE INTO account_vmesses(username,uuid,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)", [username, uuid, expDate, 'AKTIF', quota, limitip]);
+    data = {
+      hostname: DOMAIN, username, uuid, expired: expDate, exp: expDate, time: nowTime(),
+      city: 'Auto', isp: 'Auto',
+      port: { tls: '443', none: '80', any: '443', grpc: '443' },
+      path: { ws: '/vmess', stn: '/vmess', upgrade: '/upvmess' },
+      serviceName: 'vmess-grpc',
+      link: { tls: vmessLink(DOMAIN, uuid, true), none: vmessLink(DOMAIN, uuid, false), grpc: vmessLink(DOMAIN, uuid, true), uptls: vmessLink(DOMAIN, uuid, true), upntls: vmessLink(DOMAIN, uuid, false) }
+    };
+  } else if (protocol === 'vless') {
+    const uuid = crypto.randomUUID();
+    await run("INSERT OR REPLACE INTO account_vlesses(username,uuid,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)", [username, uuid, expDate, 'AKTIF', quota, limitip]);
+    data = {
+      hostname: DOMAIN, username, uuid, expired: expDate, exp: expDate, time: nowTime(),
+      city: 'Auto', isp: 'Auto',
+      port: { tls: '443', none: '80', any: '443', grpc: '443' },
+      path: { ws: '/vless', stn: '/vless', upgrade: '/upvless' },
+      serviceName: 'vless-grpc',
+      link: { tls: vlessLink(DOMAIN, uuid, true), none: vlessLink(DOMAIN, uuid, false), grpc: vlessLink(DOMAIN, uuid, true), uptls: vlessLink(DOMAIN, uuid, true), upntls: vlessLink(DOMAIN, uuid, false) }
+    };
+  } else if (protocol === 'trojan') {
+    const pass = crypto.randomUUID();
+    await run("INSERT OR REPLACE INTO account_trojans(username,password,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)", [username, pass, expDate, 'AKTIF', quota, limitip]);
+    data = {
+      hostname: DOMAIN, username, password: pass, uuid: pass, expired: expDate, exp: expDate, time: nowTime(),
+      city: 'Auto', isp: 'Auto',
+      port: { tls: '443', none: '80', any: '443', grpc: '443' },
+      path: { ws: '/trojan', stn: '/trojan', upgrade: '/uptrojan' },
+      serviceName: 'trojan-grpc',
+      link: { tls: trojanLink(DOMAIN, pass, true), none: trojanLink(DOMAIN, pass, false), grpc: trojanLink(DOMAIN, pass, true), uptls: trojanLink(DOMAIN, pass, true), upntls: trojanLink(DOMAIN, pass, false) }
+    };
+  }
+  await renderAndReloadXray();
+  return data;
+}
+
+app.post('/vps/vmessall', async (req, res) => {
+  try {
+    const data = await createXray('vmess', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
+    return ok(res, data);
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+app.post('/vps/trialvmessall', async (req, res) => {
+  try {
+    const data = await createXray('vmess', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
+    return ok(res, data);
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+app.post('/vps/vlessall', async (req, res) => {
+  try {
+    const data = await createXray('vless', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
+    return ok(res, data);
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+app.post('/vps/trialvlessall', async (req, res) => {
+  try {
+    const data = await createXray('vless', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
+    return ok(res, data);
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+app.post('/vps/trojanall', async (req, res) => {
+  try {
+    const data = await createXray('trojan', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
+    return ok(res, data);
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+app.post('/vps/trialtrojanall', async (req, res) => {
+  try {
+    const data = await createXray('trojan', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
+    return ok(res, data);
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
+
+async function renewXray(table, username, exp) {
+  const expDate = ymdPlusDays(exp);
+  await run(`UPDATE ${table} SET date_exp=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)`, [expDate, username]);
+  await renderAndReloadXray();
+  return { username, exp: expDate, time: nowTime() };
+}
+async function delXray(table, username) {
+  await run(`DELETE FROM ${table} WHERE LOWER(username)=LOWER(?)`, [username]);
+  await renderAndReloadXray();
+  return { username };
+}
+async function setStatusXray(table, username, status) {
+  await run(`UPDATE ${table} SET status=? WHERE LOWER(username)=LOWER(?)`, [status, username]);
+  await renderAndReloadXray();
+  return { username };
+}
+
+app.post('/vps/renewvmess/:username/:exp', async (req, res) => ok(res, await renewXray('account_vmesses', String(req.params.username || '').trim(), Number(req.params.exp || 30))));
+app.post('/vps/renewvless/:username/:exp', async (req, res) => ok(res, await renewXray('account_vlesses', String(req.params.username || '').trim(), Number(req.params.exp || 30))));
+app.post('/vps/renewtrojan/:username/:exp', async (req, res) => ok(res, await renewXray('account_trojans', String(req.params.username || '').trim(), Number(req.params.exp || 30))));
+
+app.delete('/vps/deletevmess/:username', async (req, res) => ok(res, await delXray('account_vmesses', String(req.params.username || '').trim())));
+app.delete('/vps/deletevless/:username', async (req, res) => ok(res, await delXray('account_vlesses', String(req.params.username || '').trim())));
+app.delete('/vps/deletetrojan/:username', async (req, res) => ok(res, await delXray('account_trojans', String(req.params.username || '').trim())));
+
+app.patch('/vps/lockvmess/:username', async (req, res) => ok(res, await setStatusXray('account_vmesses', String(req.params.username || '').trim(), 'LOCK')));
+app.patch('/vps/lockvless/:username', async (req, res) => ok(res, await setStatusXray('account_vlesses', String(req.params.username || '').trim(), 'LOCK')));
+app.patch('/vps/locktrojan/:username', async (req, res) => ok(res, await setStatusXray('account_trojans', String(req.params.username || '').trim(), 'LOCK')));
+app.patch('/vps/unlockvmess/:username', async (req, res) => ok(res, await setStatusXray('account_vmesses', String(req.params.username || '').trim(), 'AKTIF')));
+app.patch('/vps/unlockvless/:username', async (req, res) => ok(res, await setStatusXray('account_vlesses', String(req.params.username || '').trim(), 'AKTIF')));
+app.patch('/vps/unlocktrojan/:username', async (req, res) => ok(res, await setStatusXray('account_trojans', String(req.params.username || '').trim(), 'AKTIF')));
+
+app.use((err, _req, res, _next) => {
+  return fail(res, 500, err?.message || 'internal error');
+});
+
+app.listen(PORT, '127.0.0.1', () => {
+  console.log(`sc-1forcr-api on 127.0.0.1:${PORT}`);
+});
+EOF
+
+  cd "${APP_DIR}"
+  npm install --omit=dev
+}
+
+setup_services() {
+  log "Setup service sc-1forcr-api..."
+  cat > /etc/systemd/system/sc-1forcr-api.service <<EOF
+[Unit]
+Description=SC 1FORCR API
+After=network.target xray.service nginx.service
+
+[Service]
+Type=simple
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=${APP_DIR}/.env
+ExecStart=/usr/bin/node ${APP_DIR}/api.js
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable sc-1forcr-api
+  systemctl restart sc-1forcr-api
+
+  systemctl enable ssh || true
+  systemctl restart ssh || true
+}
+
+write_cli_menu() {
+  log "Menulis CLI menu..."
+
+  cat > /etc/sc-1forcr.env <<EOF
+DOMAIN=${DOMAIN}
+API_PORT=${API_PORT}
+AUTH_TOKEN=${API_AUTH_TOKEN}
+DB_PATH=${DB_PATH}
+ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
+EOF
+  chmod 600 /etc/sc-1forcr.env
+
+  cat > /usr/local/sbin/menu-sc-1forcr <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "Jalankan sebagai root."
+  exit 1
+fi
+
+source /etc/sc-1forcr.env
+API_BASE="http://127.0.0.1:${API_PORT}/vps"
+
+api_call() {
+  local method="$1" path="$2" data="${3:-}"
+  if [[ -n "${data}" ]]; then
+    curl -sS -X "${method}" "${API_BASE}${path}" \
+      -H "Authorization: ${AUTH_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d "${data}"
+  else
+    curl -sS -X "${method}" "${API_BASE}${path}" \
+      -H "Authorization: ${AUTH_TOKEN}"
+  fi
+}
+
+pick_type() {
+  echo "Pilih tipe:"
+  echo "1) ssh"
+  echo "2) vmess"
+  echo "3) vless"
+  echo "4) trojan"
+  echo "5) zivpn"
+  read -rp "Input [1-5]: " t
+  case "$t" in
+    1) echo "ssh" ;;
+    2) echo "vmess" ;;
+    3) echo "vless" ;;
+    4) echo "trojan" ;;
+    5) echo "zivpn" ;;
+    *) echo "" ;;
+  esac
+}
+
+endpoint_create() {
+  case "$1" in
+    ssh|zivpn) echo "/sshvpn" ;;
+    vmess) echo "/vmessall" ;;
+    vless) echo "/vlessall" ;;
+    trojan) echo "/trojanall" ;;
+    *) echo "" ;;
+  esac
+}
+endpoint_renew() {
+  case "$1" in
+    ssh|zivpn) echo "/renewsshvpn" ;;
+    vmess) echo "/renewvmess" ;;
+    vless) echo "/renewvless" ;;
+    trojan) echo "/renewtrojan" ;;
+    *) echo "" ;;
+  esac
+}
+endpoint_delete() {
+  case "$1" in
+    ssh|zivpn) echo "/deletesshvpn" ;;
+    vmess) echo "/deletevmess" ;;
+    vless) echo "/deletevless" ;;
+    trojan) echo "/deletetrojan" ;;
+    *) echo "" ;;
+  esac
+}
+
+create_account() {
+  local type ep username password exp limitip quota
+  type="$(pick_type)"
+  [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
+  ep="$(endpoint_create "$type")"
+  [[ -z "$ep" ]] && { echo "Endpoint create tidak ada."; return; }
+
+  read -rp "Username: " username
+  read -rp "Expired (hari) [30]: " exp
+  exp="${exp:-30}"
+  read -rp "Limit IP [2]: " limitip
+  limitip="${limitip:-2}"
+  read -rp "Quota GB [0]: " quota
+  quota="${quota:-0}"
+  if [[ "$type" == "ssh" || "$type" == "zivpn" ]]; then
+    read -rp "Password [default=username]: " password
+    password="${password:-$username}"
+  else
+    password=""
+  fi
+
+  local payload
+  if [[ -n "$password" ]]; then
+    payload="$(jq -nc --arg u "$username" --arg p "$password" --argjson e "$exp" --arg l "$limitip" --arg q "$quota" \
+      '{username:$u,password:$p,expired:$e,limitip:$l,kuota:$q}')"
+  else
+    payload="$(jq -nc --arg u "$username" --argjson e "$exp" --arg l "$limitip" --arg q "$quota" \
+      '{username:$u,expired:$e,limitip:$l,kuota:$q}')"
+  fi
+  api_call "POST" "$ep" "$payload" | jq .
+}
+
+renew_account() {
+  local type ep username exp
+  type="$(pick_type)"
+  [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
+  ep="$(endpoint_renew "$type")"
+  [[ -z "$ep" ]] && { echo "Endpoint renew tidak ada."; return; }
+  read -rp "Username: " username
+  read -rp "Tambah expired (hari) [30]: " exp
+  exp="${exp:-30}"
+  api_call "POST" "${ep}/${username}/${exp}" | jq .
+}
+
+delete_account() {
+  local type ep username
+  type="$(pick_type)"
+  [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
+  ep="$(endpoint_delete "$type")"
+  [[ -z "$ep" ]] && { echo "Endpoint delete tidak ada."; return; }
+  read -rp "Username: " username
+  api_call "DELETE" "${ep}/${username}" | jq .
+}
+
+list_accounts() {
+  echo "=== SSH/ZIVPN (DB) ==="
+  sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_sshs ORDER BY username;"
+  echo
+  echo "=== VMESS (DB) ==="
+  sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_vmesses ORDER BY username;"
+  echo
+  echo "=== VLESS (DB) ==="
+  sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_vlesses ORDER BY username;"
+  echo
+  echo "=== TROJAN (DB) ==="
+  sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_trojans ORDER BY username;"
+  echo
+  if [[ -f /etc/zivpn/config.json ]]; then
+    echo "=== ZIVPN auth.config ==="
+    jq -r '.auth.config[]?' /etc/zivpn/config.json || true
+  fi
+}
+
+service_menu() {
+  echo "1) status semua"
+  echo "2) restart semua"
+  echo "3) restart ZIVPN"
+  read -rp "Pilih [1-3]: " s
+  case "$s" in
+    1)
+      systemctl status ssh --no-pager | head -n 12
+      systemctl status nginx --no-pager | head -n 12
+      systemctl status xray --no-pager | head -n 12
+      systemctl status sc-1forcr-api --no-pager | head -n 12
+      systemctl status "${ZIVPN_SERVICE}" --no-pager | head -n 12 || true
+      ;;
+    2)
+      systemctl restart ssh nginx xray sc-1forcr-api
+      systemctl restart "${ZIVPN_SERVICE}" || true
+      echo "Restart selesai."
+      ;;
+    3)
+      systemctl restart "${ZIVPN_SERVICE}" || true
+      echo "Restart ZIVPN selesai."
+      ;;
+    *)
+      echo "Pilihan tidak valid."
+      ;;
+  esac
+}
+
+backup_restore_menu() {
+  echo "1) Backup config ZIVPN ke /root/config.json.zivpn"
+  echo "2) Restore config ZIVPN dari /root/config.json.zivpn"
+  read -rp "Pilih [1-2]: " b
+  case "$b" in
+    1)
+      cp -f /etc/zivpn/config.json /root/config.json.zivpn
+      echo "Backup selesai: /root/config.json.zivpn"
+      ;;
+    2)
+      cp -f /root/config.json.zivpn /etc/zivpn/config.json
+      systemctl restart "${ZIVPN_SERVICE}" || true
+      echo "Restore selesai."
+      ;;
+    *)
+      echo "Pilihan tidak valid."
+      ;;
+  esac
+}
+
+while true; do
+  clear
+  echo "===================================="
+  echo "        SC 1FORCR MENU"
+  echo "===================================="
+  echo "Domain : ${DOMAIN}"
+  echo
+  echo "1) Add Account"
+  echo "2) Renew Account"
+  echo "3) Delete Account"
+  echo "4) List Account"
+  echo "5) Service Menu"
+  echo "6) Backup/Restore ZIVPN Config"
+  echo "7) Uninstall SC 1FORCR"
+  echo "x) Exit"
+  echo
+  read -rp "Pilih menu: " m
+  case "$m" in
+    1) create_account ;;
+    2) renew_account ;;
+    3) delete_account ;;
+    4) list_accounts ;;
+    5) service_menu ;;
+    6) backup_restore_menu ;;
+    7) /usr/local/sbin/uninstall-sc-1forcr ;;
+    x|X) exit 0 ;;
+    *) echo "Pilihan tidak valid." ;;
+  esac
+  echo
+  read -rp "Enter untuk lanjut..." _
+done
+EOF
+
+  chmod +x /usr/local/sbin/menu-sc-1forcr
+  ln -sf /usr/local/sbin/menu-sc-1forcr /usr/local/sbin/menu
+
+  cat > /usr/local/sbin/uninstall-sc-1forcr <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "Jalankan sebagai root."
+  exit 1
+fi
+
+read -r -p "Yakin uninstall SC 1FORCR? [y/N]: " ans
+if [[ "${ans:-}" != "y" && "${ans:-}" != "Y" ]]; then
+  echo "Batal uninstall."
+  exit 0
+fi
+
+systemctl stop sc-1forcr-api >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-api >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/sc-1forcr-api.service
+rm -f /etc/systemd/system/potato-compat-api.service
+systemctl daemon-reload
+
+rm -rf /opt/sc-1forcr
+rm -rf /opt/potato-compat
+rm -f /etc/sc-1forcr.env
+rm -f /etc/potato-compat.env
+rm -f /usr/local/sbin/menu-sc-1forcr
+rm -f /usr/local/sbin/menu-potato
+rm -f /usr/local/sbin/menu
+rm -f /usr/local/sbin/uninstall-sc-1forcr
+rm -f /usr/local/sbin/uninstall-potato-compat
+
+echo "Uninstall SC 1FORCR selesai."
+echo "Catatan: layanan inti (ssh/nginx/xray/zivpn) tidak dihapus otomatis."
+EOF
+  chmod +x /usr/local/sbin/uninstall-sc-1forcr
+}
+
+main() {
+  install_base_packages
+  install_node20_if_missing
+  install_xray
+  init_db
+  setup_nginx_and_cert
+  setup_zivpn_service_if_possible
+  write_api_files
+  setup_services
+  write_cli_menu
+
+  cat <<EOF
+
+=========================================
+SELESAI - SC 1FORCR TERPASANG
+=========================================
+Domain         : ${DOMAIN}
+Email LE       : ${EMAIL}
+DB Path        : ${DB_PATH}
+API Token      : ${API_AUTH_TOKEN}
+API Base       : https://${DOMAIN}/vps
+Summary DB key : tabel servers kolom key = token di atas
+
+Contoh test:
+curl -s -X POST "https://${DOMAIN}/vps/sshvpn" \\
+  -H "Authorization: ${API_AUTH_TOKEN}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"username":"test123","password":"test123","expired":3,"limitip":"2","kuota":"0"}'
+
+Catatan:
+- Endpoint /vps/* sudah kompatibel pola bot kamu (create/trial/renew/delete/lock/unlock).
+- Untuk summary API, tinggal pakai scripts/setup-summary-api.sh di repo ini.
+- Jika binary zivpn belum ada, isi ZIVPN_BIN_URL lalu jalankan ulang script.
+- Menu VPS: jalankan perintah menu atau menu-sc-1forcr
+- Uninstall helper: uninstall-sc-1forcr
+EOF
+}
+
+main "$@"
