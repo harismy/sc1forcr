@@ -253,7 +253,12 @@ server {
     }
 
     location / {
-        return 301 https://\$host\$request_uri;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
     }
 }
 EOF
@@ -338,7 +343,12 @@ server {
     }
 
     location / {
-        return 301 https://\$host\$request_uri;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
     }
 }
 
@@ -395,6 +405,15 @@ server {
     }
 
     location /ws {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location / {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
@@ -1577,7 +1596,12 @@ server {
     }
 
     location / {
-        return 301 https://\$host\$request_uri;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
     }
 }
 EOFNGX
@@ -1649,7 +1673,12 @@ server {
     }
 
     location / {
-        return 301 https://\$host\$request_uri;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
     }
 }
 
@@ -1706,6 +1735,15 @@ server {
     }
 
     location /ws {
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location / {
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
