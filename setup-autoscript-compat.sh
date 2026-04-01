@@ -18,6 +18,9 @@ set -euo pipefail
 #   ZIVPN_BIN_URL=https://.../zivpn-linux-amd64   (opsional)
 #   ZIVPN_RELEASE_TAG=udp-zivpn_1.4.9             (opsional, default dari repo zahidbd2/udp-zivpn)
 #   ZIVPN_SERVICE_NAME=zivpn
+#   ZIVPN_LISTEN_PORT=5667
+#   ZIVPN_DNAT_RANGE=6000:19999
+#   ZIVPN_DNAT_IFACE=eth0                          (opsional, default auto-detect)
 #   DROPBEAR_PORT=109
 #   DROPBEAR_ALT_PORT=143
 #   DROPBEAR_VERSION=2019.78
@@ -33,6 +36,9 @@ API_PORT="${API_PORT:-8088}"
 ZIVPN_BIN_URL="${ZIVPN_BIN_URL:-}"
 ZIVPN_RELEASE_TAG="${ZIVPN_RELEASE_TAG:-udp-zivpn_1.4.9}"
 ZIVPN_SERVICE_NAME="${ZIVPN_SERVICE_NAME:-zivpn}"
+ZIVPN_LISTEN_PORT="${ZIVPN_LISTEN_PORT:-5667}"
+ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
+ZIVPN_DNAT_IFACE="${ZIVPN_DNAT_IFACE:-}"
 DROPBEAR_PORT="${DROPBEAR_PORT:-109}"
 DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
 DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}"
@@ -269,6 +275,21 @@ EOF
   systemctl restart systemd-journald || true
 }
 
+setup_logrotate_optimizations() {
+  log "Setup logrotate ringkas..."
+  cat > /etc/logrotate.d/sc-1forcr <<'EOF'
+/var/log/xray/*.log /var/log/nginx/*.log {
+  daily
+  rotate 7
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+}
+EOF
+}
+
 setup_nginx_and_cert() {
   log "Setup Nginx vhost (80 only)..."
   mkdir -p /var/www/html
@@ -277,10 +298,12 @@ server {
     listen 80;
     listen [::]:80;
     server_name ${DOMAIN};
+    keepalive_timeout 30;
 
     location /.well-known/acme-challenge/ { root /var/www/html; }
 
     location = /cdn-cgi/trace {
+        access_log off;
         default_type text/plain;
         return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
     }
@@ -294,6 +317,7 @@ server {
     }
 
     location /vmess {
+        access_log off;
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10001;
         proxy_http_version 1.1;
@@ -303,6 +327,7 @@ server {
     }
 
     location /vless {
+        access_log off;
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10002;
         proxy_http_version 1.1;
@@ -312,6 +337,7 @@ server {
     }
 
     location /trojan {
+        access_log off;
         proxy_redirect off;
         proxy_pass http://127.0.0.1:10003;
         proxy_http_version 1.1;
@@ -321,6 +347,7 @@ server {
     }
 
     location / {
+        access_log off;
         proxy_redirect off;
         proxy_pass http://127.0.0.1:2082;
         proxy_http_version 1.1;
@@ -364,12 +391,14 @@ global
     log /dev/log local0
     log /dev/log local1 notice
     daemon
-    maxconn 50000
+    maxconn 20000
+    nbthread 1
 
 defaults
     log global
     mode tcp
     option tcplog
+    option dontlognull
     timeout connect 10s
     timeout client  2m
     timeout server  2m
@@ -414,7 +443,7 @@ resolve_zivpn_bin_url() {
 setup_zivpn_service_if_possible() {
   mkdir -p /etc/zivpn
   if [[ ! -f /etc/zivpn/config.json ]]; then
-    cat > /etc/zivpn/config.json <<'EOF'
+    cat > /etc/zivpn/config.json <<EOF
 {
   "auth": {
     "mode": "passwords",
@@ -424,7 +453,7 @@ setup_zivpn_service_if_possible() {
     "tcp": true,
     "udp": true
   },
-  "listen": ":7300"
+  "listen": ":${ZIVPN_LISTEN_PORT}"
 }
 EOF
   fi
@@ -462,9 +491,15 @@ After=network.target
 
 [Service]
 Type=simple
+User=root
+WorkingDirectory=/etc/zivpn
 ExecStart=/usr/local/bin/zivpn server -c /etc/zivpn/config.json
 Restart=always
-RestartSec=2
+RestartSec=3
+Environment=ZIVPN_LOG_LEVEL=info
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target
@@ -472,6 +507,48 @@ EOF
     systemctl daemon-reload
     systemctl enable "${ZIVPN_SERVICE_NAME}" || true
     systemctl restart "${ZIVPN_SERVICE_NAME}" || true
+  fi
+}
+
+setup_zivpn_udp_nat_rules() {
+  if ! command -v zivpn >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! command -v iptables >/dev/null 2>&1; then
+    log "iptables tidak ditemukan. Skip rule DNAT ZIVPN."
+    return 0
+  fi
+
+  local listen_port iface
+  listen_port="$(jq -r '.listen // empty' /etc/zivpn/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
+  if [[ -z "${listen_port}" ]]; then
+    listen_port="$(echo "${ZIVPN_LISTEN_PORT}" | tr -cd '0-9')"
+  fi
+  if [[ -z "${listen_port}" ]]; then
+    listen_port="5667"
+  fi
+
+  iface="${ZIVPN_DNAT_IFACE}"
+  if [[ -z "${iface}" ]]; then
+    iface="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  fi
+  iface="${iface:-eth0}"
+
+  log "Set rule UDP ZIVPN: listen=${listen_port}, iface=${iface}, dnat_range=${ZIVPN_DNAT_RANGE}"
+
+  iptables -C INPUT -p udp --dport "${listen_port}" -j ACCEPT >/dev/null 2>&1 || \
+    iptables -I INPUT -p udp --dport "${listen_port}" -j ACCEPT
+
+  iptables -t nat -C PREROUTING -i "${iface}" -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || \
+    iptables -t nat -I PREROUTING -i "${iface}" -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}"
+
+  if ! command -v netfilter-persistent >/dev/null 2>&1; then
+    log "Install netfilter-persistent agar rule iptables tidak hilang saat reboot..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
+  fi
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
   fi
 }
 
@@ -1031,7 +1108,12 @@ EOF
   export npm_config_build_from_source=true
   export npm_config_fallback_to_build=true
   export npm_config_update_binary=false
-  npm install --omit=dev --foreground-scripts
+  log "Harap tunggu, sedang menginstall sqlite...."
+  if ! npm install --omit=dev --foreground-scripts >/tmp/sc-1forcr-npm-install.log 2>&1; then
+    log "Install npm dependency gagal. Cek log: /tmp/sc-1forcr-npm-install.log"
+    tail -n 80 /tmp/sc-1forcr-npm-install.log || true
+    exit 1
+  fi
   node -e "require('sqlite3'); console.log('sqlite3 load ok')"
 }
 
@@ -1496,9 +1578,15 @@ After=network.target xray.service nginx.service
 Type=simple
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=${APP_DIR}/.env
+Environment=NODE_ENV=production
+Environment=UV_THREADPOOL_SIZE=2
 ExecStart=/usr/bin/node ${APP_DIR}/api.js
 Restart=always
 RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+TasksMax=256
+MemoryMax=350M
 
 [Install]
 WantedBy=multi-user.target
@@ -1515,6 +1603,10 @@ EnvironmentFile=${APP_DIR}/.env
 ExecStart=${APP_DIR}/bin/ssh-mux
 Restart=always
 RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+TasksMax=256
+MemoryMax=128M
 
 [Install]
 WantedBy=multi-user.target
@@ -1534,7 +1626,10 @@ After=network.target sc-1forcr-api.service
 Type=oneshot
 WorkingDirectory=${APP_DIR}
 EnvironmentFile=${APP_DIR}/.env
+Environment=NODE_ENV=production
 ExecStart=/usr/bin/node ${APP_DIR}/iplimit-checker.js
+NoNewPrivileges=true
+PrivateTmp=true
 EOF
 
   cat > /etc/systemd/system/sc-1forcr-iplimit.timer <<'EOF'
@@ -1934,6 +2029,7 @@ EOF
 main() {
   install_base_packages
   apply_system_optimizations
+  setup_logrotate_optimizations
   install_node20_if_missing
   install_go_if_missing
   install_xray
@@ -1942,6 +2038,7 @@ main() {
   setup_nginx_and_cert
   setup_haproxy_tls_mux
   setup_zivpn_service_if_possible
+  setup_zivpn_udp_nat_rules
   write_api_files
   write_go_mux_files
   build_go_files
@@ -1974,6 +2071,7 @@ Catatan:
 - SSH mux runtime sudah pakai Go binary: ${APP_DIR}/bin/ssh-mux
 - Untuk summary API, tinggal pakai scripts/setup-summary-api.sh di repo ini.
 - Jika binary zivpn belum ada, isi ZIVPN_BIN_URL lalu jalankan ulang script.
+- Rule UDP ZIVPN otomatis dipasang: INPUT udp ${ZIVPN_LISTEN_PORT}, DNAT ${ZIVPN_DNAT_RANGE} -> ${ZIVPN_LISTEN_PORT}.
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
 - Uninstall helper: uninstall-sc-1forcr
 - Auto lock IP limit: timer systemd sc-1forcr-iplimit.timer (cek tiap 15 menit, lock sementara 15 menit)
