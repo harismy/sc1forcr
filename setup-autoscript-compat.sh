@@ -1890,7 +1890,7 @@ print_created_account() {
       pass="$(echo "${raw}" | jq -r '.data.password // "-"' )"
       exp="$(echo "${raw}" | jq -r '.data.exp // .data.expired // "-"' )"
       lim="$(echo "${raw}" | jq -r '.data.limitip // "0"' )"
-      cat <<EOF
+      cat <<EOT_SSH
 =============================
  SSH ACCOUNT CREATED
 =============================
@@ -1908,7 +1908,7 @@ Username     : ${user}
 Password     : ${pass}
 Expiry Date  : ${exp}
 IP Limit     : ${lim}
-EOF
+EOT_SSH
       ;;
     zivpn)
       local host pass exp lim
@@ -1916,7 +1916,7 @@ EOF
       pass="$(echo "${raw}" | jq -r '.data.password // .data.username // "-"' )"
       exp="$(echo "${raw}" | jq -r '.data.exp // .data.expired // "-"' )"
       lim="$(echo "${raw}" | jq -r '.data.limitip // "0"' )"
-      cat <<EOF
+      cat <<EOT_ZIVPN
 =============================
  ZIVPN SSH ACCOUNT
 =============================
@@ -1924,7 +1924,7 @@ udp password : ${pass}
 Hostname     : ${host}
 Expired      : ${exp}
 IP Limit     : ${lim} device
-EOF
+EOT_ZIVPN
       ;;
     vmess|vless|trojan)
       local host user exp tls none linktls linknone
@@ -1935,7 +1935,7 @@ EOF
       none="$(echo "${raw}" | jq -r '.data.port.none // "80"' )"
       linktls="$(echo "${raw}" | jq -r '.data.link.tls // "-"' )"
       linknone="$(echo "${raw}" | jq -r '.data.link.none // "-"' )"
-      cat <<EOF
+      cat <<EOT_XRAY
 =============================
  ${type^^} ACCOUNT CREATED
 =============================
@@ -1950,7 +1950,7 @@ ${linktls}
 
 Link NON TLS:
 ${linknone}
-EOF
+EOT_XRAY
       ;;
     *)
       echo "${raw}" | jq . 2>/dev/null || echo "${raw}"
