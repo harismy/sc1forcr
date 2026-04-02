@@ -21,6 +21,12 @@ set -euo pipefail
 #   ZIVPN_LISTEN_PORT=5667
 #   ZIVPN_DNAT_RANGE=6000:19999
 #   ZIVPN_DNAT_IFACE=eth0                          (opsional, default auto-detect)
+#   UDPCUSTOM_BIN_URL=https://raw.github.com/http-custom/udp-custom/main/bin/udp-custom-linux-amd64
+#   UDPCUSTOM_SERVICE_NAME=sc-1forcr-udpcustom
+#   UDPCUSTOM_LISTEN_PORT=5667
+#   UDPCUSTOM_DNAT_RANGE=                        (opsional, default kosong = tanpa DNAT range untuk performa)
+#   UDPCUSTOM_DEFAULT_USER=freeudphc
+#   ACTIVE_UDP_BACKEND=zivpn                       (pilihan: zivpn|udpcustom)
 #   DROPBEAR_PORT=109
 #   DROPBEAR_ALT_PORT=143
 #   DROPBEAR_VERSION=2019.78
@@ -39,6 +45,12 @@ ZIVPN_SERVICE_NAME="${ZIVPN_SERVICE_NAME:-zivpn}"
 ZIVPN_LISTEN_PORT="${ZIVPN_LISTEN_PORT:-5667}"
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
 ZIVPN_DNAT_IFACE="${ZIVPN_DNAT_IFACE:-}"
+UDPCUSTOM_BIN_URL="${UDPCUSTOM_BIN_URL:-https://raw.github.com/http-custom/udp-custom/main/bin/udp-custom-linux-amd64}"
+UDPCUSTOM_SERVICE_NAME="${UDPCUSTOM_SERVICE_NAME:-sc-1forcr-udpcustom}"
+UDPCUSTOM_LISTEN_PORT="${UDPCUSTOM_LISTEN_PORT:-5667}"
+UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
+UDPCUSTOM_DEFAULT_USER="${UDPCUSTOM_DEFAULT_USER:-freeudphc}"
+ACTIVE_UDP_BACKEND="${ACTIVE_UDP_BACKEND:-zivpn}"
 DROPBEAR_PORT="${DROPBEAR_PORT:-109}"
 DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
 DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}"
@@ -550,6 +562,127 @@ setup_zivpn_udp_nat_rules() {
     netfilter-persistent save >/dev/null 2>&1 || true
     systemctl enable netfilter-persistent >/dev/null 2>&1 || true
   fi
+}
+
+setup_udpcustom_service_if_possible() {
+  mkdir -p /root/udp
+
+  if [[ ! -x /root/udp/udp-custom ]]; then
+    log "Download binary udp-custom: ${UDPCUSTOM_BIN_URL}"
+    if curl -fL --retry 5 --retry-delay 2 "${UDPCUSTOM_BIN_URL}" -o /root/udp/udp-custom; then
+      chmod +x /root/udp/udp-custom
+    else
+      log "Gagal download udp-custom. Lanjut tanpa service UDP Custom."
+      return 0
+    fi
+  fi
+
+  if [[ ! -f /root/udp/config.json ]]; then
+    cat > /root/udp/config.json <<EOF
+{
+  "listen": ":${UDPCUSTOM_LISTEN_PORT}",
+  "stream_buffer": 33554432,
+  "receive_buffer": 83886080,
+  "auth": {
+    "mode": "passwords",
+    "config": [
+      "${UDPCUSTOM_DEFAULT_USER}"
+    ]
+  }
+}
+EOF
+  fi
+
+  cat > /etc/systemd/system/${UDPCUSTOM_SERVICE_NAME}.service <<EOF
+[Unit]
+Description=SC 1FORCR UDP Custom Core
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/udp
+ExecStart=/root/udp/udp-custom server
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
+  systemctl restart "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
+}
+
+setup_udpcustom_udp_nat_rules() {
+  if [[ ! -x /root/udp/udp-custom ]]; then
+    return 0
+  fi
+  if ! command -v iptables >/dev/null 2>&1; then
+    log "iptables tidak ditemukan. Skip rule DNAT UDP Custom."
+    return 0
+  fi
+
+  local listen_port iface
+  listen_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
+  if [[ -z "${listen_port}" ]]; then
+    listen_port="$(echo "${UDPCUSTOM_LISTEN_PORT}" | tr -cd '0-9')"
+  fi
+  if [[ -z "${listen_port}" ]]; then
+    listen_port="5667"
+  fi
+
+  iface="${ZIVPN_DNAT_IFACE}"
+  if [[ -z "${iface}" ]]; then
+    iface="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+  fi
+  iface="${iface:-eth0}"
+
+  log "Set rule UDP UDPHC: listen=${listen_port}, iface=${iface}, dnat_range=${UDPCUSTOM_DNAT_RANGE:-none}"
+
+  iptables -C INPUT -p udp --dport "${listen_port}" -j ACCEPT >/dev/null 2>&1 || \
+    iptables -I INPUT -p udp --dport "${listen_port}" -j ACCEPT
+
+  if [[ -n "${UDPCUSTOM_DNAT_RANGE}" ]]; then
+    iptables -t nat -C PREROUTING -i "${iface}" -p udp --dport "${UDPCUSTOM_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || \
+      iptables -t nat -I PREROUTING -i "${iface}" -p udp --dport "${UDPCUSTOM_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}"
+  else
+    log "UDPHC tanpa DNAT range (default performa). Isi UDPCUSTOM_DNAT_RANGE jika perlu mode tembak port."
+    # Bersihkan rule DNAT lama ke port UDPHC agar tidak jadi bottleneck.
+    while IFS= read -r rule; do
+      [[ -z "${rule}" ]] && continue
+      iptables -t nat ${rule/-A/-D} >/dev/null 2>&1 || true
+    done < <(iptables -t nat -S PREROUTING | grep -F -- "-j DNAT --to-destination :${listen_port}" || true)
+  fi
+
+  if ! command -v netfilter-persistent >/dev/null 2>&1; then
+    log "Install netfilter-persistent agar rule iptables tidak hilang saat reboot..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
+  fi
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+  fi
+}
+
+enforce_single_udp_backend() {
+  local backend
+  backend="$(echo "${ACTIVE_UDP_BACKEND}" | tr '[:upper:]' '[:lower:]')"
+  case "${backend}" in
+    udpcustom|udp-custom|udphc)
+      systemctl disable --now "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
+      systemctl enable "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
+      systemctl restart "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
+      log "Backend UDP aktif: UDP Custom (${UDPCUSTOM_SERVICE_NAME})"
+      ;;
+    zivpn|*)
+      systemctl disable --now "${UDPCUSTOM_SERVICE_NAME}" >/dev/null 2>&1 || true
+      systemctl enable "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
+      systemctl restart "${ZIVPN_SERVICE_NAME}" >/dev/null 2>&1 || true
+      log "Backend UDP aktif: ZIVPN (${ZIVPN_SERVICE_NAME})"
+      ;;
+  esac
 }
 
 write_api_files() {
@@ -1663,6 +1796,7 @@ API_PORT=${API_PORT}
 AUTH_TOKEN=${API_AUTH_TOKEN}
 DB_PATH=${DB_PATH}
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
+UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 EOF
@@ -1739,6 +1873,91 @@ endpoint_delete() {
   esac
 }
 
+print_created_account() {
+  local type="$1" raw="$2"
+  local code
+  code="$(echo "${raw}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+  if [[ "${code}" != "200" ]]; then
+    echo "${raw}" | jq . 2>/dev/null || echo "${raw}"
+    return
+  fi
+
+  case "${type}" in
+    ssh)
+      local host user pass exp lim
+      host="$(echo "${raw}" | jq -r '.data.hostname // "-"' )"
+      user="$(echo "${raw}" | jq -r '.data.username // "-"' )"
+      pass="$(echo "${raw}" | jq -r '.data.password // "-"' )"
+      exp="$(echo "${raw}" | jq -r '.data.exp // .data.expired // "-"' )"
+      lim="$(echo "${raw}" | jq -r '.data.limitip // "0"' )"
+      cat <<EOF
+=============================
+ SSH ACCOUNT CREATED
+=============================
+
+[ SSH PREMIUM DETAILS ]
+-----------------------------
+SSH WS       : ${host}:80@${user}:${pass}
+SSH SSL      : ${host}:443@${user}:${pass}
+DNS SELOW    : ${host}:5300@${user}:${pass}
+
+[ HOST INFORMATION ]
+-----------------------------
+Hostname     : ${host}
+Username     : ${user}
+Password     : ${pass}
+Expiry Date  : ${exp}
+IP Limit     : ${lim}
+EOF
+      ;;
+    zivpn)
+      local host pass exp lim
+      host="$(echo "${raw}" | jq -r '.data.hostname // "-"' )"
+      pass="$(echo "${raw}" | jq -r '.data.password // .data.username // "-"' )"
+      exp="$(echo "${raw}" | jq -r '.data.exp // .data.expired // "-"' )"
+      lim="$(echo "${raw}" | jq -r '.data.limitip // "0"' )"
+      cat <<EOF
+=============================
+ ZIVPN SSH ACCOUNT
+=============================
+udp password : ${pass}
+Hostname     : ${host}
+Expired      : ${exp}
+IP Limit     : ${lim} device
+EOF
+      ;;
+    vmess|vless|trojan)
+      local host user exp tls none linktls linknone
+      host="$(echo "${raw}" | jq -r '.data.hostname // "-"' )"
+      user="$(echo "${raw}" | jq -r '.data.username // "-"' )"
+      exp="$(echo "${raw}" | jq -r '.data.exp // .data.expired // "-"' )"
+      tls="$(echo "${raw}" | jq -r '.data.port.tls // "443"' )"
+      none="$(echo "${raw}" | jq -r '.data.port.none // "80"' )"
+      linktls="$(echo "${raw}" | jq -r '.data.link.tls // "-"' )"
+      linknone="$(echo "${raw}" | jq -r '.data.link.none // "-"' )"
+      cat <<EOF
+=============================
+ ${type^^} ACCOUNT CREATED
+=============================
+Hostname     : ${host}
+Username     : ${user}
+Expired      : ${exp}
+TLS Port     : ${tls}
+NON TLS Port : ${none}
+
+Link TLS:
+${linktls}
+
+Link NON TLS:
+${linknone}
+EOF
+      ;;
+    *)
+      echo "${raw}" | jq . 2>/dev/null || echo "${raw}"
+      ;;
+  esac
+}
+
 create_account() {
   local type ep username password exp limitip quota
   type="$(pick_type)"
@@ -1768,7 +1987,9 @@ create_account() {
     payload="$(jq -nc --arg u "$username" --argjson e "$exp" --arg l "$limitip" --arg q "$quota" \
       '{username:$u,expired:$e,limitip:$l,kuota:$q}')"
   fi
-  api_call "POST" "$ep" "$payload" | jq .
+  local resp
+  resp="$(api_call "POST" "$ep" "$payload")"
+  print_created_account "$type" "${resp}"
 }
 
 renew_account() {
@@ -1812,11 +2033,66 @@ list_accounts() {
   fi
 }
 
+udp_backend_status() {
+  local udpcustom
+  udpcustom="$(detect_udpcustom_service)"
+  echo "UDP backend:"
+  echo "- ZIVPN (${ZIVPN_SERVICE}): $(systemctl is-active "${ZIVPN_SERVICE}" 2>/dev/null || echo unknown)"
+  echo "- UDPHC (${udpcustom}): $(systemctl is-active "${udpcustom}" 2>/dev/null || echo unknown)"
+}
+
+switch_udp_to_zivpn() {
+  local udpcustom
+  udpcustom="$(detect_udpcustom_service)"
+  systemctl disable --now "${udpcustom}" >/dev/null 2>&1 || true
+  systemctl enable "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+  systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+  echo "Mode UDP aktif: ZIVPN (UDPHC dimatikan)."
+}
+
+switch_udp_to_udpcustom() {
+  local udpcustom
+  udpcustom="$(detect_udpcustom_service)"
+  systemctl disable --now "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+  systemctl enable "${udpcustom}" >/dev/null 2>&1 || true
+  systemctl restart "${udpcustom}" >/dev/null 2>&1 || true
+  echo "Mode UDP aktif: UDPHC (ZIVPN dimatikan)."
+}
+
+restart_active_udp_backend() {
+  local udpcustom zstat ustat
+  udpcustom="$(detect_udpcustom_service)"
+  zstat="$(systemctl is-active "${ZIVPN_SERVICE}" 2>/dev/null || true)"
+  ustat="$(systemctl is-active "${udpcustom}" 2>/dev/null || true)"
+  if [[ "${zstat}" == "active" && "${ustat}" == "active" ]]; then
+    systemctl disable --now "${udpcustom}" >/dev/null 2>&1 || true
+    systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+    echo "Keduanya aktif, dipaksa single backend: ZIVPN aktif, UDPHC dimatikan."
+    return
+  fi
+  if [[ "${zstat}" == "active" ]]; then
+    systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+    echo "Restart backend aktif: ZIVPN."
+    return
+  fi
+  if [[ "${ustat}" == "active" ]]; then
+    systemctl restart "${udpcustom}" >/dev/null 2>&1 || true
+    echo "Restart backend aktif: UDPHC."
+    return
+  fi
+  echo "Tidak ada backend UDP yang aktif."
+}
+
 service_menu() {
+  local udpcustom
+  udpcustom="$(detect_udpcustom_service)"
   echo "1) status semua"
   echo "2) restart semua"
-  echo "3) restart ZIVPN"
-  read -rp "Pilih [1-3]: " s
+  echo "3) restart backend UDP aktif"
+  echo "4) aktifkan ZIVPN (matikan UDPHC)"
+  echo "5) aktifkan UDPHC (matikan ZIVPN)"
+  echo "6) status backend UDP"
+  read -rp "Pilih [1-6]: " s
   case "$s" in
     1)
       systemctl status ssh --no-pager | head -n 12
@@ -1827,15 +2103,24 @@ service_menu() {
       systemctl status haproxy --no-pager | head -n 12 || true
       systemctl status dropbear --no-pager | head -n 12 || true
       systemctl status "${ZIVPN_SERVICE}" --no-pager | head -n 12 || true
+      systemctl status "${udpcustom}" --no-pager | head -n 12 || true
       ;;
     2)
       systemctl restart ssh dropbear nginx haproxy xray sc-1forcr-api sc-1forcr-sshws
-      systemctl restart "${ZIVPN_SERVICE}" || true
+      restart_active_udp_backend
       echo "Restart selesai."
       ;;
     3)
-      systemctl restart "${ZIVPN_SERVICE}" || true
-      echo "Restart ZIVPN selesai."
+      restart_active_udp_backend
+      ;;
+    4)
+      switch_udp_to_zivpn
+      ;;
+    5)
+      switch_udp_to_udpcustom
+      ;;
+    6)
+      udp_backend_status
       ;;
     *)
       echo "Pilihan tidak valid."
@@ -1844,9 +2129,20 @@ service_menu() {
 }
 
 backup_restore_menu() {
+  local bdir ts db_backup cfg_zivpn cfg_udphc
+  bdir="/root/backup-sc-1forcr"
+  ts="$(date +%Y%m%d-%H%M%S)"
+  db_backup="${bdir}/accounts-${ts}.db"
+  cfg_zivpn="${bdir}/zivpn-config-${ts}.json"
+  cfg_udphc="${bdir}/udphc-config-${ts}.json"
+
+  mkdir -p "${bdir}"
+
   echo "1) Backup config ZIVPN ke /root/config.json.zivpn"
   echo "2) Restore config ZIVPN dari /root/config.json.zivpn"
-  read -rp "Pilih [1-2]: " b
+  echo "3) Backup akun (SSH/VMESS/VLESS/TROJAN) + config ZIVPN + config UDPHC"
+  echo "4) Restore akun + config dari backup terbaru"
+  read -rp "Pilih [1-4]: " b
   case "$b" in
     1)
       cp -f /etc/zivpn/config.json /root/config.json.zivpn
@@ -1856,6 +2152,46 @@ backup_restore_menu() {
       cp -f /root/config.json.zivpn /etc/zivpn/config.json
       systemctl restart "${ZIVPN_SERVICE}" || true
       echo "Restore selesai."
+      ;;
+    3)
+      if [[ -f "${DB_PATH}" ]]; then
+        sqlite3 "${DB_PATH}" ".backup '${db_backup}'"
+        cp -f "${db_backup}" "${bdir}/accounts-latest.db"
+      fi
+      if [[ -f /etc/zivpn/config.json ]]; then
+        cp -f /etc/zivpn/config.json "${cfg_zivpn}"
+        cp -f /etc/zivpn/config.json "${bdir}/zivpn-config-latest.json"
+      fi
+      if [[ -f /root/udp/config.json ]]; then
+        cp -f /root/udp/config.json "${cfg_udphc}"
+        cp -f /root/udp/config.json "${bdir}/udphc-config-latest.json"
+      fi
+      echo "Backup selesai di: ${bdir}"
+      ls -lh "${bdir}" | sed -n '1,12p'
+      ;;
+    4)
+      if [[ -f "${bdir}/accounts-latest.db" ]]; then
+        systemctl stop sc-1forcr-api >/dev/null 2>&1 || true
+        cp -f "${bdir}/accounts-latest.db" "${DB_PATH}"
+        chown root:root "${DB_PATH}" >/dev/null 2>&1 || true
+        chmod 600 "${DB_PATH}" >/dev/null 2>&1 || true
+        systemctl start sc-1forcr-api >/dev/null 2>&1 || true
+      fi
+      if [[ -f "${bdir}/zivpn-config-latest.json" ]]; then
+        cp -f "${bdir}/zivpn-config-latest.json" /etc/zivpn/config.json
+      fi
+      if [[ -f "${bdir}/udphc-config-latest.json" ]]; then
+        mkdir -p /root/udp
+        cp -f "${bdir}/udphc-config-latest.json" /root/udp/config.json
+      fi
+      systemctl restart xray >/dev/null 2>&1 || true
+      systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+      if systemctl list-unit-files | grep -q '^sc-1forcr-udpcustom\.service'; then
+        systemctl restart sc-1forcr-udpcustom >/dev/null 2>&1 || true
+      elif systemctl list-unit-files | grep -q '^udp-custom\.service'; then
+        systemctl restart udp-custom >/dev/null 2>&1 || true
+      fi
+      echo "Restore dari backup terbaru selesai."
       ;;
     *)
       echo "Pilihan tidak valid."
@@ -1938,6 +2274,171 @@ monitor_temp_lock_menu() {
   " || true
 }
 
+detect_udpcustom_service() {
+  if systemctl list-unit-files | grep -q '^sc-1forcr-udpcustom\.service'; then
+    echo "sc-1forcr-udpcustom"
+    return
+  fi
+  if systemctl list-unit-files | grep -q '^udp-custom\.service'; then
+    echo "udp-custom"
+    return
+  fi
+  echo "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}"
+}
+
+show_ssh_online() {
+  echo "=== SSH ONLINE (who) ==="
+  if ! command -v who >/dev/null 2>&1; then
+    echo "Perintah who tidak tersedia."
+    return
+  fi
+  local out
+  out="$(who 2>/dev/null | awk '
+    {
+      user=$1; ip="";
+      if (match($0, /\([^)]+\)/)) ip=substr($0, RSTART+1, RLENGTH-2);
+      if (user != "" && ip != "") print user "|" ip;
+    }' | sort)"
+  if [[ -z "${out}" ]]; then
+    echo "Tidak ada user SSH aktif."
+    return
+  fi
+  echo "${out}" | awk -F'|' '
+    { key=$1 "|" $2; c[key]++ }
+    END {
+      printf "%-20s %-24s %s\n", "username", "ip", "session";
+      for (k in c) {
+        split(k, a, "|");
+        printf "%-20s %-24s %d\n", a[1], a[2], c[k];
+      }
+    }' | sort
+}
+
+xray_log_snapshot() {
+  local dst="$1"
+  if [[ ! -f /var/log/xray/access.log ]]; then
+    : > "${dst}"
+    return
+  fi
+  tail -n 25000 /var/log/xray/access.log | awk '
+    {
+      email=""; src="";
+      if (match($0, /"email":"[^"]+"/)) {
+        email=substr($0, RSTART+9, RLENGTH-10);
+      } else if (match($0, /email:[[:space:]]*[^[:space:]]+/)) {
+        t=substr($0, RSTART, RLENGTH); sub(/email:[[:space:]]*/, "", t); email=t;
+      }
+
+      if (match($0, /"source":"[^"]+"/)) {
+        src=substr($0, RSTART+10, RLENGTH-11);
+      } else if (match($0, /from[[:space:]]+[0-9a-fA-F\.:]+/)) {
+        t=substr($0, RSTART, RLENGTH); sub(/from[[:space:]]+/, "", t); src=t;
+      }
+
+      if (email == "") next;
+      gsub(/[[:space:]]/, "", email);
+      email=tolower(email);
+
+      ip=src;
+      sub(/:[0-9]+$/, "", ip);
+
+      seen[email]=1;
+      if (ip != "") lastip[email]=ip;
+    }
+    END {
+      for (u in seen) {
+        printf "%s|%s\n", u, lastip[u];
+      }
+    }' > "${dst}"
+}
+
+show_xray_online_by_table() {
+  local table="$1" label="$2"
+  local t_users t_seen
+  t_users="$(mktemp)"
+  t_seen="$(mktemp)"
+  trap 'rm -f "${t_users}" "${t_seen}"' RETURN
+
+  sqlite3 "${DB_PATH}" "SELECT LOWER(username) FROM ${table} WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' ORDER BY LOWER(username);" > "${t_users}" 2>/dev/null || true
+  if [[ ! -s "${t_users}" ]]; then
+    echo "=== ${label} ONLINE ==="
+    echo "Tidak ada akun ${label} aktif di DB."
+    return
+  fi
+
+  xray_log_snapshot "${t_seen}"
+
+  echo "=== ${label} ONLINE (berdasarkan log xray terbaru) ==="
+  awk -F'|' '
+    NR==FNR { ip[$1]=$2; next }
+    {
+      u=$1;
+      if (u in ip) {
+        seen=1;
+        printf "%-20s %s\n", u, (ip[u] == "" ? "-" : ip[u]);
+      }
+    }
+    END {
+      if (!seen) print "Tidak ada aktivitas terbaru.";
+    }' "${t_seen}" "${t_users}" | sort
+}
+
+show_udpcustom_online() {
+  local svc
+  svc="$(detect_udpcustom_service)"
+  echo "=== UDP CUSTOM ONLINE (log terbaru) ==="
+  if ! systemctl list-unit-files | grep -q "^${svc}\.service"; then
+    echo "Service UDP Custom tidak ditemukan."
+    return
+  fi
+
+  journalctl -u "${svc}" -n 800 --no-pager 2>/dev/null | \
+    sed -nE 's/.*\[src:([^]]+)\] \[user:([^]]+)\] Client connected.*/\2|\1/p' | \
+    awk -F'|' '
+      {
+        user=$1; src=$2;
+        cnt[user]++; last[user]=src;
+      }
+      END {
+        if (length(cnt) == 0) {
+          print "Tidak ada koneksi terbaru.";
+          exit;
+        }
+        printf "%-20s %-24s %s\n", "username", "last_src", "hits";
+        for (u in cnt) {
+          printf "%-20s %-24s %d\n", u, last[u], cnt[u];
+        }
+      }' | sort
+}
+
+monitor_online_menu() {
+  while true; do
+    clear
+    echo "===================================="
+    echo "      MONITOR USER ONLINE"
+    echo "===================================="
+    echo "1) SSH"
+    echo "2) VMESS"
+    echo "3) VLESS"
+    echo "4) TROJAN"
+    echo "5) UDP CUSTOM"
+    echo "0) Kembali"
+    echo
+    read -rp "Pilih menu: " o
+    case "${o}" in
+      1) show_ssh_online ;;
+      2) show_xray_online_by_table "account_vmesses" "VMESS" ;;
+      3) show_xray_online_by_table "account_vlesses" "VLESS" ;;
+      4) show_xray_online_by_table "account_trojans" "TROJAN" ;;
+      5) show_udpcustom_online ;;
+      0) return ;;
+      *) echo "Pilihan tidak valid." ;;
+    esac
+    echo
+    read -rp "Enter untuk lanjut..." _
+  done
+}
+
 while true; do
   clear
   echo "===================================="
@@ -1950,10 +2451,11 @@ while true; do
   echo "3) Delete Account"
   echo "4) List Account"
   echo "5) Service Menu"
-  echo "6) Backup/Restore ZIVPN Config"
+  echo "6) Backup/Restore Config + Akun"
   echo "7) Ganti Domain + Renew SSL"
   echo "8) Monitor Lock Sementara (IP Limit)"
-  echo "9) Uninstall SC 1FORCR"
+  echo "9) Monitor User Online"
+  echo "10) Uninstall SC 1FORCR"
   echo "x) Exit"
   echo
   read -rp "Pilih menu: " m
@@ -1966,7 +2468,8 @@ while true; do
     6) backup_restore_menu ;;
     7) change_domain_menu ;;
     8) monitor_temp_lock_menu ;;
-    9) /usr/local/sbin/uninstall-sc-1forcr ;;
+    9) monitor_online_menu ;;
+    10) /usr/local/sbin/uninstall-sc-1forcr ;;
     x|X) exit 0 ;;
     *) echo "Pilihan tidak valid." ;;
   esac
@@ -2003,10 +2506,15 @@ systemctl stop sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-iplimit.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-udpcustom >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-udpcustom >/dev/null 2>&1 || true
+systemctl stop udp-custom >/dev/null 2>&1 || true
+systemctl disable udp-custom >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/sc-1forcr-api.service
 rm -f /etc/systemd/system/sc-1forcr-sshws.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.timer
+rm -f /etc/systemd/system/sc-1forcr-udpcustom.service
 rm -f /etc/systemd/system/potato-compat-api.service
 systemctl daemon-reload
 
@@ -2039,6 +2547,9 @@ main() {
   setup_haproxy_tls_mux
   setup_zivpn_service_if_possible
   setup_zivpn_udp_nat_rules
+  setup_udpcustom_service_if_possible
+  setup_udpcustom_udp_nat_rules
+  enforce_single_udp_backend
   write_api_files
   write_go_mux_files
   build_go_files
@@ -2072,6 +2583,9 @@ Catatan:
 - Untuk summary API, tinggal pakai scripts/setup-summary-api.sh di repo ini.
 - Jika binary zivpn belum ada, isi ZIVPN_BIN_URL lalu jalankan ulang script.
 - Rule UDP ZIVPN otomatis dipasang: INPUT udp ${ZIVPN_LISTEN_PORT}, DNAT ${ZIVPN_DNAT_RANGE} -> ${ZIVPN_LISTEN_PORT}.
+- UDP Custom juga otomatis disiapkan di service ${UDPCUSTOM_SERVICE_NAME} (config: /root/udp/config.json).
+- UDP Custom default tanpa DNAT range (lebih stabil/cepat). Jika perlu mode tembak port, isi UDPCUSTOM_DNAT_RANGE.
+- Hanya 1 backend UDP aktif sesuai ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND} (zivpn|udpcustom).
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
 - Uninstall helper: uninstall-sc-1forcr
 - Auto lock IP limit: timer systemd sc-1forcr-iplimit.timer (cek tiap 15 menit, lock sementara 15 menit)
