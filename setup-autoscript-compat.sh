@@ -15,6 +15,7 @@ set -euo pipefail
 #   DOMAIN=example.com
 #   EMAIL=admin@example.com
 #   API_AUTH_TOKEN=token-rahasia
+#   UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh
 #   ZIVPN_BIN_URL=https://.../zivpn-linux-amd64   (opsional)
 #   ZIVPN_RELEASE_TAG=udp-zivpn_1.4.9             (opsional, default dari repo zahidbd2/udp-zivpn)
 #   ZIVPN_SERVICE_NAME=zivpn
@@ -36,6 +37,7 @@ set -euo pipefail
 DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-}"
 API_AUTH_TOKEN="${API_AUTH_TOKEN:-}"
+UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh}"
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
 APP_DIR="${APP_DIR:-/opt/sc-1forcr}"
 API_PORT="${API_PORT:-8088}"
@@ -1792,8 +1794,10 @@ write_cli_menu() {
 
   cat > /etc/sc-1forcr.env <<EOF
 DOMAIN=${DOMAIN}
+EMAIL=${EMAIL}
 API_PORT=${API_PORT}
 AUTH_TOKEN=${API_AUTH_TOKEN}
+UPDATE_SCRIPT_URL=${UPDATE_SCRIPT_URL}
 DB_PATH=${DB_PATH}
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
 UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
@@ -2384,15 +2388,8 @@ show_xray_online_by_table() {
 }
 
 show_udpcustom_online() {
-  local svc
-  svc="$(detect_udpcustom_service)"
   echo "=== UDP CUSTOM ONLINE (log terbaru) ==="
-  if ! systemctl list-unit-files | grep -q "^${svc}\.service"; then
-    echo "Service UDP Custom tidak ditemukan."
-    return
-  fi
-
-  journalctl -u "${svc}" -n 800 --no-pager 2>/dev/null | \
+  journalctl -u sc-1forcr-udpcustom -u udp-custom -n 800 --no-pager 2>/dev/null | \
     sed -nE 's/.*\[src:([^]]+)\] \[user:([^]]+)\] Client connected.*/\2|\1/p' | \
     awk -F'|' '
       {
@@ -2409,6 +2406,48 @@ show_udpcustom_online() {
           printf "%-20s %-24s %d\n", u, last[u], cnt[u];
         }
       }' | sort
+}
+
+update_script_from_repo() {
+  local url tmp active_backend
+  url="${UPDATE_SCRIPT_URL:-}"
+  if [[ -z "${url}" ]]; then
+    echo "UPDATE_SCRIPT_URL belum diisi di /etc/sc-1forcr.env"
+    echo "Contoh:"
+    echo "UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/<user>/<repo>/main/scripts/setup-autoscript-compat.sh"
+    return
+  fi
+
+  tmp="/tmp/setup-autoscript-compat.sh"
+  echo "Download update script dari: ${url}"
+  if ! curl -fsSL "${url}" -o "${tmp}"; then
+    echo "Gagal download update script."
+    return
+  fi
+  chmod +x "${tmp}"
+  if ! bash -n "${tmp}"; then
+    echo "Update script gagal validasi syntax (bash -n)."
+    return
+  fi
+
+  active_backend="zivpn"
+  if systemctl is-active --quiet "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}"; then
+    active_backend="udpcustom"
+  fi
+
+  echo "Menjalankan update installer..."
+  DOMAIN="${DOMAIN}" \
+  EMAIL="${EMAIL:-admin@${DOMAIN}}" \
+  API_AUTH_TOKEN="${AUTH_TOKEN}" \
+  UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL}" \
+  DB_PATH="${DB_PATH}" \
+  APP_DIR="/opt/sc-1forcr" \
+  ZIVPN_SERVICE_NAME="${ZIVPN_SERVICE}" \
+  UDPCUSTOM_SERVICE_NAME="${UDPCUSTOM_SERVICE}" \
+  DROPBEAR_PORT="${DROPBEAR_PORT}" \
+  DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT}" \
+  ACTIVE_UDP_BACKEND="${active_backend}" \
+  bash "${tmp}"
 }
 
 monitor_online_menu() {
@@ -2456,6 +2495,7 @@ while true; do
   echo "8) Monitor Lock Sementara (IP Limit)"
   echo "9) Monitor User Online"
   echo "10) Uninstall SC 1FORCR"
+  echo "11) Update Script dari Repo"
   echo "x) Exit"
   echo
   read -rp "Pilih menu: " m
@@ -2470,6 +2510,7 @@ while true; do
     8) monitor_temp_lock_menu ;;
     9) monitor_online_menu ;;
     10) /usr/local/sbin/uninstall-sc-1forcr ;;
+    11) update_script_from_repo ;;
     x|X) exit 0 ;;
     *) echo "Pilihan tidak valid." ;;
   esac
@@ -2587,6 +2628,7 @@ Catatan:
 - UDP Custom default tanpa DNAT range (lebih stabil/cepat). Jika perlu mode tembak port, isi UDPCUSTOM_DNAT_RANGE.
 - Hanya 1 backend UDP aktif sesuai ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND} (zivpn|udpcustom).
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
+- Update sekali klik dari menu: isi UPDATE_SCRIPT_URL lalu pilih menu 11 (Update Script dari Repo)
 - Uninstall helper: uninstall-sc-1forcr
 - Auto lock IP limit: timer systemd sc-1forcr-iplimit.timer (cek tiap 15 menit, lock sementara 15 menit)
 EOF
