@@ -2314,8 +2314,14 @@ show_ssh_online() {
 
   # SSH/Dropbear user aktif dari process sshd + who
   ps -eo args= 2>/dev/null | awk '
-    match($0, /^sshd: ([^ @\[]+)/, a) {
-      u=tolower(a[1]);
+    /^sshd:[[:space:]]/ {
+      line=$0;
+      sub(/^sshd:[[:space:]]*/, "", line);
+      u=line;
+      sub(/[[:space:]].*$/, "", u);
+      sub(/\[.*$/, "", u);
+      sub(/@.*$/, "", u);
+      u=tolower(u);
       if (u != "" && u != "root") print u;
     }' >> "${tmp_users}"
   who 2>/dev/null | awk '{u=tolower($1); if (u != "" && u != "root") print u;}' >> "${tmp_users}"
