@@ -1146,7 +1146,7 @@ const server = net.createServer((client) => {
     });
     upstream.on('error', closeAll);
     upstream.on('close', closeAll);
-    upstream.setTimeout(180000, closeAll);
+    upstream.setTimeout(0);
   };
 
   const startRawSshTunnel = (firstPayload) => {
@@ -1229,7 +1229,7 @@ const server = net.createServer((client) => {
 
   client.on('error', closeAll);
   client.on('close', closeAll);
-  client.setTimeout(180000, closeAll);
+  client.setTimeout(0);
 });
 
 server.listen(PORT, '127.0.0.1', () => {
@@ -1238,17 +1238,29 @@ server.listen(PORT, '127.0.0.1', () => {
 EOF
 
   cd "${APP_DIR}"
-  rm -rf node_modules package-lock.json
-  npm cache clean --force >/dev/null 2>&1 || true
   export npm_config_build_from_source=true
   export npm_config_fallback_to_build=true
   export npm_config_update_binary=false
-  log "Harap tunggu, sedang menginstall sqlite...."
-  if ! npm install --omit=dev --foreground-scripts >/tmp/sc-1forcr-npm-install.log 2>&1; then
-    log "Install npm dependency gagal. Cek log: /tmp/sc-1forcr-npm-install.log"
-    tail -n 80 /tmp/sc-1forcr-npm-install.log || true
-    exit 1
+
+  local need_npm_install="0"
+  if [[ ! -d node_modules ]]; then
+    need_npm_install="1"
+    log "node_modules belum ada, install dependency..."
+  elif ! node -e "require('sqlite3'); require('express'); require('dotenv'); require('ws')" >/dev/null 2>&1; then
+    need_npm_install="1"
+    log "Dependency Node terdeteksi rusak/kurang, reinstall dependency..."
+  else
+    log "Dependency Node sudah OK, skip reinstall sqlite."
   fi
+
+  if [[ "${need_npm_install}" == "1" ]]; then
+    if ! npm install --omit=dev --foreground-scripts >/tmp/sc-1forcr-npm-install.log 2>&1; then
+      log "Install npm dependency gagal. Cek log: /tmp/sc-1forcr-npm-install.log"
+      tail -n 80 /tmp/sc-1forcr-npm-install.log || true
+      exit 1
+    fi
+  fi
+
   node -e "require('sqlite3'); console.log('sqlite3 load ok')"
 }
 
@@ -1319,7 +1331,6 @@ func tunnelBoth(a, b net.Conn) {
 
 func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int) {
 	defer client.Close()
-	_ = client.SetDeadline(time.Now().Add(3 * time.Minute))
 	reader := bufio.NewReaderSize(client, 64*1024)
 
 	peek, err := reader.Peek(4)
@@ -2291,31 +2302,61 @@ detect_udpcustom_service() {
 }
 
 show_ssh_online() {
-  echo "=== SSH ONLINE (who) ==="
-  if ! command -v who >/dev/null 2>&1; then
-    echo "Perintah who tidak tersedia."
-    return
+  echo "=== SSH ONLINE (socket + who) ==="
+
+  local ss_out who_out
+  ss_out="$(ss -Htnp state established 2>/dev/null | awk '
+    {
+      local=$4; remote=$5;
+      split(local, la, ":");
+      lport=la[length(la)];
+      if (lport != "22" && lport != "109" && lport != "143") next;
+      if (index($0, "sshd") == 0) next;
+      ip=remote;
+      sub(/^\[/, "", ip);
+      sub(/\]$/, "", ip);
+      sub(/:[0-9]+$/, "", ip);
+      if (ip != "") print ip;
+    }' | sort)"
+
+  echo "--- TCP SSH aktif (port 22/109/143) ---"
+  if [[ -n "${ss_out}" ]]; then
+    echo "${ss_out}" | awk '
+      { c[$1]++ }
+      END {
+        total=0;
+        printf "%-24s %s\n", "ip", "session";
+        for (k in c) {
+          printf "%-24s %d\n", k, c[k];
+          total += c[k];
+        }
+        printf "\nTotal sesi TCP SSH: %d\n", total;
+      }' | sort
+  else
+    echo "Tidak ada sesi TCP SSH aktif."
   fi
-  local out
-  out="$(who 2>/dev/null | awk '
+
+  echo
+  echo "--- TTY login (who) ---"
+  who_out="$(who 2>/dev/null | awk '
     {
       user=$1; ip="";
       if (match($0, /\([^)]+\)/)) ip=substr($0, RSTART+1, RLENGTH-2);
       if (user != "" && ip != "") print user "|" ip;
     }' | sort)"
-  if [[ -z "${out}" ]]; then
-    echo "Tidak ada user SSH aktif."
-    return
+  if [[ -n "${who_out}" ]]; then
+    echo "${who_out}" | awk -F'|' '
+      { key=$1 "|" $2; c[key]++ }
+      END {
+        printf "%-20s %-24s %s\n", "username", "ip", "session";
+        for (k in c) {
+          split(k, a, "|");
+          printf "%-20s %-24s %d\n", a[1], a[2], c[k];
+        }
+      }' | sort
+  else
+    echo "Tidak ada TTY login (normal untuk koneksi WS/HTTP custom)."
   fi
-  echo "${out}" | awk -F'|' '
-    { key=$1 "|" $2; c[key]++ }
-    END {
-      printf "%-20s %-24s %s\n", "username", "ip", "session";
-      for (k in c) {
-        split(k, a, "|");
-        printf "%-20s %-24s %d\n", a[1], a[2], c[k];
-      }
-    }' | sort
 }
 
 xray_log_snapshot() {
@@ -2388,9 +2429,15 @@ show_xray_online_by_table() {
 }
 
 show_udpcustom_online() {
+  local udpcustom
+  udpcustom="$(detect_udpcustom_service)"
   echo "=== UDP CUSTOM ONLINE (log terbaru) ==="
-  journalctl -u sc-1forcr-udpcustom -u udp-custom -n 800 --no-pager 2>/dev/null | \
-    sed -nE 's/.*\[src:([^]]+)\] \[user:([^]]+)\] Client connected.*/\2|\1/p' | \
+  journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom -n 1200 --no-pager 2>/dev/null | \
+    sed -nE '
+      s/.*\[src:([^]]+)\][[:space:]]+\[user:([^]]+)\][[:space:]]+Client connected.*/\2|\1/p;
+      s/.*user[=: ]([^ ,]+).*src[=: ]([^ ,]+).*/\1|\2/p;
+      s/.*src[=: ]([^ ,]+).*user[=: ]([^ ,]+).*/\2|\1/p;
+    ' | \
     awk -F'|' '
       {
         user=$1; src=$2;
