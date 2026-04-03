@@ -2302,61 +2302,51 @@ detect_udpcustom_service() {
 }
 
 show_ssh_online() {
-  echo "=== SSH ONLINE (socket + who) ==="
+  local ip isp tmp_users tmp_count udpcustom
+  ip="$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+  ip="${ip:-unknown}"
+  isp="$(curl -fsS --max-time 4 "https://ipinfo.io/${ip}/org" 2>/dev/null || echo unknown)"
+  udpcustom="$(detect_udpcustom_service)"
 
-  local ss_out who_out
-  ss_out="$(ss -Htnp state established 2>/dev/null | awk '
-    {
-      local=$4; remote=$5;
-      split(local, la, ":");
-      lport=la[length(la)];
-      if (lport != "22" && lport != "109" && lport != "143") next;
-      if (index($0, "sshd") == 0) next;
-      ip=remote;
-      sub(/^\[/, "", ip);
-      sub(/\]$/, "", ip);
-      sub(/:[0-9]+$/, "", ip);
-      if (ip != "") print ip;
-    }' | sort)"
+  tmp_users="$(mktemp)"
+  tmp_count="$(mktemp)"
+  trap 'rm -f "${tmp_users}" "${tmp_count}"' RETURN
 
-  echo "--- TCP SSH aktif (port 22/109/143) ---"
-  if [[ -n "${ss_out}" ]]; then
-    echo "${ss_out}" | awk '
-      { c[$1]++ }
-      END {
-        total=0;
-        printf "%-24s %s\n", "ip", "session";
-        for (k in c) {
-          printf "%-24s %d\n", k, c[k];
-          total += c[k];
-        }
-        printf "\nTotal sesi TCP SSH: %d\n", total;
-      }' | sort
-  else
-    echo "Tidak ada sesi TCP SSH aktif."
+  # SSH/Dropbear user aktif dari process sshd + who
+  ps -eo args= 2>/dev/null | awk '
+    match($0, /^sshd: ([^ @\[]+)/, a) {
+      u=tolower(a[1]);
+      if (u != "" && u != "root") print u;
+    }' >> "${tmp_users}"
+  who 2>/dev/null | awk '{u=tolower($1); if (u != "" && u != "root") print u;}' >> "${tmp_users}"
+
+  # UDP Custom user dari log terbaru (format lama + format baru)
+  journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom -n 1200 --no-pager 2>/dev/null | \
+    sed -nE '
+      s/.*\[src:[^]]+\][[:space:]]+\[user:([^]]+)\][[:space:]]+Client connected.*/\1/p;
+      s/.*\[user:([^]]+)\].*/\1/p;
+      s/.*user[=: ]([^ ,]+).*src[=: ][^ ,]+.*/\1/p;
+    ' | tr '[:upper:]' '[:lower:]' >> "${tmp_users}"
+
+  grep -E '^[a-z0-9._-]+$' "${tmp_users}" | awk '{c[$1]++} END {for (u in c) printf "%s %d\n", u, c[u]}' | sort > "${tmp_count}" || true
+
+  echo "IP     : ${ip}"
+  echo "DOMAIN : ${DOMAIN}"
+  echo "ISP    : ${isp}"
+  echo "Users Login SSH/Dropbear + UDP Custom"
+
+  if [[ ! -s "${tmp_count}" ]]; then
+    echo "Tidak ada user online terdeteksi."
+    echo
+    echo "Total User : 0"
+    echo "Total PID  : 0"
+    return
   fi
 
+  awk '{printf "%s %d PID\n", $1, $2}' "${tmp_count}"
   echo
-  echo "--- TTY login (who) ---"
-  who_out="$(who 2>/dev/null | awk '
-    {
-      user=$1; ip="";
-      if (match($0, /\([^)]+\)/)) ip=substr($0, RSTART+1, RLENGTH-2);
-      if (user != "" && ip != "") print user "|" ip;
-    }' | sort)"
-  if [[ -n "${who_out}" ]]; then
-    echo "${who_out}" | awk -F'|' '
-      { key=$1 "|" $2; c[key]++ }
-      END {
-        printf "%-20s %-24s %s\n", "username", "ip", "session";
-        for (k in c) {
-          split(k, a, "|");
-          printf "%-20s %-24s %d\n", a[1], a[2], c[k];
-        }
-      }' | sort
-  else
-    echo "Tidak ada TTY login (normal untuk koneksi WS/HTTP custom)."
-  fi
+  echo "Total User : $(wc -l < "${tmp_count}" | tr -d ' ')"
+  echo "Total PID  : $(awk '{s+=$2} END{print s+0}' "${tmp_count}")"
 }
 
 xray_log_snapshot() {
@@ -2503,7 +2493,7 @@ monitor_online_menu() {
     echo "===================================="
     echo "      MONITOR USER ONLINE"
     echo "===================================="
-    echo "1) SSH"
+    echo "1) SSH + UDP CUSTOM"
     echo "2) VMESS"
     echo "3) VLESS"
     echo "4) TROJAN"
