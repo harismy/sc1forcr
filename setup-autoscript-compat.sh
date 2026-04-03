@@ -2312,19 +2312,21 @@ show_ssh_online() {
   tmp_count="$(mktemp)"
   trap 'rm -f "${tmp_users}" "${tmp_count}"' RETURN
 
-  # SSH/Dropbear user aktif dari process sshd + who
-  ps -eo args= 2>/dev/null | awk '
-    /^sshd:[[:space:]]/ {
-      line=$0;
-      sub(/^sshd:[[:space:]]*/, "", line);
-      u=line;
-      sub(/[[:space:]].*$/, "", u);
-      sub(/\[.*$/, "", u);
-      sub(/@.*$/, "", u);
-      u=tolower(u);
-      if (u != "" && u != "root") print u;
-    }' >> "${tmp_users}"
-  who 2>/dev/null | awk '{u=tolower($1); if (u != "" && u != "root") print u;}' >> "${tmp_users}"
+  # SSH/Dropbear user aktif dari process sshd + who (tanpa awk kompleks agar kompatibel)
+  ps -eo args= 2>/dev/null | \
+    sed -n 's/^sshd:[[:space:]]*//p' | \
+    sed -E 's/[[:space:]].*$//' | \
+    sed -E 's/@.*$//' | \
+    sed -E 's/\[.*$//' | \
+    tr '[:upper:]' '[:lower:]' | \
+    grep -E '^[a-z0-9._-]+$' | \
+    grep -v '^root$' >> "${tmp_users}" || true
+
+  who 2>/dev/null | \
+    cut -d' ' -f1 | \
+    tr '[:upper:]' '[:lower:]' | \
+    grep -E '^[a-z0-9._-]+$' | \
+    grep -v '^root$' >> "${tmp_users}" || true
 
   # UDP Custom user dari log terbaru (format lama + format baru)
   journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom -n 1200 --no-pager 2>/dev/null | \
@@ -2334,7 +2336,8 @@ show_ssh_online() {
       s/.*user[=: ]([^ ,]+).*src[=: ][^ ,]+.*/\1/p;
     ' | tr '[:upper:]' '[:lower:]' >> "${tmp_users}"
 
-  grep -E '^[a-z0-9._-]+$' "${tmp_users}" | awk '{c[$1]++} END {for (u in c) printf "%s %d\n", u, c[u]}' | sort > "${tmp_count}" || true
+  grep -E '^[a-z0-9._-]+$' "${tmp_users}" | sort | uniq -c | \
+    sed -E 's/^[[:space:]]*([0-9]+)[[:space:]]+(.+)$/\2 \1/' > "${tmp_count}" || true
 
   echo "IP     : ${ip}"
   echo "DOMAIN : ${DOMAIN}"
@@ -2349,10 +2352,20 @@ show_ssh_online() {
     return
   fi
 
-  awk '{printf "%s %d PID\n", $1, $2}' "${tmp_count}"
+  while read -r u n; do
+    [[ -z "${u:-}" || -z "${n:-}" ]] && continue
+    echo "${u} ${n} PID"
+  done < "${tmp_count}"
+  local total_user total_pid n
+  total_user="$(wc -l < "${tmp_count}" | tr -d ' ')"
+  total_pid=0
+  while read -r _ n; do
+    [[ -n "${n:-}" ]] || continue
+    total_pid=$((total_pid + n))
+  done < "${tmp_count}"
   echo
-  echo "Total User : $(wc -l < "${tmp_count}" | tr -d ' ')"
-  echo "Total PID  : $(awk '{s+=$2} END{print s+0}' "${tmp_count}")"
+  echo "Total User : ${total_user}"
+  echo "Total PID  : ${total_pid}"
 }
 
 xray_log_snapshot() {
