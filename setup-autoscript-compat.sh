@@ -2150,8 +2150,32 @@ udp_backend_status() {
   local udpcustom
   udpcustom="$(detect_udpcustom_service)"
   echo "UDP backend:"
-  echo "- ZIVPN (${ZIVPN_SERVICE}): $(systemctl is-active "${ZIVPN_SERVICE}" 2>/dev/null || echo unknown)"
-  echo "- UDPHC (${udpcustom}): $(systemctl is-active "${udpcustom}" 2>/dev/null || echo unknown)"
+  echo "- ZIVPN (${ZIVPN_SERVICE}): $(service_onoff "${ZIVPN_SERVICE}")"
+  echo "- UDPHC (${udpcustom}): $(service_onoff "${udpcustom}")"
+}
+
+service_onoff() {
+  local svc="$1"
+  if systemctl is-active --quiet "${svc}" 2>/dev/null; then
+    echo "ON"
+  else
+    echo "OFF"
+  fi
+}
+
+show_core_services_onoff() {
+  local udpcustom
+  udpcustom="$(detect_udpcustom_service)"
+  echo "Service status (ON/OFF):"
+  echo "- ssh: $(service_onoff ssh)"
+  echo "- dropbear: $(service_onoff dropbear)"
+  echo "- nginx: $(service_onoff nginx)"
+  echo "- haproxy: $(service_onoff haproxy)"
+  echo "- xray: $(service_onoff xray)"
+  echo "- sc-1forcr-api: $(service_onoff sc-1forcr-api)"
+  echo "- sc-1forcr-sshws: $(service_onoff sc-1forcr-sshws)"
+  echo "- ${ZIVPN_SERVICE}: $(service_onoff "${ZIVPN_SERVICE}")"
+  echo "- ${udpcustom}: $(service_onoff "${udpcustom}")"
 }
 
 switch_udp_to_zivpn() {
@@ -2208,15 +2232,7 @@ service_menu() {
   read -rp "Pilih [1-6]: " s
   case "$s" in
     1)
-      systemctl status ssh --no-pager | head -n 12
-      systemctl status nginx --no-pager | head -n 12
-      systemctl status xray --no-pager | head -n 12
-      systemctl status sc-1forcr-api --no-pager | head -n 12
-      systemctl status sc-1forcr-sshws --no-pager | head -n 12
-      systemctl status haproxy --no-pager | head -n 12 || true
-      systemctl status dropbear --no-pager | head -n 12 || true
-      systemctl status "${ZIVPN_SERVICE}" --no-pager | head -n 12 || true
-      systemctl status "${udpcustom}" --no-pager | head -n 12 || true
+      show_core_services_onoff
       ;;
     2)
       systemctl restart ssh dropbear nginx haproxy xray sc-1forcr-api sc-1forcr-sshws
@@ -2409,7 +2425,7 @@ show_combined_online() {
 
   tmp_users="$(mktemp)"
   tmp_count="$(mktemp)"
-  trap 'rm -f "${tmp_users}" "${tmp_count}"' RETURN
+  trap 'rm -f "${tmp_users:-}" "${tmp_count:-}"' RETURN
 
   # SSH/Dropbear user aktif dari process sshd + who (tanpa awk kompleks agar kompatibel)
   ps -eo args= 2>/dev/null | \
@@ -2522,7 +2538,7 @@ show_xray_online_by_table() {
   local t_users t_seen
   t_users="$(mktemp)"
   t_seen="$(mktemp)"
-  trap 'rm -f "${t_users}" "${t_seen}"' RETURN
+  trap 'rm -f "${t_users:-}" "${t_seen:-}"' RETURN
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) FROM ${table} WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' ORDER BY LOWER(username);" > "${t_users}" 2>/dev/null || true
   if [[ ! -s "${t_users}" ]]; then
