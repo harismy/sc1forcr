@@ -1979,6 +1979,20 @@ api_call() {
   fi
 }
 
+cancelled() {
+  echo
+  echo "Dibatalkan. Kembali ke menu sebelumnya."
+}
+
+prompt_input() {
+  local var_name="$1" prompt="$2"
+  if ! read -rp "${prompt}" "${var_name}" </dev/tty; then
+    cancelled
+    return 130
+  fi
+  return 0
+}
+
 pick_type() {
   echo "Pilih tipe:" >&2
   echo "1) ssh" >&2
@@ -1986,7 +2000,10 @@ pick_type() {
   echo "3) vless" >&2
   echo "4) trojan" >&2
   echo "5) zivpn" >&2
-  read -rp "Input [1-5]: " t </dev/tty
+  if ! prompt_input t "Input [1-5]: "; then
+    echo ""
+    return 0
+  fi
   case "$t" in
     1) echo "ssh" ;;
     2) echo "vmess" ;;
@@ -2117,15 +2134,15 @@ create_account() {
   ep="$(endpoint_create "$type")"
   [[ -z "$ep" ]] && { echo "Endpoint create tidak ada."; return; }
 
-  read -rp "Username: " username
-  read -rp "Expired (hari) [30]: " exp
+  prompt_input username "Username: " || return
+  prompt_input exp "Expired (hari) [30]: " || return
   exp="${exp:-30}"
-  read -rp "Limit IP [2]: " limitip
+  prompt_input limitip "Limit IP [2]: " || return
   limitip="${limitip:-2}"
-  read -rp "Quota GB [0]: " quota
+  prompt_input quota "Quota GB [0]: " || return
   quota="${quota:-0}"
   if [[ "$type" == "ssh" || "$type" == "zivpn" ]]; then
-    read -rp "Password [default=username]: " password
+    prompt_input password "Password [default=username]: " || return
     password="${password:-$username}"
   else
     password=""
@@ -2167,7 +2184,7 @@ pick_existing_username() {
 
   echo "Daftar akun ${type^^}:" >&2
   echo "${rows}" | nl -w1 -s') ' >&2
-  read -rp "Pilih nomor atau isi username: " input
+  prompt_input input "Pilih nomor atau isi username: " || return 1
   input="$(echo "${input}" | tr -d '[:space:]')"
   [[ -z "${input}" ]] && { echo "Input kosong." >&2; return 1; }
 
@@ -2191,7 +2208,7 @@ renew_account() {
   [[ -z "$ep" ]] && { echo "Endpoint renew tidak ada."; return; }
   username="$(pick_existing_username "$type")" || return
   echo "Dipilih: ${username}"
-  read -rp "Tambah expired (hari) [30]: " exp
+  prompt_input exp "Tambah expired (hari) [30]: " || return
   exp="${exp:-30}"
   api_call "POST" "${ep}/${username}/${exp}" | jq .
 }
@@ -2215,7 +2232,8 @@ list_accounts() {
   echo "4) TROJAN (DB)"
   echo "5) ZIVPN auth.config"
   echo "6) Semua"
-  read -rp "Input [1-6]: " l
+  prompt_input l "Input [1-6]: " || return
+  clear
 
   case "${l}" in
     1)
@@ -2351,7 +2369,8 @@ service_menu() {
   echo "4) aktifkan ZIVPN (matikan UDPHC)"
   echo "5) aktifkan UDPHC (matikan ZIVPN)"
   echo "6) status backend UDP"
-  read -rp "Pilih [1-6]: " s
+  prompt_input s "Pilih [1-6]: " || return
+  clear
   case "$s" in
     1)
       show_core_services_onoff
@@ -2393,7 +2412,8 @@ backup_restore_menu() {
   echo "2) Restore config ZIVPN dari /root/config.json.zivpn"
   echo "3) Backup akun (SSH/VMESS/VLESS/TROJAN) + config ZIVPN + config UDPHC"
   echo "4) Restore akun + config dari backup terbaru"
-  read -rp "Pilih [1-4]: " b
+  prompt_input b "Pilih [1-4]: " || return
+  clear
   case "$b" in
     1)
       cp -f /etc/zivpn/config.json /root/config.json.zivpn
@@ -2452,12 +2472,12 @@ backup_restore_menu() {
 
 change_domain_menu() {
   local new_domain email app_env pem
-  read -rp "Masukkan domain baru: " new_domain
+  prompt_input new_domain "Masukkan domain baru: " || return
   if [[ -z "${new_domain}" ]]; then
     echo "Domain tidak boleh kosong."
     return
   fi
-  read -rp "Masukkan email Let's Encrypt [admin@${new_domain}]: " email
+  prompt_input email "Masukkan email Let's Encrypt [admin@${new_domain}]: " || return
   email="${email:-admin@${new_domain}}"
 
   DOMAIN="${new_domain}"
@@ -2769,7 +2789,10 @@ monitor_online_menu() {
     echo "6) UDP CUSTOM"
     echo "0) Kembali"
     echo
-    read -rp "Pilih menu: " o
+    if ! prompt_input o "Pilih menu: "; then
+      return
+    fi
+    clear
     case "${o}" in
       1) show_ssh_online ;;
       2) show_ssh_online_history ;;
@@ -2781,7 +2804,7 @@ monitor_online_menu() {
       *) echo "Pilihan tidak valid." ;;
     esac
     echo
-    read -rp "Enter untuk lanjut..." _
+    read -rp "Enter untuk lanjut..." _ || true
   done
 }
 
@@ -2805,7 +2828,10 @@ while true; do
   echo "11) Update Script dari Repo"
   echo "x) Exit"
   echo
-  read -rp "Pilih menu: " m
+  if ! prompt_input m "Pilih menu: "; then
+    continue
+  fi
+  clear
   case "$m" in
     1) create_account ;;
     2) renew_account ;;
@@ -2822,7 +2848,7 @@ while true; do
     *) echo "Pilihan tidak valid." ;;
   esac
   echo
-  read -rp "Enter untuk lanjut..." _
+  read -rp "Enter untuk lanjut..." _ || true
 done
 EOF
 
