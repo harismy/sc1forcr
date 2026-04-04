@@ -102,6 +102,7 @@ install_base_packages() {
   apt-get install -y \
     curl wget jq sqlite3 openssl uuid-runtime ca-certificates \
     gnupg lsb-release socat cron unzip \
+    vnstat speedtest-cli \
     haproxy \
     nginx certbot python3-certbot-nginx \
     openssh-server dropbear pwgen \
@@ -308,6 +309,20 @@ setup_logrotate_optimizations() {
   copytruncate
 }
 EOF
+}
+
+setup_vnstat() {
+  if ! command -v vnstat >/dev/null 2>&1; then
+    return
+  fi
+  log "Setup vnStat..."
+  systemctl enable vnstat >/dev/null 2>&1 || true
+  systemctl restart vnstat >/dev/null 2>&1 || true
+  local iface
+  iface="$(ip route 2>/dev/null | awk '/default/ {print $5; exit}')"
+  if [[ -n "${iface}" ]]; then
+    vnstat --add -i "${iface}" >/dev/null 2>&1 || true
+  fi
 }
 
 setup_nginx_and_cert() {
@@ -2672,14 +2687,19 @@ bytes_human() {
 read_vnstat_stats() {
   VNSTAT_MONTH_RX="-"
   VNSTAT_MONTH_TX="-"
+  VNSTAT_MONTH_TOTAL="-"
+  VNSTAT_MONTH_NAME="$(date +%B 2>/dev/null || echo "-")"
   VNSTAT_DAY_RX="-"
   VNSTAT_DAY_TX="-"
+  VNSTAT_DAY_TOTAL="-"
+  VNSTAT_DAY_NAME="$(date +%A 2>/dev/null || echo "-")"
+  VNSTAT_RATE="-"
   VNSTAT_IFACE="-"
   if ! command -v vnstat >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
     return
   fi
 
-  local js rx tx drx dtx iface
+  local js rx tx drx dtx iface rate5m mtotal dtotal
   js="$(vnstat --json 2>/dev/null || true)"
   [[ -z "${js}" ]] && return
 
@@ -2694,19 +2714,36 @@ read_vnstat_stats() {
   VNSTAT_MONTH_TX="$(bytes_human "${tx}")"
   VNSTAT_DAY_RX="$(bytes_human "${drx}")"
   VNSTAT_DAY_TX="$(bytes_human "${dtx}")"
+  if [[ "${rx}" =~ ^[0-9]+$ && "${tx}" =~ ^[0-9]+$ ]]; then
+    mtotal="$((rx + tx))"
+    VNSTAT_MONTH_TOTAL="$(bytes_human "${mtotal}")"
+  fi
+  if [[ "${drx}" =~ ^[0-9]+$ && "${dtx}" =~ ^[0-9]+$ ]]; then
+    dtotal="$((drx + dtx))"
+    VNSTAT_DAY_TOTAL="$(bytes_human "${dtotal}")"
+  fi
+  rate5m="$(echo "${js}" | jq -r '(.interfaces[0].traffic.fiveminute // [] | last | ((.rx // 0) + (.tx // 0)))' 2>/dev/null || echo 0)"
+  if [[ "${rate5m}" =~ ^[0-9]+$ && "${rate5m}" -gt 0 ]]; then
+    VNSTAT_RATE="$(awk -v b="${rate5m}" 'BEGIN { printf "%.2f Mbit/s", (b*8)/(300*1000000) }')"
+  fi
 }
 
 draw_dashboard() {
   local os_name ram_mb swap_mb uptime_s uptime_h uptime_m
   local ip city isp udpcustom
-  local ssh_on nginx_on xray_on api_on ws_on
+  local ssh_on xray_on ws_on loadblc_on
   local c_ssh c_vmess c_vless c_trojan
-  local month_total day_total
-  local C0 CC CG CY CR CD
+  local health
+  local line
+
+  box_line() {
+    line="$1"
+    printf "│ %-47.47s │\n" "${line}"
+  }
 
   os_name="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
-  ram_mb="$(free -m 2>/dev/null | awk '/^Mem:/ {print $3 "/" $2 " MB"}')"
-  swap_mb="$(free -m 2>/dev/null | awk '/^Swap:/ {print $3 "/" $2 " MB"}')"
+  ram_mb="$(free -m 2>/dev/null | awk '/^Mem:/ {print $3 "M"}')"
+  swap_mb="$(free -m 2>/dev/null | awk '/^Swap:/ {print $3 "M"}')"
   uptime_s="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
   uptime_h="$((uptime_s / 3600))"
   uptime_m="$(((uptime_s % 3600) / 60))"
@@ -2718,10 +2755,13 @@ draw_dashboard() {
 
   udpcustom="$(detect_udpcustom_service)"
   ssh_on="$(onoff_word ssh)"
-  nginx_on="$(onoff_word nginx)"
   xray_on="$(onoff_word xray)"
-  api_on="$(onoff_word sc-1forcr-api)"
   ws_on="$(onoff_word sc-1forcr-sshws)"
+  loadblc_on="$(onoff_word haproxy)"
+  health="CHECK"
+  if [[ "${xray_on}" == "ON" && "${ws_on}" == "ON" && "${loadblc_on}" == "ON" ]]; then
+    health="GOOD"
+  fi
 
   c_ssh="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_sshs;" 2>/dev/null || echo 0)"
   c_vmess="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vmesses;" 2>/dev/null || echo 0)"
@@ -2729,64 +2769,49 @@ draw_dashboard() {
   c_trojan="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_trojans;" 2>/dev/null || echo 0)"
 
   read_vnstat_stats
-  month_total="-"
-  day_total="-"
-  if [[ "${VNSTAT_MONTH_RX}" != "-" && "${VNSTAT_MONTH_TX}" != "-" ]]; then
-    month_total="${VNSTAT_MONTH_RX} + ${VNSTAT_MONTH_TX}"
-  fi
-  if [[ "${VNSTAT_DAY_RX}" != "-" && "${VNSTAT_DAY_TX}" != "-" ]]; then
-    day_total="${VNSTAT_DAY_RX} + ${VNSTAT_DAY_TX}"
-  fi
 
-  C0=""
-  CC=""
-  CG=""
-  CY=""
-  CR=""
-  CD=""
-  if [[ -t 1 ]]; then
-    C0=$'\033[0m'
-    CC=$'\033[1;36m'
-    CG=$'\033[1;32m'
-    CY=$'\033[1;33m'
-    CR=$'\033[1;31m'
-    CD=$'\033[2m'
-  fi
-
-  printf "%b+------------------------------------------------------------------+%b\n" "${CC}" "${C0}"
-  printf "%b|                       SC 1FORCR NEXUS PANEL                     |%b\n" "${CC}" "${C0}"
-  printf "%b+------------------------------------------------------------------+%b\n" "${CC}" "${C0}"
-  printf "%b|%b OS      : %-54s %b|%b\n" "${CC}" "${C0}" "${os_name}" "${CC}" "${C0}"
-  printf "%b|%b RAM     : %-54s %b|%b\n" "${CC}" "${C0}" "${ram_mb:-"-"}" "${CC}" "${C0}"
-  printf "%b|%b SWAP    : %-54s %b|%b\n" "${CC}" "${C0}" "${swap_mb:-"-"}" "${CC}" "${C0}"
-  printf "%b|%b CITY    : %-54s %b|%b\n" "${CC}" "${C0}" "${city}" "${CC}" "${C0}"
-  printf "%b|%b ISP     : %-54s %b|%b\n" "${CC}" "${C0}" "${isp}" "${CC}" "${C0}"
-  printf "%b|%b IP      : %-54s %b|%b\n" "${CC}" "${C0}" "${ip}" "${CC}" "${C0}"
-  printf "%b|%b DOMAIN  : %-54s %b|%b\n" "${CC}" "${C0}" "${DOMAIN}" "${CC}" "${C0}"
-  printf "%b|%b UPTIME  : %-54s %b|%b\n" "${CC}" "${C0}" "${uptime_h}h ${uptime_m}m" "${CC}" "${C0}"
-  printf "%b+------------------------------------------------------------------+%b\n" "${CC}" "${C0}"
-  printf "%b|%b TRAFFIC : IFACE %-13s RX %-12s TX %-12s %b|%b\n" "${CC}" "${C0}" "${VNSTAT_IFACE}" "${VNSTAT_DAY_RX}" "${VNSTAT_DAY_TX}" "${CC}" "${C0}"
-  printf "%b|%b MONTH   : %-54s %b|%b\n" "${CC}" "${C0}" "${month_total}" "${CC}" "${C0}"
-  printf "%b|%b TODAY   : %-54s %b|%b\n" "${CC}" "${C0}" "${day_total}" "${CC}" "${C0}"
-  printf "%b+------------------------------------------------------------------+%b\n" "${CC}" "${C0}"
-  printf "%b|%b CORE    : SSH[%s%s%b] NGINX[%s%s%b] XRAY[%s%s%b] API[%s%s%b] WS[%s%s%b] %b|%b\n" \
-    "${CC}" "${C0}" \
-    "$([[ "${ssh_on}" == "ON" ]] && echo "${CG}" || echo "${CR}")" "${ssh_on}" "${C0}" \
-    "$([[ "${nginx_on}" == "ON" ]] && echo "${CG}" || echo "${CR}")" "${nginx_on}" "${C0}" \
-    "$([[ "${xray_on}" == "ON" ]] && echo "${CG}" || echo "${CR}")" "${xray_on}" "${C0}" \
-    "$([[ "${api_on}" == "ON" ]] && echo "${CG}" || echo "${CR}")" "${api_on}" "${C0}" \
-    "$([[ "${ws_on}" == "ON" ]] && echo "${CG}" || echo "${CR}")" "${ws_on}" "${C0}" \
-    "${CC}" "${C0}"
-  printf "%b|%b UDP     : ZIVPN[%s%s%b] UDPHC[%s%s%b]%29s%b|%b\n" \
-    "${CC}" "${C0}" \
-    "$([[ "$(onoff_word "${ZIVPN_SERVICE}")" == "ON" ]] && echo "${CG}" || echo "${CR}")" "$(onoff_word "${ZIVPN_SERVICE}")" "${C0}" \
-    "$([[ "$(onoff_word "${udpcustom}")" == "ON" ]] && echo "${CG}" || echo "${CR}")" "$(onoff_word "${udpcustom}")" "${C0}" \
-    "" "${CC}" "${C0}"
-  printf "%b+------------------------------------------------------------------+%b\n" "${CC}" "${C0}"
-  printf "%b|%b ACCOUNTS: SSH %-6s VMESS %-6s VLESS %-6s TROJAN %-6s        %b|%b\n" "${CC}" "${C0}" "${c_ssh}" "${c_vmess}" "${c_vless}" "${c_trojan}" "${CC}" "${C0}"
-  printf "%b|%b VERSION : %b%-54s%b %b|%b\n" "${CC}" "${C0}" "${CY}" "${SCRIPT_VERSION:-unknown}" "${C0}" "${CC}" "${C0}"
-  printf "%b+------------------------------------------------------------------+%b\n" "${CC}" "${C0}"
-  printf "%b%s%b\n" "${CD}" "hint: akses menu tetap sama, tampilannya aja dibuat beda dari potato." "${C0}"
+  printf "┌─────────────────────────────────────────────────┐\n"
+  printf "│                 SC 1FORCR NEXUS                │\n"
+  printf "└─────────────────────────────────────────────────┘\n"
+  printf "┌─────────────────────────────────────────────────┐\n"
+  box_line " OS      : ${os_name}"
+  box_line " RAM     : ${ram_mb:-"-"}"
+  box_line " SWAP    : ${swap_mb:-"-"}"
+  box_line " CITY    : ${city}"
+  box_line " ISP     : ${isp}"
+  box_line " IP      : ${ip}"
+  box_line " DOMAIN  : ${DOMAIN}"
+  box_line " UPTIME  : ${uptime_h} hours, ${uptime_m} minutes"
+  box_line " -----------------------------------------------"
+  box_line " MONTH   : ${VNSTAT_MONTH_TOTAL}     [${VNSTAT_MONTH_NAME}]"
+  box_line " RX      : ${VNSTAT_MONTH_RX}"
+  box_line " TX      : ${VNSTAT_MONTH_TX}"
+  box_line " -----------------------------------------------"
+  box_line " DAY     : ${VNSTAT_DAY_TOTAL}     [${VNSTAT_DAY_NAME}]"
+  box_line " RX      : ${VNSTAT_DAY_RX}"
+  box_line " TX      : ${VNSTAT_DAY_TX}"
+  box_line " TRAFFIC : ${VNSTAT_RATE}"
+  printf "└─────────────────────────────────────────────────┘\n"
+  printf "┌─────────────────────────────────────────────────┐\n"
+  box_line " XRAY : ${xray_on} | SSH-WS : ${ws_on} | LOADBLC : ${loadblc_on} | ${health}"
+  printf "└─────────────────────────────────────────────────┘\n"
+  printf "     ┌───────────────────────────────────────┐\n"
+  printf "     │             LIST ACCOUNTS             │\n"
+  printf "     │ ------------------------------------- │\n"
+  printf "     │  SSH/OPENVPN    : %-4s ACCOUNT        │\n" "${c_ssh}"
+  printf "     │  VMESS          : %-4s ACCOUNT        │\n" "${c_vmess}"
+  printf "     │  VLESS          : %-4s ACCOUNT        │\n" "${c_vless}"
+  printf "     │  TROJAN         : %-4s ACCOUNT        │\n" "${c_trojan}"
+  printf "     └───────────────────────────────────────┘\n"
+  printf "   ┌───────────────────────────────────────────┐\n"
+  printf "   │  Version     : %-28.28s │\n" "${SCRIPT_VERSION:-unknown}"
+  printf "   │  Order By    : %-28.28s │\n" "SC 1FORCR"
+  printf "   │  Client Name : %-28.28s │\n" "${ip}"
+  printf "   │  Expiry In   : %-28.28s │\n" "Unlimited"
+  printf "   └───────────────────────────────────────────┘\n"
+  printf " ─────────────────────────────────────────────────\n"
+  printf "           to access use menu command\n"
+  printf " ─────────────────────────────────────────────────\n"
 }
 
 show_combined_online() {
@@ -3040,24 +3065,45 @@ monitor_online_menu() {
   done
 }
 
+test_speed_vps() {
+  echo "=== TEST SPEED VPS ==="
+  echo "Mohon tunggu..."
+  if command -v speedtest >/dev/null 2>&1; then
+    speedtest --accept-license --accept-gdpr || true
+    return
+  fi
+  if command -v speedtest-cli >/dev/null 2>&1; then
+    speedtest-cli --secure || true
+    return
+  fi
+
+  echo "speedtest belum ada, mencoba install speedtest-cli..."
+  apt-get update -y >/dev/null 2>&1 || true
+  apt-get install -y speedtest-cli >/dev/null 2>&1 || true
+  if command -v speedtest-cli >/dev/null 2>&1; then
+    speedtest-cli --secure || true
+  else
+    echo "Gagal install speedtest-cli."
+  fi
+}
+
 while true; do
   clear
   draw_dashboard
   echo
-  echo "1) Add Account"
-  echo "2) Renew Account"
-  echo "3) Delete Account"
-  echo "4) List Account"
-  echo "5) Service Menu"
-  echo "6) Backup/Restore Config + Akun"
-  echo "7) Ganti Domain + Renew SSL"
-  echo "8) Monitor Lock Sementara (IP Limit)"
-  echo "9) Monitor User Online"
-  echo "10) Uninstall SC 1FORCR"
-  echo "11) Update Script dari Repo"
-  echo "x) Exit"
+  echo " —————————————————————————————————————————————————"
+  echo "┌─────────────────────────────────────────────────┐"
+  echo "   1.) ☞ ADD ACCOUNT       7.) ☞ CHANGE DOMAIN"
+  echo "│  2.) ☞ RENEW ACCOUNT     8.) ☞ MONITOR LOCK     │"
+  echo "   3.) ☞ DELETE ACCOUNT    9.) ☞ MONITOR ONLINE"
+  echo "│  4.) ☞ LIST ACCOUNT      10.) ☞ TEST SPEED VPS  │"
+  echo "   5.) ☞ SERVICE MENU      11.) ☞ UPDATE SCRIPT"
+  echo "│  6.) ☞ BACKUP/RESTORE    12.) ☞ UNINSTALL       │"
+  echo "   x.) ☞ EXIT"
+  echo "└─────────────────────────────────────────────────┘"
+  echo " —————————————————————————————————————————————————"
   echo
-  if ! prompt_input m "Pilih menu: "; then
+  if ! prompt_input m "Select From Options [1-12 or x] : "; then
     continue
   fi
   clear
@@ -3071,8 +3117,9 @@ while true; do
     7) change_domain_menu ;;
     8) monitor_temp_lock_menu ;;
     9) monitor_online_menu ;;
-    10) /usr/local/sbin/uninstall-sc-1forcr ;;
+    10) test_speed_vps ;;
     11) update_script_from_repo ;;
+    12) /usr/local/sbin/uninstall-sc-1forcr ;;
     x|X) exit 0 ;;
     *) echo "Pilihan tidak valid." ;;
   esac
@@ -3147,6 +3194,7 @@ write_version_marker() {
 
 main() {
   install_base_packages
+  setup_vnstat
   apply_system_optimizations
   setup_logrotate_optimizations
   install_node20_if_missing
@@ -3199,6 +3247,7 @@ Catatan:
 - UDP Custom juga otomatis disiapkan di service ${UDPCUSTOM_SERVICE_NAME} (config: /root/udp/config.json).
 - UDP Custom default tanpa DNAT range (lebih stabil/cepat). Jika perlu mode tembak port, isi UDPCUSTOM_DNAT_RANGE.
 - Hanya 1 backend UDP aktif sesuai ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND} (zivpn|udpcustom).
+- vnStat dan speedtest-cli otomatis terpasang untuk monitoring trafik + tes speed VPS.
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
 - Update sekali klik dari menu: isi UPDATE_SCRIPT_URL lalu pilih menu 11 (Update Script dari Repo)
 - Uninstall helper: uninstall-sc-1forcr
