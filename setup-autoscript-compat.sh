@@ -748,6 +748,8 @@ SSH_WS_PORT=2082
 SSH_WS_TARGET_PORT=22
 SSH_HTTP_BACKEND_HOST=127.0.0.1
 SSH_HTTP_BACKEND_PORT=80
+UDPCUSTOM_CONFIG=/root/udp/config.json
+UDPCUSTOM_LISTEN_PORT=${UDPCUSTOM_LISTEN_PORT}
 EOF
 
   cat > "${APP_DIR}/api.js" <<'EOF'
@@ -1610,6 +1612,8 @@ const { execFileSync } = require('child_process');
 const DB_PATH = process.env.DB_PATH || '/usr/sbin/potatonc/potato.db';
 const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
+const UDPCUSTOM_CONFIG = process.env.UDPCUSTOM_CONFIG || '/root/udp/config.json';
+const UDPCUSTOM_LISTEN_PORT = Number(process.env.UDPCUSTOM_LISTEN_PORT || 5667);
 const LOCK_SECONDS = 15 * 60;
 
 const db = new sqlite3.Database(DB_PATH);
@@ -1834,6 +1838,42 @@ function restartService(service) {
   if (!safeExec('systemctl', ['restart', service])) safeExec('service', [service, 'restart']);
 }
 
+function getUdpCustomListenPort() {
+  try {
+    if (!fs.existsSync(UDPCUSTOM_CONFIG)) return UDPCUSTOM_LISTEN_PORT;
+    const root = JSON.parse(fs.readFileSync(UDPCUSTOM_CONFIG, 'utf8'));
+    const raw = String(root?.listen || '').trim();
+    const m = raw.match(/^:([0-9]{1,5})$/);
+    if (!m) return UDPCUSTOM_LISTEN_PORT;
+    const n = Number(m[1]);
+    if (!Number.isInteger(n) || n < 1 || n > 65535) return UDPCUSTOM_LISTEN_PORT;
+    return n;
+  } catch (_) {
+    return UDPCUSTOM_LISTEN_PORT;
+  }
+}
+
+function isIpv6(ip) {
+  return String(ip || '').includes(':');
+}
+
+function addUdpDropRule(ip, port) {
+  const src = String(ip || '').trim();
+  if (!src) return false;
+  const cmd = isIpv6(src) ? 'ip6tables' : 'iptables';
+  const rule = ['INPUT', '-p', 'udp', '-s', src, '--dport', String(port), '-j', 'DROP'];
+  if (safeExec(cmd, ['-C', ...rule])) return true;
+  return safeExec(cmd, ['-I', ...rule]);
+}
+
+function removeUdpDropRule(ip, port) {
+  const src = String(ip || '').trim();
+  if (!src) return;
+  const cmd = isIpv6(src) ? 'ip6tables' : 'iptables';
+  const rule = ['INPUT', '-p', 'udp', '-s', src, '--dport', String(port), '-j', 'DROP'];
+  while (safeExec(cmd, ['-D', ...rule])) {}
+}
+
 async function ensureTables() {
   await run(`CREATE TABLE IF NOT EXISTS temp_ip_locks (
     account_type TEXT NOT NULL,
@@ -1843,18 +1883,29 @@ async function ensureTables() {
     created_at INTEGER DEFAULT (strftime('%s','now')),
     PRIMARY KEY (account_type, username)
   )`);
+  await run(`CREATE TABLE IF NOT EXISTS temp_ip_lock_ips (
+    account_type TEXT NOT NULL,
+    username TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    PRIMARY KEY (account_type, username, ip)
+  )`);
 }
 
 async function unlockExpired(nowTs) {
   const rows = await all("SELECT account_type, username, zivpn_removed FROM temp_ip_locks WHERE locked_until <= ?", [nowTs]);
   if (rows.length === 0) return { xrayChanged: false, zivpnChanged: false };
 
+  const udpcustomPort = getUdpCustomListenPort();
   let xrayChanged = false;
   let zivpnChanged = false;
   for (const row of rows) {
     const t = String(row.account_type || '');
     const u = String(row.username || '');
     if (t === 'ssh') {
+      const ipRows = await all("SELECT ip FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [u]).catch(() => []);
+      for (const item of ipRows) {
+        removeUdpDropRule(String(item?.ip || ''), udpcustomPort);
+      }
       safeExec('passwd', ['-u', u]);
       await run("UPDATE account_sshs SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
       if (Number(row.zivpn_removed || 0) === 1) {
@@ -1870,6 +1921,7 @@ async function unlockExpired(nowTs) {
       await run("UPDATE account_trojans SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
       xrayChanged = true;
     }
+    await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
   }
   return { xrayChanged, zivpnChanged };
@@ -1880,6 +1932,7 @@ async function lockIfExceeded(nowTs) {
   const sshIpMap = sshUsage.ipMap;
   const sshSessionMap = sshUsage.sessionMap;
   const xrayMap = parseXrayRecentIpMap();
+  const udpcustomPort = getUdpCustomListenPort();
   let xrayChanged = false;
   let zivpnChanged = false;
 
@@ -1894,7 +1947,20 @@ async function lockIfExceeded(nowTs) {
     if (cnt <= lim) continue;
     const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]);
     if (exists) continue;
+
+    // Putuskan sesi aktif SSH user yang baru di-lock.
+    safeExec('pkill', ['-KILL', '-u', user]);
     safeExec('passwd', ['-l', user]);
+
+    // Untuk UDPHC: drop semua src IP aktif user ini selama masa lock.
+    const lockIps = Array.from(sshIpMap.get(userKey) || []);
+    await run("DELETE FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
+    for (const ip of lockIps) {
+      if (addUdpDropRule(ip, udpcustomPort)) {
+        await run("INSERT OR IGNORE INTO temp_ip_lock_ips(account_type, username, ip) VALUES('ssh', ?, ?)", [user, ip]).catch(() => {});
+      }
+    }
+
     const removed = removeZivpnUser(user) ? 1 : 0;
     if (removed) zivpnChanged = true;
     await run("UPDATE account_sshs SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
