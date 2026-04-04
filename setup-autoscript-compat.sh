@@ -3028,7 +3028,7 @@ draw_dashboard() {
   printf " ─────────────────────────────────────────────────\n"
 }
 show_combined_online() {
-  local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_udp_pair tmp_udp_count udpcustom udp_ttl
+  local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_udp_pair tmp_udp_count udpcustom udp_ttl
   mode="${1:-realtime}"
   udp_ttl="180"
   udpcustom="$(detect_udpcustom_service)"
@@ -3039,9 +3039,11 @@ show_combined_online() {
   tmp_pid_user="$(mktemp)"
   tmp_ssh_pair="$(mktemp)"
   tmp_ssh_count="$(mktemp)"
+  tmp_ssh_proc_count="$(mktemp)"
+  tmp_ssh_count_merged="$(mktemp)"
   tmp_udp_pair="$(mktemp)"
   tmp_udp_count="$(mktemp)"
-  trap 'rm -f "${tmp_count:-}" "${tmp_status:-}" "${tmp_ssh_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_ssh_pair:-}" "${tmp_ssh_count:-}" "${tmp_udp_pair:-}" "${tmp_udp_count:-}"' RETURN
+  trap 'rm -f "${tmp_count:-}" "${tmp_status:-}" "${tmp_ssh_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_ssh_pair:-}" "${tmp_ssh_count:-}" "${tmp_ssh_proc_count:-}" "${tmp_ssh_count_merged:-}" "${tmp_udp_pair:-}" "${tmp_udp_count:-}"' RETURN
 
   # SSH realtime: map pid->user dan pid->remote_ip, lalu pisahkan dari pasangan user+ip UDPHC aktif.
   : > "${tmp_ssh_pair}"
@@ -3182,6 +3184,49 @@ show_combined_online() {
       if (!(k in key)) cnt[$1]++;
     }
     END { for (u in cnt) print u, cnt[u]; }' "${tmp_udp_pair}" "${tmp_ssh_pair}" > "${tmp_ssh_count}" || true
+
+  # Fallback untuk SSH-WS/HC: ambil sesi dari process list bila mapping socket->user tidak terbaca.
+  ps -eo args= 2>/dev/null | awk '
+    {
+      u="";
+      if ($0 ~ /^sshd:[[:space:]]+/) {
+        # Hitung hanya sesi user, bukan proses helper seperti [priv].
+        if ($0 ~ /\[priv\]/ || $0 ~ /\[preauth\]/ || $0 ~ /\[listener\]/) next;
+        u=$0;
+        sub(/^sshd:[[:space:]]*/, "", u);
+        sub(/[[:space:]].*$/, "", u);
+        sub(/@.*$/, "", u);
+        sub(/\[.*$/, "", u);
+      } else if ($0 ~ /^dropbear[[:space:]]+\[[^]]+\]/) {
+        u=$0;
+        sub(/^dropbear[[:space:]]+\[/, "", u);
+        sub(/\].*$/, "", u);
+      } else next;
+      u=tolower(u);
+      if (u !~ /^[a-z0-9._-]+$/) next;
+      if (u == "root" || u == "priv" || u == "net") next;
+      cnt[u]++;
+    }
+    END { for (u in cnt) print u, cnt[u]; }' > "${tmp_ssh_proc_count}" || true
+
+  awk '
+    NR==FNR {
+      a[$1]=$2 + 0;
+      seen[$1]=1;
+      next
+    }
+    {
+      b[$1]=$2 + 0;
+      seen[$1]=1;
+    }
+    END {
+      for (u in seen) {
+        x=(u in a ? a[u] : 0);
+        y=(u in b ? b[u] : 0);
+        print u, (x > y ? x : y);
+      }
+    }' "${tmp_ssh_count}" "${tmp_ssh_proc_count}" > "${tmp_ssh_count_merged}" || true
+  mv -f "${tmp_ssh_count_merged}" "${tmp_ssh_count}"
 
   awk '
     NR==FNR {
