@@ -533,7 +533,7 @@ setup_zivpn_udp_nat_rules() {
     return 0
   fi
 
-  local listen_port iface
+  local listen_port
   listen_port="$(jq -r '.listen // empty' /etc/zivpn/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
   if [[ -z "${listen_port}" ]]; then
     listen_port="$(echo "${ZIVPN_LISTEN_PORT}" | tr -cd '0-9')"
@@ -542,19 +542,21 @@ setup_zivpn_udp_nat_rules() {
     listen_port="5667"
   fi
 
-  iface="${ZIVPN_DNAT_IFACE}"
-  if [[ -z "${iface}" ]]; then
-    iface="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-  fi
-  iface="${iface:-eth0}"
-
-  log "Set rule UDP ZIVPN: listen=${listen_port}, iface=${iface}, dnat_range=${ZIVPN_DNAT_RANGE}"
+  log "Set rule UDP ZIVPN: listen=${listen_port}, dnat_range=${ZIVPN_DNAT_RANGE}"
 
   iptables -C INPUT -p udp --dport "${listen_port}" -j ACCEPT >/dev/null 2>&1 || \
     iptables -I INPUT -p udp --dport "${listen_port}" -j ACCEPT
 
-  iptables -t nat -C PREROUTING -i "${iface}" -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || \
-    iptables -t nat -I PREROUTING -i "${iface}" -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}"
+  # Cleanup rule lama yang terikat interface tertentu (sering tidak match setelah rename NIC).
+  while IFS= read -r rule; do
+    [[ -z "${rule}" ]] && continue
+    iptables -t nat ${rule/-A/-D} >/dev/null 2>&1 || true
+  done < <(iptables -t nat -S PREROUTING | \
+    grep -F -- "--dport ${ZIVPN_DNAT_RANGE} -j DNAT --to-destination :${listen_port}" | \
+    grep -F -- "-i " || true)
+
+  iptables -t nat -C PREROUTING -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || \
+    iptables -t nat -I PREROUTING -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}"
 
   if ! command -v netfilter-persistent >/dev/null 2>&1; then
     log "Install netfilter-persistent agar rule iptables tidak hilang saat reboot..."
@@ -626,7 +628,7 @@ setup_udpcustom_udp_nat_rules() {
     return 0
   fi
 
-  local listen_port iface
+  local listen_port
   listen_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
   if [[ -z "${listen_port}" ]]; then
     listen_port="$(echo "${UDPCUSTOM_LISTEN_PORT}" | tr -cd '0-9')"
@@ -635,20 +637,22 @@ setup_udpcustom_udp_nat_rules() {
     listen_port="5667"
   fi
 
-  iface="${ZIVPN_DNAT_IFACE}"
-  if [[ -z "${iface}" ]]; then
-    iface="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
-  fi
-  iface="${iface:-eth0}"
-
-  log "Set rule UDP UDPHC: listen=${listen_port}, iface=${iface}, dnat_range=${UDPCUSTOM_DNAT_RANGE:-none}"
+  log "Set rule UDP UDPHC: listen=${listen_port}, dnat_range=${UDPCUSTOM_DNAT_RANGE:-none}"
 
   iptables -C INPUT -p udp --dport "${listen_port}" -j ACCEPT >/dev/null 2>&1 || \
     iptables -I INPUT -p udp --dport "${listen_port}" -j ACCEPT
 
   if [[ -n "${UDPCUSTOM_DNAT_RANGE}" ]]; then
-    iptables -t nat -C PREROUTING -i "${iface}" -p udp --dport "${UDPCUSTOM_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || \
-      iptables -t nat -I PREROUTING -i "${iface}" -p udp --dport "${UDPCUSTOM_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}"
+    # Cleanup rule lama yang terikat interface tertentu.
+    while IFS= read -r rule; do
+      [[ -z "${rule}" ]] && continue
+      iptables -t nat ${rule/-A/-D} >/dev/null 2>&1 || true
+    done < <(iptables -t nat -S PREROUTING | \
+      grep -F -- "--dport ${UDPCUSTOM_DNAT_RANGE} -j DNAT --to-destination :${listen_port}" | \
+      grep -F -- "-i " || true)
+
+    iptables -t nat -C PREROUTING -p udp --dport "${UDPCUSTOM_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || \
+      iptables -t nat -I PREROUTING -p udp --dport "${UDPCUSTOM_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}"
   else
     log "UDPHC tanpa DNAT range (default performa). Isi UDPCUSTOM_DNAT_RANGE jika perlu mode tembak port."
     # Bersihkan rule DNAT lama ke port UDPHC agar tidak jadi bottleneck.
