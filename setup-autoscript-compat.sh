@@ -2045,11 +2045,11 @@ EOF
 
   cat > /etc/systemd/system/sc-1forcr-iplimit.timer <<'EOF'
 [Unit]
-Description=Run SC 1FORCR IP Limit Checker every 15 minutes
+Description=Run SC 1FORCR IP Limit Checker every 10 minutes
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=15min
+OnUnitActiveSec=10min
 Unit=sc-1forcr-iplimit.service
 
 [Install]
@@ -2912,7 +2912,7 @@ draw_dashboard() {
   printf " ─────────────────────────────────────────────────\n"
 }
 show_combined_online() {
-  local mode ip isp tmp_users tmp_count udpcustom
+  local mode ip isp tmp_users tmp_count tmp_status udpcustom
   mode="${1:-realtime}"
   ip="$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
   ip="${ip:-unknown}"
@@ -2921,7 +2921,8 @@ show_combined_online() {
 
   tmp_users="$(mktemp)"
   tmp_count="$(mktemp)"
-  trap 'rm -f "${tmp_users:-}" "${tmp_count:-}"' RETURN
+  tmp_status="$(mktemp)"
+  trap 'rm -f "${tmp_users:-}" "${tmp_count:-}" "${tmp_status:-}"' RETURN
 
   # SSH/Dropbear user aktif dari process sshd + who (tanpa awk kompleks agar kompatibel)
   ps -eo args= 2>/dev/null | \
@@ -2954,6 +2955,8 @@ show_combined_online() {
   grep -E '^[a-z0-9._-]+$' "${tmp_users}" | sort | uniq -c | \
     sed -E 's/^[[:space:]]*([0-9]+)[[:space:]]+(.+)$/\2 \1/' > "${tmp_count}" || true
 
+  sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
+
   echo "IP     : ${ip}"
   echo "DOMAIN : ${DOMAIN}"
   echo "ISP    : ${isp}"
@@ -2967,10 +2970,28 @@ show_combined_online() {
     return
   fi
 
-  while read -r u n; do
-    [[ -z "${u:-}" || -z "${n:-}" ]] && continue
-    echo "${u} ${n} PID"
-  done < "${tmp_count}"
+  echo "username|status|jumlah_login"
+  awk '
+    BEGIN { FS="|"; OFS="|" }
+    NR==FNR {
+      st[$1]=$2;
+      lim[$1]=$3 + 0;
+      next
+    }
+    {
+      u=$1; n=$2 + 0;
+      s=(u in st ? st[u] : "AMAN");
+      l=(u in lim ? lim[u] : 0);
+      if (s == "LOCK" || s == "LOCK_TMP") {
+        out="KENA_LOCK";
+      } else if (l > 0 && n > l) {
+        out="MULTI_LOGIN";
+      } else {
+        out="AMAN";
+      }
+      print u, out, n;
+    }' "${tmp_status}" "${tmp_count}"
+
   local total_user total_pid n
   total_user="$(wc -l < "${tmp_count}" | tr -d ' ')"
   total_pid=0
@@ -3335,7 +3356,7 @@ Catatan:
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
 - Update sekali klik dari menu: isi UPDATE_SCRIPT_URL lalu pilih menu 11 (Update Script dari Repo)
 - Uninstall helper: uninstall-sc-1forcr
-- Auto lock IP limit: timer systemd sc-1forcr-iplimit.timer (cek tiap 15 menit, lock sementara 15 menit)
+- Auto lock IP limit: timer systemd sc-1forcr-iplimit.timer (cek tiap 10 menit, lock sementara 15 menit)
 EOF
 }
 
