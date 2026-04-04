@@ -629,6 +629,7 @@ setup_udpcustom_udp_nat_rules() {
   fi
 
   local listen_port backend
+  backend="$(echo "${ACTIVE_UDP_BACKEND:-}" | tr '[:upper:]' '[:lower:]')"
   listen_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
   if [[ -z "${listen_port}" ]]; then
     listen_port="$(echo "${UDPCUSTOM_LISTEN_PORT}" | tr -cd '0-9')"
@@ -723,7 +724,7 @@ AUTH_TOKEN=${API_AUTH_TOKEN}
 ZIVPN_CONFIG=/etc/zivpn/config.json
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
 SSH_WS_PORT=2082
-SSH_WS_TARGET_PORT=${DROPBEAR_PORT}
+SSH_WS_TARGET_PORT=22
 SSH_HTTP_BACKEND_HOST=127.0.0.1
 SSH_HTTP_BACKEND_PORT=80
 EOF
@@ -1462,37 +1463,36 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 		raw.Reset()
 
-		// Some clients switch directly to raw SSH after CONNECT.
-		_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
-		nextPeek, nextErr := reader.Peek(4)
+		// CONNECT clients may still send HTTP payload lines before SSH banner.
+		// Discard those lines until we see SSH- and then start raw SSH tunnel.
+		_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for i := 0; i < 64; i++ {
+			nextPeek, nextErr := reader.Peek(4)
+			if nextErr != nil {
+				_ = client.SetReadDeadline(time.Time{})
+				return
+			}
+			if string(nextPeek) == "SSH-" {
+				_ = client.SetReadDeadline(time.Time{})
+				sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+				if err != nil {
+					return
+				}
+				if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+					_ = sshUp.Close()
+					return
+				}
+				tunnelBoth(client, sshUp)
+				return
+			}
+			// Drop one line of HTTP payload and keep scanning.
+			if _, err := reader.ReadBytes('\n'); err != nil {
+				_ = client.SetReadDeadline(time.Time{})
+				return
+			}
+		}
 		_ = client.SetReadDeadline(time.Time{})
-		if nextErr == nil && string(nextPeek) == "SSH-" {
-			sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
-			if err != nil {
-				return
-			}
-			if err := flushReaderBufferedTo(reader, sshUp); err != nil {
-				_ = sshUp.Close()
-				return
-			}
-			tunnelBoth(client, sshUp)
-			return
-		}
-
-		for {
-			line, err := reader.ReadBytes('\n')
-			if err != nil {
-				return
-			}
-			raw.Write(line)
-			if raw.Len() > 128*1024 {
-				return
-			}
-			if bytes.HasSuffix(raw.Bytes(), []byte("\r\n\r\n")) {
-				break
-			}
-		}
-		header = strings.ToLower(raw.String())
+		return
 	}
 
 	if strings.Contains(header, "upgrade: websocket") || strings.Contains(header, "upgrade:") {
@@ -3055,4 +3055,3 @@ EOF
 }
 
 main "$@"
-  backend="$(echo "${ACTIVE_UDP_BACKEND}" | tr '[:upper:]' '[:lower:]')"
