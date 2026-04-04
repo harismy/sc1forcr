@@ -1649,6 +1649,14 @@ function addIpToUserMap(map, username, ip) {
   map.get(u).add(v);
 }
 
+function addSessionKeyToUserMap(map, username, key) {
+  const u = String(username || '').trim().toLowerCase();
+  const k = String(key || '').trim().toLowerCase();
+  if (!u || !k || u === 'root') return;
+  if (!map.has(u)) map.set(u, new Set());
+  map.get(u).add(k);
+}
+
 function extractIp(raw) {
   let v = String(raw || '').trim();
   if (!v) return '';
@@ -1657,8 +1665,9 @@ function extractIp(raw) {
   return v;
 }
 
-function parseSshAndUdpIpMap() {
-  const map = new Map();
+function parseSshAndUdpUsage() {
+  const ipMap = new Map();
+  const sessionMap = new Map();
 
   // SSH/Dropbear realtime: established sockets + sshd PID owner -> username.
   const pidIpMap = new Map();
@@ -1697,7 +1706,11 @@ function parseSshAndUdpIpMap() {
       if (!args.startsWith('sshd:')) continue;
       let user = args.replace(/^sshd:\s*/, '').split(/\s+/)[0] || '';
       user = user.replace(/@.*$/, '').replace(/\[.*$/, '');
-      for (const ip of (pidIpMap.get(pid) || [])) addIpToUserMap(map, user, ip);
+      addSessionKeyToUserMap(sessionMap, user, `sshd-pid:${pid}`);
+      for (const ip of (pidIpMap.get(pid) || [])) {
+        addIpToUserMap(ipMap, user, ip);
+        addSessionKeyToUserMap(sessionMap, user, `sshd-ip:${ip}`);
+      }
     }
   }
 
@@ -1713,7 +1726,8 @@ function parseSshAndUdpIpMap() {
     const user = String(parts[0] || '').trim();
     const hostMatch = t.match(/\(([^\)]+)\)/);
     const host = extractIp(hostMatch?.[1] || '');
-    addIpToUserMap(map, user, host);
+    addIpToUserMap(ipMap, user, host);
+    addSessionKeyToUserMap(sessionMap, user, `who:${host || 'local'}`);
   }
 
   // UDP Custom realtime (short window) from journal.
@@ -1746,9 +1760,11 @@ function parseSshAndUdpIpMap() {
         }
       }
     }
-    addIpToUserMap(map, user, extractIp(src));
+    const ip = extractIp(src);
+    addIpToUserMap(ipMap, user, ip);
+    addSessionKeyToUserMap(sessionMap, user, `udp:${src || ip || '-'}`);
   }
-  return map;
+  return { ipMap, sessionMap };
 }
 
 function parseXrayRecentIpMap() {
@@ -1860,7 +1876,9 @@ async function unlockExpired(nowTs) {
 }
 
 async function lockIfExceeded(nowTs) {
-  const sshMap = parseSshAndUdpIpMap();
+  const sshUsage = parseSshAndUdpUsage();
+  const sshIpMap = sshUsage.ipMap;
+  const sshSessionMap = sshUsage.sessionMap;
   const xrayMap = parseXrayRecentIpMap();
   let xrayChanged = false;
   let zivpnChanged = false;
@@ -1870,7 +1888,9 @@ async function lockIfExceeded(nowTs) {
     const user = String(r.username || '').trim();
     const userKey = user.toLowerCase();
     const lim = Number(r.limitip || 0);
-    const cnt = sshMap.has(userKey) ? sshMap.get(userKey).size : 0;
+    const cntIp = sshIpMap.has(userKey) ? sshIpMap.get(userKey).size : 0;
+    const cntSession = sshSessionMap.has(userKey) ? sshSessionMap.get(userKey).size : 0;
+    const cnt = Math.max(cntIp, cntSession);
     if (cnt <= lim) continue;
     const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]);
     if (exists) continue;
@@ -2043,6 +2063,51 @@ EOF
   systemctl restart ssh || true
   systemctl enable dropbear || true
   systemctl restart dropbear || true
+}
+
+setup_auto_reboot_timer() {
+  log "Setup auto reboot harian jam 03:00..."
+
+  cat > /usr/local/sbin/sc-1forcr-safe-reboot <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+logger -t sc-1forcr "Auto reboot timer triggered (03:00)."
+sync
+sleep 2
+/usr/bin/systemctl --force reboot
+EOF
+  chmod +x /usr/local/sbin/sc-1forcr-safe-reboot
+
+  cat > /etc/systemd/system/sc-1forcr-autoreboot.service <<'EOF'
+[Unit]
+Description=SC 1FORCR Safe Auto Reboot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-safe-reboot
+NoNewPrivileges=true
+PrivateTmp=true
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-autoreboot.timer <<'EOF'
+[Unit]
+Description=Run SC 1FORCR auto reboot at 03:00 daily
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+AccuracySec=1min
+Unit=sc-1forcr-autoreboot.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now sc-1forcr-autoreboot.timer
 }
 
 write_cli_menu() {
@@ -3165,6 +3230,10 @@ systemctl stop sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-iplimit.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-autoreboot.service >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-autoreboot.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udpcustom >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-udpcustom >/dev/null 2>&1 || true
 systemctl stop udp-custom >/dev/null 2>&1 || true
@@ -3173,6 +3242,8 @@ rm -f /etc/systemd/system/sc-1forcr-api.service
 rm -f /etc/systemd/system/sc-1forcr-sshws.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.timer
+rm -f /etc/systemd/system/sc-1forcr-autoreboot.service
+rm -f /etc/systemd/system/sc-1forcr-autoreboot.timer
 rm -f /etc/systemd/system/sc-1forcr-udpcustom.service
 rm -f /etc/systemd/system/potato-compat-api.service
 systemctl daemon-reload
@@ -3186,6 +3257,7 @@ rm -f /usr/local/sbin/menu-potato
 rm -f /usr/local/sbin/menu
 rm -f /usr/local/sbin/uninstall-sc-1forcr
 rm -f /usr/local/sbin/uninstall-potato-compat
+rm -f /usr/local/sbin/sc-1forcr-safe-reboot
 
 echo "Uninstall SC 1FORCR selesai."
 echo "Catatan: layanan inti (ssh/nginx/xray/zivpn) tidak dihapus otomatis."
@@ -3223,6 +3295,7 @@ main() {
   build_go_files
   write_iplimit_checker
   setup_services
+  setup_auto_reboot_timer
   write_cli_menu
   write_version_marker
 
@@ -3257,6 +3330,8 @@ Catatan:
 - UDP Custom default tanpa DNAT range (lebih stabil/cepat). Jika perlu mode tembak port, isi UDPCUSTOM_DNAT_RANGE.
 - Hanya 1 backend UDP aktif sesuai ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND} (zivpn|udpcustom).
 - vnStat dan speedtest-cli otomatis terpasang untuk monitoring trafik + tes speed VPS.
+- Auto reboot aktif setiap hari jam 03:00 via systemd timer sc-1forcr-autoreboot.timer.
+- Reboot hanya menjalankan sync + reboot (tanpa ubah konfigurasi layanan).
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
 - Update sekali klik dari menu: isi UPDATE_SCRIPT_URL lalu pilih menu 11 (Update Script dari Repo)
 - Uninstall helper: uninstall-sc-1forcr
@@ -3265,5 +3340,3 @@ EOF
 }
 
 main "$@"
-
-
