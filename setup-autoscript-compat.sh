@@ -3177,13 +3177,9 @@ show_combined_online() {
 
   awk '{ if ($1 ~ /^[a-z0-9._-]+$/ && $2 != "") cnt[$1]++ } END { for (u in cnt) print u, cnt[u]; }' "${tmp_udp_pair}" > "${tmp_udp_count}" || true
 
-  awk '
-    NR==FNR { key[$1 " " $2]=1; next }
-    {
-      k=$1 " " $2;
-      if (!(k in key)) cnt[$1]++;
-    }
-    END { for (u in cnt) print u, cnt[u]; }' "${tmp_udp_pair}" "${tmp_ssh_pair}" > "${tmp_ssh_count}" || true
+  # Hitung sesi SSH murni dari pair user+ip hasil socket mapping.
+  # Jangan dikurangi dari data UDPHC; dua kolom ditampilkan terpisah.
+  awk '{ if ($1 ~ /^[a-z0-9._-]+$/ && $2 != "") cnt[$1]++ } END { for (u in cnt) print u, cnt[u]; }' "${tmp_ssh_pair}" > "${tmp_ssh_count}" || true
 
   # Fallback untuk SSH-WS/HC: ambil sesi dari process list bila mapping socket->user tidak terbaca.
   ps -eo args= 2>/dev/null | awk '
