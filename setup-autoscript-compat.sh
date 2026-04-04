@@ -1501,6 +1501,10 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			return
 		}
 		_, _ = client.Write([]byte("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"))
+		if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+			_ = sshUp.Close()
+			return
+		}
 		tunnelBoth(client, sshUp)
 		return
 	}
@@ -1515,6 +1519,10 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 			_ = httpUp.Close()
 			return
 		}
+		if err := flushReaderBufferedTo(reader, httpUp); err != nil {
+			_ = httpUp.Close()
+			return
+		}
 		tunnelBoth(client, httpUp)
 		return
 	}
@@ -1525,6 +1533,10 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 		return
 	}
 	if err := writeAll(sshUp, raw.Bytes()); err != nil {
+		_ = sshUp.Close()
+		return
+	}
+	if err := flushReaderBufferedTo(reader, sshUp); err != nil {
 		_ = sshUp.Close()
 		return
 	}
