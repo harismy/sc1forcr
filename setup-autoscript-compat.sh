@@ -1494,8 +1494,67 @@ function safeExec(cmd, args) {
   }
 }
 
-function parseWhoMap() {
+function addIpToUserMap(map, username, ip) {
+  const u = String(username || '').trim().toLowerCase();
+  const v = String(ip || '').trim();
+  if (!u || !v || u === 'root') return;
+  if (!map.has(u)) map.set(u, new Set());
+  map.get(u).add(v);
+}
+
+function extractIp(raw) {
+  let v = String(raw || '').trim();
+  if (!v) return '';
+  v = v.replace(/^\[/, '').replace(/\]$/, '');
+  v = v.replace(/:[0-9]+$/, '');
+  return v;
+}
+
+function parseSshAndUdpIpMap() {
   const map = new Map();
+
+  // SSH/Dropbear realtime: established sockets + sshd PID owner -> username.
+  const pidIpMap = new Map();
+  let ssOut = '';
+  try {
+    ssOut = execFileSync('ss', ['-Htnp', 'state', 'established'], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+  } catch (_) {}
+  for (const lineRaw of String(ssOut || '').split('\n')) {
+    const line = String(lineRaw || '').trim();
+    if (!line) continue;
+    const cols = line.split(/\s+/);
+    const local = String(cols[3] || '');
+    const remote = String(cols[4] || '');
+    const lport = (local.match(/:([0-9]+)$/) || [])[1] || '';
+    if (lport !== '22' && lport !== '109' && lport !== '143') continue;
+    const ip = extractIp(remote);
+    if (!ip) continue;
+    const pids = Array.from(line.matchAll(/pid=(\d+)/g)).map((m) => Number(m[1])).filter((n) => Number.isInteger(n) && n > 0);
+    for (const pid of new Set(pids)) {
+      if (!pidIpMap.has(pid)) pidIpMap.set(pid, new Set());
+      pidIpMap.get(pid).add(ip);
+    }
+  }
+
+  if (pidIpMap.size > 0) {
+    let psOut = '';
+    const pids = Array.from(pidIpMap.keys()).join(',');
+    try {
+      psOut = execFileSync('ps', ['-o', 'pid=,args=', '-p', pids], { encoding: 'utf8' });
+    } catch (_) {}
+    for (const lineRaw of String(psOut || '').split('\n')) {
+      const m = String(lineRaw || '').match(/^\s*(\d+)\s+(.*)$/);
+      if (!m) continue;
+      const pid = Number(m[1]);
+      const args = String(m[2] || '').trim();
+      if (!args.startsWith('sshd:')) continue;
+      let user = args.replace(/^sshd:\s*/, '').split(/\s+/)[0] || '';
+      user = user.replace(/@.*$/, '').replace(/\[.*$/, '');
+      for (const ip of (pidIpMap.get(pid) || [])) addIpToUserMap(map, user, ip);
+    }
+  }
+
+  // Fallback: who entries (TTY login).
   let out = '';
   try {
     out = execFileSync('who', [], { encoding: 'utf8' });
@@ -1506,10 +1565,41 @@ function parseWhoMap() {
     const parts = t.split(/\s+/);
     const user = String(parts[0] || '').trim();
     const hostMatch = t.match(/\(([^\)]+)\)/);
-    const host = String(hostMatch?.[1] || '').trim();
-    if (!user || !host) continue;
-    if (!map.has(user)) map.set(user, new Set());
-    map.get(user).add(host);
+    const host = extractIp(hostMatch?.[1] || '');
+    addIpToUserMap(map, user, host);
+  }
+
+  // UDP Custom realtime (short window) from journal.
+  let jOut = '';
+  try {
+    jOut = execFileSync(
+      'journalctl',
+      ['-u', 'sc-1forcr-udpcustom', '-u', 'udp-custom', '--since', '-20 min', '-n', '300', '--no-pager'],
+      { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 }
+    );
+  } catch (_) {}
+  for (const lineRaw of String(jOut || '').split('\n')) {
+    const line = String(lineRaw || '');
+    let user = '';
+    let src = '';
+    let m = line.match(/\[src:([^\]]+)\]\s+\[user:([^\]]+)\]\s+Client connected/i);
+    if (m) {
+      src = m[1];
+      user = m[2];
+    } else {
+      m = line.match(/user[=: ]([^\s,]+).*src[=: ]([^\s,]+)/i);
+      if (m) {
+        user = m[1];
+        src = m[2];
+      } else {
+        m = line.match(/src[=: ]([^\s,]+).*user[=: ]([^\s,]+)/i);
+        if (m) {
+          src = m[1];
+          user = m[2];
+        }
+      }
+    }
+    addIpToUserMap(map, user, extractIp(src));
   }
   return map;
 }
@@ -1518,18 +1608,24 @@ function parseXrayRecentIpMap() {
   const map = new Map();
   const path = '/var/log/xray/access.log';
   if (!fs.existsSync(path)) return map;
-  const lines = fs.readFileSync(path, 'utf8').split('\n').slice(-20000);
+  let tailOut = '';
+  try {
+    tailOut = execFileSync('tail', ['-n', '5000', path], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  } catch (_) {
+    return map;
+  }
+  const lines = String(tailOut || '').split('\n');
   for (const lineRaw of lines) {
     const line = String(lineRaw || '').trim();
     if (!line) continue;
     const emailJson = line.match(/"email":"([^"]+)"/);
     const emailTxt = line.match(/\bemail:\s*([^\s]+)/i);
-    const email = String(emailJson?.[1] || emailTxt?.[1] || '').trim();
+    const email = String(emailJson?.[1] || emailTxt?.[1] || '').trim().toLowerCase();
     if (!email) continue;
     const srcJson = line.match(/"source":"([^"]+)"/);
     const srcTxt = line.match(/\bfrom\s+([0-9a-fA-F\.:]+)/i);
     const src = String(srcJson?.[1] || srcTxt?.[1] || '').trim();
-    const ip = src.split(':')[0];
+    const ip = extractIp(src);
     if (!ip) continue;
     if (!map.has(email)) map.set(email, new Set());
     map.get(email).add(ip);
@@ -1617,7 +1713,7 @@ async function unlockExpired(nowTs) {
 }
 
 async function lockIfExceeded(nowTs) {
-  const sshMap = parseWhoMap();
+  const sshMap = parseSshAndUdpIpMap();
   const xrayMap = parseXrayRecentIpMap();
   let xrayChanged = false;
   let zivpnChanged = false;
@@ -1625,8 +1721,9 @@ async function lockIfExceeded(nowTs) {
   const sshRows = await all("SELECT username, limitip FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(limitip,0) AS INTEGER) > 0");
   for (const r of sshRows) {
     const user = String(r.username || '').trim();
+    const userKey = user.toLowerCase();
     const lim = Number(r.limitip || 0);
-    const cnt = sshMap.has(user) ? sshMap.get(user).size : 0;
+    const cnt = sshMap.has(userKey) ? sshMap.get(userKey).size : 0;
     if (cnt <= lim) continue;
     const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]);
     if (exists) continue;
@@ -1646,8 +1743,9 @@ async function lockIfExceeded(nowTs) {
     const rows = await all(`SELECT username, limitip FROM ${item.table} WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(limitip,0) AS INTEGER) > 0`);
     for (const r of rows) {
       const user = String(r.username || '').trim();
+      const userKey = user.toLowerCase();
       const lim = Number(r.limitip || 0);
-      const cnt = xrayMap.has(user) ? xrayMap.get(user).size : 0;
+      const cnt = xrayMap.has(userKey) ? xrayMap.get(userKey).size : 0;
       if (cnt <= lim) continue;
       const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type=? AND username=?", [item.type, user]);
       if (exists) continue;
@@ -2301,8 +2399,9 @@ detect_udpcustom_service() {
   echo "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}"
 }
 
-show_ssh_online() {
-  local ip isp tmp_users tmp_count udpcustom
+show_combined_online() {
+  local mode ip isp tmp_users tmp_count udpcustom
+  mode="${1:-realtime}"
   ip="$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
   ip="${ip:-unknown}"
   isp="$(curl -fsS --max-time 4 "https://ipinfo.io/${ip}/org" 2>/dev/null || echo unknown)"
@@ -2328,8 +2427,12 @@ show_ssh_online() {
     grep -E '^[a-z0-9._-]+$' | \
     grep -v '^root$' >> "${tmp_users}" || true
 
-  # UDP Custom user dari log terbaru (format lama + format baru)
-  journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom -n 1200 --no-pager 2>/dev/null | \
+  # UDP Custom user dari log (realtime ringan: 5 menit terakhir, history: lebih panjang)
+  if [[ "${mode}" == "history" ]]; then
+    journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom -n 1200 --no-pager 2>/dev/null
+  else
+    journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom --since "-5 min" -n 250 --no-pager 2>/dev/null
+  fi | \
     sed -nE '
       s/.*\[src:[^]]+\][[:space:]]+\[user:([^]]+)\][[:space:]]+Client connected.*/\1/p;
       s/.*\[user:([^]]+)\].*/\1/p;
@@ -2366,6 +2469,14 @@ show_ssh_online() {
   echo
   echo "Total User : ${total_user}"
   echo "Total PID  : ${total_pid}"
+}
+
+show_ssh_online() {
+  show_combined_online "realtime"
+}
+
+show_ssh_online_history() {
+  show_combined_online "history"
 }
 
 xray_log_snapshot() {
@@ -2512,20 +2623,22 @@ monitor_online_menu() {
     echo "===================================="
     echo "      MONITOR USER ONLINE"
     echo "===================================="
-    echo "1) SSH + UDP CUSTOM"
-    echo "2) VMESS"
-    echo "3) VLESS"
-    echo "4) TROJAN"
-    echo "5) UDP CUSTOM"
+    echo "1) SSH + UDP CUSTOM (Realtime ringan)"
+    echo "2) SSH + UDP CUSTOM (Histori log)"
+    echo "3) VMESS"
+    echo "4) VLESS"
+    echo "5) TROJAN"
+    echo "6) UDP CUSTOM"
     echo "0) Kembali"
     echo
     read -rp "Pilih menu: " o
     case "${o}" in
       1) show_ssh_online ;;
-      2) show_xray_online_by_table "account_vmesses" "VMESS" ;;
-      3) show_xray_online_by_table "account_vlesses" "VLESS" ;;
-      4) show_xray_online_by_table "account_trojans" "TROJAN" ;;
-      5) show_udpcustom_online ;;
+      2) show_ssh_online_history ;;
+      3) show_xray_online_by_table "account_vmesses" "VMESS" ;;
+      4) show_xray_online_by_table "account_vlesses" "VLESS" ;;
+      5) show_xray_online_by_table "account_trojans" "TROJAN" ;;
+      6) show_udpcustom_online ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
