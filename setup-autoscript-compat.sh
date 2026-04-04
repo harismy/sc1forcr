@@ -3027,7 +3027,7 @@ draw_dashboard() {
   printf " ─────────────────────────────────────────────────\n"
 }
 show_combined_online() {
-  local mode tmp_count tmp_status tmp_ssh_pids tmp_ssh_count tmp_udp_count udpcustom
+  local mode tmp_count tmp_status tmp_ssh_pids tmp_ssh_count tmp_udp_count udpcustom udp_ttl
   mode="${1:-realtime}"
   udpcustom="$(detect_udpcustom_service)"
 
@@ -3072,19 +3072,28 @@ show_combined_online() {
       END { for (u in cnt) print u, cnt[u]; }' > "${tmp_ssh_count}" || true
   fi
 
-  # UDP Custom: pair Client connected/disconnected by src untuk estimasi sesi aktif.
+  # UDP Custom: pair connected/disconnected by src, lalu expire sesi lama (anti ghost session).
   if [[ "${mode}" == "history" ]]; then
-    journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom -n 2400 --no-pager 2>/dev/null
+    udp_ttl="3600"
+    journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom -n 2400 -o short-unix --no-pager 2>/dev/null
   else
-    journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom --since "-20 min" -n 1200 --no-pager 2>/dev/null
-  fi | awk '
+    udp_ttl="180"
+    journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom --since "-8 min" -n 800 -o short-unix --no-pager 2>/dev/null
+  fi | awk -v ttl="${udp_ttl}" '
     function norm_user(v) {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
       v=tolower(v);
       if (v ~ /^[a-z0-9._-]+$/ && v != "root") return v;
       return "";
     }
+    BEGIN {
+      now=systime();
+      if (ttl <= 0) ttl=180;
+    }
     {
+      ts=$1;
+      sub(/\..*$/, "", ts);
+      if (ts !~ /^[0-9]+$/) ts=now;
       line=$0;
       src=""; u="";
       if (line ~ /\[src:[^]]+\][[:space:]]+\[user:[^]]+\][[:space:]]+Client connected/) {
@@ -3095,7 +3104,10 @@ show_combined_online() {
         sub(/^.*\[user:/, "", u);
         sub(/\].*$/, "", u);
         u=norm_user(u);
-        if (src != "" && u != "") active[src]=u;
+        if (src != "" && u != "") {
+          active[src]=u;
+          seen[src]=ts + 0;
+        }
         next;
       }
       if (line ~ /\[src:[^]]+\][[:space:]]+Client disconnected/) {
@@ -3103,11 +3115,15 @@ show_combined_online() {
         sub(/^.*\[src:/, "", src);
         sub(/\].*$/, "", src);
         if (src in active) delete active[src];
+        if (src in seen) delete seen[src];
         next;
       }
     }
     END {
-      for (s in active) cnt[active[s]]++;
+      for (s in active) {
+        age=now - (s in seen ? seen[s] : now);
+        if (age <= ttl) cnt[active[s]]++;
+      }
       for (u in cnt) print u, cnt[u];
     }' > "${tmp_udp_count}" || true
 
