@@ -3028,53 +3028,81 @@ draw_dashboard() {
   printf " ─────────────────────────────────────────────────\n"
 }
 show_combined_online() {
-  local mode tmp_count tmp_status tmp_ssh_pids tmp_ssh_count tmp_udp_count udpcustom udp_ttl
+  local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_udp_pair tmp_udp_count udpcustom udp_ttl
   mode="${1:-realtime}"
   udp_ttl="180"
   udpcustom="$(detect_udpcustom_service)"
 
   tmp_count="$(mktemp)"
   tmp_status="$(mktemp)"
-  tmp_ssh_pids="$(mktemp)"
+  tmp_ssh_pid_ip="$(mktemp)"
+  tmp_pid_user="$(mktemp)"
+  tmp_ssh_pair="$(mktemp)"
   tmp_ssh_count="$(mktemp)"
+  tmp_udp_pair="$(mktemp)"
   tmp_udp_count="$(mktemp)"
-  trap 'rm -f "${tmp_count:-}" "${tmp_status:-}" "${tmp_ssh_pids:-}" "${tmp_ssh_count:-}" "${tmp_udp_count:-}"' RETURN
+  trap 'rm -f "${tmp_count:-}" "${tmp_status:-}" "${tmp_ssh_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_ssh_pair:-}" "${tmp_ssh_count:-}" "${tmp_udp_pair:-}" "${tmp_udp_count:-}"' RETURN
 
-  # SSH realtime: hitung sesi established dari port SSH/Dropbear saja (tanpa dobel dari who).
+  # SSH realtime: map pid->user dan pid->remote_ip, lalu pisahkan dari pasangan user+ip UDPHC aktif.
+  : > "${tmp_ssh_pair}"
+  : > "${tmp_ssh_count}"
   ss -Htnp state established 2>/dev/null | awk '
     {
       l=$4;
+      r=$5;
       if (l ~ /:22$/ || l ~ /:109$/ || l ~ /:143$/) {
+        ip=r;
+        gsub(/^\[/, "", ip);
+        gsub(/\]$/, "", ip);
+        sub(/:[0-9]+$/, "", ip);
+        if (ip == "") next;
         s=$0;
         while (match(s, /pid=[0-9]+/)) {
-          print substr(s, RSTART + 4, RLENGTH - 4);
+          pid=substr(s, RSTART + 4, RLENGTH - 4);
+          if (pid ~ /^[0-9]+$/) print pid, ip;
           s=substr(s, RSTART + RLENGTH);
         }
       }
-    }' | sort -u > "${tmp_ssh_pids}" || true
+    }' | sort -u > "${tmp_ssh_pid_ip}" || true
 
-  : > "${tmp_ssh_count}"
-  if [[ -s "${tmp_ssh_pids}" ]]; then
+  if [[ -s "${tmp_ssh_pid_ip}" ]]; then
     local pid_csv
-    pid_csv="$(paste -sd, "${tmp_ssh_pids}")"
+    pid_csv="$(awk '{print $1}' "${tmp_ssh_pid_ip}" | sort -u | paste -sd, -)"
     ps -o pid=,args= -p "${pid_csv}" 2>/dev/null | awk '
       {
         pid=$1;
         $1="";
         sub(/^[[:space:]]+/, "", $0);
-        if ($0 !~ /^sshd:/) next;
-        u=$0;
-        sub(/^sshd:[[:space:]]*/, "", u);
-        sub(/[[:space:]].*$/, "", u);
-        sub(/@.*$/, "", u);
-        sub(/\[.*$/, "", u);
+        u="";
+        if ($0 ~ /^sshd:/) {
+          u=$0;
+          sub(/^sshd:[[:space:]]*/, "", u);
+          sub(/[[:space:]].*$/, "", u);
+          sub(/@.*$/, "", u);
+          sub(/\[.*$/, "", u);
+        } else if ($0 ~ /^dropbear/) {
+          u=$0;
+          if (u !~ /\[[^]]+\]/) next;
+          sub(/^.*\[/, "", u);
+          sub(/\].*$/, "", u);
+        } else next;
         u=tolower(u);
-        if (u ~ /^[a-z0-9._-]+$/ && u != "root") cnt[u]++;
-      }
-      END { for (u in cnt) print u, cnt[u]; }' > "${tmp_ssh_count}" || true
+        if (u !~ /^[a-z0-9._-]+$/) next;
+        if (u == "root" || u == "priv" || u == "net") next;
+        print pid, u;
+      }' > "${tmp_pid_user}" || true
+
+    awk '
+      NR==FNR { u[$1]=$2; next }
+      {
+        pid=$1; ip=$2; user=(pid in u ? u[pid] : "");
+        if (user != "" && ip != "") print user, ip;
+      }' "${tmp_pid_user}" "${tmp_ssh_pid_ip}" | sort -u > "${tmp_ssh_pair}" || true
   fi
 
   # UDP Custom: pair connected/disconnected by src, lalu expire sesi lama (anti ghost session).
+  : > "${tmp_udp_pair}"
+  : > "${tmp_udp_count}"
   if [[ "${mode}" == "history" ]]; then
     udp_ttl="3600"
     journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom -n 2400 -o short-unix --no-pager 2>/dev/null
@@ -3140,11 +3168,20 @@ show_combined_online() {
       }
       for (k in uniq) {
         split(k, a, /\|/);
-        u=a[1];
-        if (u != "") cnt[u]++;
+        u=a[1]; ip=a[2];
+        if (u != "" && ip != "") print u, ip;
       }
-      for (u in cnt) print u, cnt[u];
-    }' > "${tmp_udp_count}" || true
+    }' > "${tmp_udp_pair}" || true
+
+  awk '{ if ($1 ~ /^[a-z0-9._-]+$/ && $2 != "") cnt[$1]++ } END { for (u in cnt) print u, cnt[u]; }' "${tmp_udp_pair}" > "${tmp_udp_count}" || true
+
+  awk '
+    NR==FNR { key[$1 " " $2]=1; next }
+    {
+      k=$1 " " $2;
+      if (!(k in key)) cnt[$1]++;
+    }
+    END { for (u in cnt) print u, cnt[u]; }' "${tmp_udp_pair}" "${tmp_ssh_pair}" > "${tmp_ssh_count}" || true
 
   awk '
     NR==FNR {
