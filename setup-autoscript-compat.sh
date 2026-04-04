@@ -2734,7 +2734,20 @@ draw_dashboard() {
   local ssh_on xray_on ws_on loadblc_on zivpn_on udphc_on
   local c_ssh c_vmess c_vless c_trojan
   local health
+  local line
 
+  # Color definitions
+  local RED='\033[0;31m'
+  local GREEN='\033[0;32m'
+  local YELLOW='\033[0;33m'
+  local BLUE='\033[0;34m'
+  local CYAN='\033[0;36m'
+  local BOLD='\033[1m'
+  local NC='\033[0m'
+  local CHECK="${YELLOW}CHECK${NC}"
+  local GOOD="${GREEN}GOOD${NC}"
+
+  # Data collection
   os_name="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
   ram_mb="$(free -m 2>/dev/null | awk '/^Mem:/ {print $3 "M"}')"
   swap_mb="$(free -m 2>/dev/null | awk '/^Swap:/ {print $3 "M"}')"
@@ -2759,6 +2772,8 @@ draw_dashboard() {
   if [[ "${xray_on}" == "ON" && "${ws_on}" == "ON" && "${loadblc_on}" == "ON" ]]; then
     health="GOOD"
   fi
+  local health_display="${CHECK}"
+  [[ "${health}" == "GOOD" ]] && health_display="${GOOD}"
 
   c_ssh="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_sshs;" 2>/dev/null || echo 0)"
   c_vmess="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vmesses;" 2>/dev/null || echo 0)"
@@ -2767,36 +2782,69 @@ draw_dashboard() {
 
   read_vnstat_stats
 
-  printf "┌─────────────────────────────────────────────────┐\n"
-  printf "│                 SC 1FORCR NEXUS                 │\n"
-  printf "├─────────────────────────────────────────────────┤\n"
-  printf "│ OS      : %-38.38s │\n" "${os_name}"
-  printf "│ RAM     : %-38.38s │\n" "${ram_mb:-"-"}"
-  printf "│ SWAP    : %-38.38s │\n" "${swap_mb:-"-"}"
-  printf "│ CITY    : %-38.38s │\n" "${city}"
-  printf "│ ISP     : %-38.38s │\n" "${isp}"
-  printf "│ IP      : %-38.38s │\n" "${ip}"
-  printf "│ DOMAIN  : %-38.38s │\n" "${DOMAIN}"
-  printf "│ UPTIME  : %-38.38s │\n" "${uptime_h} hours, ${uptime_m} minutes"
-  printf "├─────────────────────────────────────────────────┤\n"
-  printf "│ MONTH   : %-38.38s │\n" "${VNSTAT_MONTH_TOTAL} [${VNSTAT_MONTH_NAME}]"
-  printf "│ RX      : %-38.38s │\n" "${VNSTAT_MONTH_RX}"
-  printf "│ TX      : %-38.38s │\n" "${VNSTAT_MONTH_TX}"
-  printf "├─────────────────────────────────────────────────┤\n"
-  printf "│ DAY     : %-38.38s │\n" "${VNSTAT_DAY_TOTAL} [${VNSTAT_DAY_NAME}]"
-  printf "│ RX      : %-38.38s │\n" "${VNSTAT_DAY_RX}"
-  printf "│ TX      : %-38.38s │\n" "${VNSTAT_DAY_TX}"
-  printf "│ TRAFFIC : %-38.38s │\n" "${VNSTAT_RATE}"
-  printf "├─────────────────────────────────────────────────┤\n"
-  printf "│ XRAY:%-3s SSH-WS:%-3s LOADBLC:%-3s ZIVPN:%-3s │\n" "${xray_on}" "${ws_on}" "${loadblc_on}" "${zivpn_on}"
-  printf "│ UDPHC:%-3s SSH:%-3s HEALTH:%-20.20s │\n" "${udphc_on}" "${ssh_on}" "${health}"
-  printf "├─────────────────────────────────────────────────┤\n"
-  printf "│ SSH/OPENVPN : %-4s ACCOUNT   VMESS  : %-4s AC │\n" "${c_ssh}" "${c_vmess}"
-  printf "│ VLESS       : %-4s ACCOUNT   TROJAN : %-4s AC │\n" "${c_vless}" "${c_trojan}"
-  printf "├─────────────────────────────────────────────────┤\n"
-  printf "│ Version     : %-33.33s │\n" "${SCRIPT_VERSION:-unknown}"
-  printf "│ Client Name : %-33.33s │\n" "${ip}"
-  printf "└─────────────────────────────────────────────────┘\n"
+  # Helper for separator (without right border)
+  hr() {
+    printf "├─────────────────────────────────────────────────\n"
+  }
+
+  # Dashboard - no closing pipe on the right
+  printf "┌─────────────────────────────────────────────────\n"
+  printf "│${BOLD}             SC 1FORCR NEXUS DASHBOARD            ${NC}\n"
+  printf "├─────────────────────────────────────────────────\n"
+
+  # System & Network
+  printf "│ ${CYAN}${BOLD}■ SYSTEM & NETWORK${NC}${BOLD}${NC}                                  \n"
+  printf "│   OS      : ${os_name}${NC}                              \n"
+  printf "│   RAM     : ${ram_mb:-"-"}  │ SWAP : ${swap_mb:-"-"}${NC}                         \n"
+  printf "│   UPTIME  : ${uptime_h}h ${uptime_m}m${NC}                                           \n"
+  hr
+  printf "│ ${CYAN}${BOLD}■ LOCATION & ISP${NC}${BOLD}${NC}                                    \n"
+  printf "│   IP      : ${ip}${NC}                                                \n"
+  printf "│   CITY    : ${city}${NC}                                              \n"
+  printf "│   ISP     : ${isp}${NC}                                              \n"
+  printf "│   DOMAIN  : ${DOMAIN}${NC}                                           \n"
+  hr
+
+  # Traffic Stats
+  printf "│ ${CYAN}${BOLD}■ TRAFFIC STATS${NC}${BOLD}${NC}                                     \n"
+  printf "│   MONTH   : ${VNSTAT_MONTH_TOTAL}     [${VNSTAT_MONTH_NAME}]${NC}                 \n"
+  printf "│   RX      : ${VNSTAT_MONTH_RX}${NC}                                              \n"
+  printf "│   TX      : ${VNSTAT_MONTH_TX}${NC}                                              \n"
+  printf "│   DAY     : ${VNSTAT_DAY_TOTAL}     [${VNSTAT_DAY_NAME}]${NC}                    \n"
+  printf "│   RX      : ${VNSTAT_DAY_RX}${NC}                                               \n"
+  printf "│   TX      : ${VNSTAT_DAY_TX}${NC}                                               \n"
+  printf "│   CURRENT : ${VNSTAT_RATE}${NC}                                              \n"
+  hr
+
+  # Services Status (includes zivpn and udphc)
+  printf "│ ${CYAN}${BOLD}■ SERVICES STATUS${NC}${BOLD}${NC}                                   \n"
+  local xray_color="${GREEN}ON${NC}"; [[ "$xray_on" != "ON" ]] && xray_color="${RED}OFF${NC}"
+  local ws_color="${GREEN}ON${NC}";   [[ "$ws_on" != "ON" ]] && ws_color="${RED}OFF${NC}"
+  local lb_color="${GREEN}ON${NC}";   [[ "$loadblc_on" != "ON" ]] && lb_color="${RED}OFF${NC}"
+  local zivpn_color="${GREEN}ON${NC}"; [[ "$zivpn_on" != "ON" ]] && zivpn_color="${RED}OFF${NC}"
+  local udphc_color="${GREEN}ON${NC}"; [[ "$udphc_on" != "ON" ]] && udphc_color="${RED}OFF${NC}"
+  local ssh_color="${GREEN}ON${NC}";   [[ "$ssh_on" != "ON" ]] && ssh_color="${RED}OFF${NC}"
+
+  printf "│   XRAY    : ${xray_color}   │ SSH-WS : ${ws_color}   │ LOADBLC : ${lb_color}   \n"
+  printf "│   ZIVPN   : ${zivpn_color}   │ UDPHC  : ${udphc_color}   │ SSH    : ${ssh_color}   │ HEALTH : ${health_display}${NC} \n"
+  hr
+
+  # Account Summary
+  printf "│ ${CYAN}${BOLD}■ ACCOUNT SUMMARY${NC}${BOLD}${NC}                                   \n"
+  printf "│   SSH/OpenVPN : %-4s     │ VMESS : %-4s     \n" "${c_ssh}" "${c_vmess}"
+  printf "│   VLESS       : %-4s     │ TROJAN: %-4s     \n" "${c_vless}" "${c_trojan}"
+  hr
+
+  # Version & Client
+  printf "│ ${BLUE}${BOLD}■ VERSION & CLIENT${NC}${BOLD}${NC}                                  \n"
+  printf "│   Version     : ${SCRIPT_VERSION:-unknown}${NC}                                 \n"
+  printf "│   Order By    : SC 1FORCR${NC}                                               \n"
+  printf "│   Client Name : ${ip}${NC}                                                \n"
+  printf "│   Expiry In   : Unlimited${NC}                                              \n"
+  printf "└─────────────────────────────────────────────────\n"
+  printf " ─────────────────────────────────────────────────\n"
+  printf "           ${BOLD}to access use 'menu' command${NC}\n"
+  printf " ─────────────────────────────────────────────────\n"
 }
 show_combined_online() {
   local mode ip isp tmp_users tmp_count udpcustom
@@ -3049,43 +3097,20 @@ monitor_online_menu() {
   done
 }
 
-test_speed_vps() {
-  echo "=== TEST SPEED VPS ==="
-  echo "Mohon tunggu..."
-  if command -v speedtest >/dev/null 2>&1; then
-    speedtest --accept-license --accept-gdpr || true
-    return
-  fi
-  if command -v speedtest-cli >/dev/null 2>&1; then
-    speedtest-cli --secure || true
-    return
-  fi
-
-  echo "speedtest belum ada, mencoba install speedtest-cli..."
-  apt-get update -y >/dev/null 2>&1 || true
-  apt-get install -y speedtest-cli >/dev/null 2>&1 || true
-  if command -v speedtest-cli >/dev/null 2>&1; then
-    speedtest-cli --secure || true
-  else
-    echo "Gagal install speedtest-cli."
-  fi
-}
-
 while true; do
   clear
-  draw_dashboard
-  echo
-  echo " â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”"
-  echo "â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”"
-  echo "   1.) â˜ž ADD ACCOUNT       7.) â˜ž CHANGE DOMAIN"
-  echo "â”‚  2.) â˜ž RENEW ACCOUNT     8.) â˜ž MONITOR LOCK     â”‚"
-  echo "   3.) â˜ž DELETE ACCOUNT    9.) â˜ž MONITOR ONLINE"
-  echo "â”‚  4.) â˜ž LIST ACCOUNT      10.) â˜ž TEST SPEED VPS  â”‚"
-  echo "   5.) â˜ž SERVICE MENU      11.) â˜ž UPDATE SCRIPT"
-  echo "â”‚  6.) â˜ž BACKUP/RESTORE    12.) â˜ž UNINSTALL       â”‚"
-  echo "   x.) â˜ž EXIT"
-  echo "â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜"
-  echo " â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”"
+draw_dashboard
+echo
+echo " ┌─────────────────────────────────────────────────"
+echo " │  1.) > ADD ACCOUNT       7.) > CHANGE DOMAIN"
+echo " │  2.) > RENEW ACCOUNT     8.) > MONITOR LOCK"
+echo " │  3.) > DELETE ACCOUNT    9.) > MONITOR ONLINE"
+echo " │  4.) > LIST ACCOUNT      10.) > TEST SPEED VPS"
+echo " │  5.) > SERVICE MENU      11.) > UPDATE SCRIPT"
+echo " │  6.) > BACKUP/RESTORE    12.) > UNINSTALL"
+echo " │  x.) > EXIT"
+echo " └─────────────────────────────────────────────────"
+echo " ─────────────────────────────────────────────────"
   echo
   if ! prompt_input m "Select From Options [1-12 or x] : "; then
     continue
@@ -3240,4 +3265,5 @@ EOF
 }
 
 main "$@"
+
 
