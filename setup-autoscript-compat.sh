@@ -37,6 +37,7 @@ set -euo pipefail
 DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-}"
 API_AUTH_TOKEN="${API_AUTH_TOKEN:-}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-2026.04.05-1}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh}"
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
 APP_DIR="${APP_DIR:-/opt/sc-1forcr}"
@@ -56,6 +57,11 @@ ACTIVE_UDP_BACKEND="${ACTIVE_UDP_BACKEND:-zivpn}"
 DROPBEAR_PORT="${DROPBEAR_PORT:-109}"
 DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
 DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}"
+
+if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
+  echo "setup-autoscript-compat ${SCRIPT_VERSION}"
+  exit 0
+fi
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Jalankan sebagai root."
@@ -2028,6 +2034,7 @@ write_cli_menu() {
   log "Menulis CLI menu..."
 
   cat > /etc/sc-1forcr.env <<EOF
+SCRIPT_VERSION=${SCRIPT_VERSION}
 DOMAIN=${DOMAIN}
 EMAIL=${EMAIL}
 API_PORT=${API_PORT}
@@ -2644,6 +2651,144 @@ detect_udpcustom_service() {
   echo "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}"
 }
 
+onoff_word() {
+  local svc="$1"
+  if systemctl is-active --quiet "${svc}" 2>/dev/null; then
+    echo "ON"
+  else
+    echo "OFF"
+  fi
+}
+
+bytes_human() {
+  local bytes="${1:-0}"
+  if [[ -z "${bytes}" || ! "${bytes}" =~ ^[0-9]+$ ]]; then
+    echo "-"
+    return
+  fi
+  numfmt --to=iec-i --suffix=B "${bytes}" 2>/dev/null || echo "${bytes}B"
+}
+
+read_vnstat_stats() {
+  VNSTAT_MONTH_RX="-"
+  VNSTAT_MONTH_TX="-"
+  VNSTAT_DAY_RX="-"
+  VNSTAT_DAY_TX="-"
+  VNSTAT_IFACE="-"
+  if ! command -v vnstat >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
+    return
+  fi
+
+  local js rx tx drx dtx iface
+  js="$(vnstat --json 2>/dev/null || true)"
+  [[ -z "${js}" ]] && return
+
+  iface="$(echo "${js}" | jq -r '.interfaces[0].name // "-"' 2>/dev/null || echo "-")"
+  rx="$(echo "${js}" | jq -r '(.interfaces[0].traffic.month // [] | last | .rx // 0)' 2>/dev/null || echo 0)"
+  tx="$(echo "${js}" | jq -r '(.interfaces[0].traffic.month // [] | last | .tx // 0)' 2>/dev/null || echo 0)"
+  drx="$(echo "${js}" | jq -r '(.interfaces[0].traffic.day // [] | last | .rx // 0)' 2>/dev/null || echo 0)"
+  dtx="$(echo "${js}" | jq -r '(.interfaces[0].traffic.day // [] | last | .tx // 0)' 2>/dev/null || echo 0)"
+
+  VNSTAT_IFACE="${iface}"
+  VNSTAT_MONTH_RX="$(bytes_human "${rx}")"
+  VNSTAT_MONTH_TX="$(bytes_human "${tx}")"
+  VNSTAT_DAY_RX="$(bytes_human "${drx}")"
+  VNSTAT_DAY_TX="$(bytes_human "${dtx}")"
+}
+
+draw_dashboard() {
+  local os_name ram_mb swap_mb uptime_s uptime_h uptime_m
+  local ip city isp udpcustom
+  local ssh_on nginx_on xray_on api_on ws_on
+  local c_ssh c_vmess c_vless c_trojan
+  local month_total day_total
+  local C0 CC CG CY CR CD
+
+  os_name="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
+  ram_mb="$(free -m 2>/dev/null | awk '/^Mem:/ {print $3 "/" $2 " MB"}')"
+  swap_mb="$(free -m 2>/dev/null | awk '/^Swap:/ {print $3 "/" $2 " MB"}')"
+  uptime_s="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
+  uptime_h="$((uptime_s / 3600))"
+  uptime_m="$(((uptime_s % 3600) / 60))"
+
+  ip="$(curl -fsS --max-time 3 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
+  ip="${ip:-unknown}"
+  city="$(curl -fsS --max-time 3 https://ipinfo.io/city 2>/dev/null || echo "-")"
+  isp="$(curl -fsS --max-time 3 https://ipinfo.io/org 2>/dev/null || echo "-")"
+
+  udpcustom="$(detect_udpcustom_service)"
+  ssh_on="$(onoff_word ssh)"
+  nginx_on="$(onoff_word nginx)"
+  xray_on="$(onoff_word xray)"
+  api_on="$(onoff_word sc-1forcr-api)"
+  ws_on="$(onoff_word sc-1forcr-sshws)"
+
+  c_ssh="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_sshs;" 2>/dev/null || echo 0)"
+  c_vmess="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vmesses;" 2>/dev/null || echo 0)"
+  c_vless="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vlesses;" 2>/dev/null || echo 0)"
+  c_trojan="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_trojans;" 2>/dev/null || echo 0)"
+
+  read_vnstat_stats
+  month_total="-"
+  day_total="-"
+  if [[ "${VNSTAT_MONTH_RX}" != "-" && "${VNSTAT_MONTH_TX}" != "-" ]]; then
+    month_total="${VNSTAT_MONTH_RX} + ${VNSTAT_MONTH_TX}"
+  fi
+  if [[ "${VNSTAT_DAY_RX}" != "-" && "${VNSTAT_DAY_TX}" != "-" ]]; then
+    day_total="${VNSTAT_DAY_RX} + ${VNSTAT_DAY_TX}"
+  fi
+
+  C0=""
+  CC=""
+  CG=""
+  CY=""
+  CR=""
+  CD=""
+  if [[ -t 1 ]]; then
+    C0=$'\033[0m'
+    CC=$'\033[1;36m'
+    CG=$'\033[1;32m'
+    CY=$'\033[1;33m'
+    CR=$'\033[1;31m'
+    CD=$'\033[2m'
+  fi
+
+  printf "%b+------------------------------------------------------------------+%b\n" "${CC}" "${C0}"
+  printf "%b|                       SC 1FORCR NEXUS PANEL                     |%b\n" "${CC}" "${C0}"
+  printf "%b+------------------------------------------------------------------+%b\n" "${CC}" "${C0}"
+  printf "%b|%b OS      : %-54s %b|%b\n" "${CC}" "${C0}" "${os_name}" "${CC}" "${C0}"
+  printf "%b|%b RAM     : %-54s %b|%b\n" "${CC}" "${C0}" "${ram_mb:-"-"}" "${CC}" "${C0}"
+  printf "%b|%b SWAP    : %-54s %b|%b\n" "${CC}" "${C0}" "${swap_mb:-"-"}" "${CC}" "${C0}"
+  printf "%b|%b CITY    : %-54s %b|%b\n" "${CC}" "${C0}" "${city}" "${CC}" "${C0}"
+  printf "%b|%b ISP     : %-54s %b|%b\n" "${CC}" "${C0}" "${isp}" "${CC}" "${C0}"
+  printf "%b|%b IP      : %-54s %b|%b\n" "${CC}" "${C0}" "${ip}" "${CC}" "${C0}"
+  printf "%b|%b DOMAIN  : %-54s %b|%b\n" "${CC}" "${C0}" "${DOMAIN}" "${CC}" "${C0}"
+  printf "%b|%b UPTIME  : %-54s %b|%b\n" "${CC}" "${C0}" "${uptime_h}h ${uptime_m}m" "${CC}" "${C0}"
+  printf "%b+------------------------------------------------------------------+%b\n" "${CC}" "${C0}"
+  printf "%b|%b TRAFFIC : IFACE %-13s RX %-12s TX %-12s %b|%b\n" "${CC}" "${C0}" "${VNSTAT_IFACE}" "${VNSTAT_DAY_RX}" "${VNSTAT_DAY_TX}" "${CC}" "${C0}"
+  printf "%b|%b MONTH   : %-54s %b|%b\n" "${CC}" "${C0}" "${month_total}" "${CC}" "${C0}"
+  printf "%b|%b TODAY   : %-54s %b|%b\n" "${CC}" "${C0}" "${day_total}" "${CC}" "${C0}"
+  printf "%b+------------------------------------------------------------------+%b\n" "${CC}" "${C0}"
+  printf "%b|%b CORE    : SSH[%s%s%b] NGINX[%s%s%b] XRAY[%s%s%b] API[%s%s%b] WS[%s%s%b] %b|%b\n" \
+    "${CC}" "${C0}" \
+    "$([[ "${ssh_on}" == "ON" ]] && echo "${CG}" || echo "${CR}")" "${ssh_on}" "${C0}" \
+    "$([[ "${nginx_on}" == "ON" ]] && echo "${CG}" || echo "${CR}")" "${nginx_on}" "${C0}" \
+    "$([[ "${xray_on}" == "ON" ]] && echo "${CG}" || echo "${CR}")" "${xray_on}" "${C0}" \
+    "$([[ "${api_on}" == "ON" ]] && echo "${CG}" || echo "${CR}")" "${api_on}" "${C0}" \
+    "$([[ "${ws_on}" == "ON" ]] && echo "${CG}" || echo "${CR}")" "${ws_on}" "${C0}" \
+    "${CC}" "${C0}"
+  printf "%b|%b UDP     : ZIVPN[%s%s%b] UDPHC[%s%s%b]%29s%b|%b\n" \
+    "${CC}" "${C0}" \
+    "$([[ "$(onoff_word "${ZIVPN_SERVICE}")" == "ON" ]] && echo "${CG}" || echo "${CR}")" "$(onoff_word "${ZIVPN_SERVICE}")" "${C0}" \
+    "$([[ "$(onoff_word "${udpcustom}")" == "ON" ]] && echo "${CG}" || echo "${CR}")" "$(onoff_word "${udpcustom}")" "${C0}" \
+    "" "${CC}" "${C0}"
+  printf "%b+------------------------------------------------------------------+%b\n" "${CC}" "${C0}"
+  printf "%b|%b ACCOUNTS: SSH %-6s VMESS %-6s VLESS %-6s TROJAN %-6s        %b|%b\n" "${CC}" "${C0}" "${c_ssh}" "${c_vmess}" "${c_vless}" "${c_trojan}" "${CC}" "${C0}"
+  printf "%b|%b VERSION : %b%-54s%b %b|%b\n" "${CC}" "${C0}" "${CY}" "${SCRIPT_VERSION:-unknown}" "${C0}" "${CC}" "${C0}"
+  printf "%b+------------------------------------------------------------------+%b\n" "${CC}" "${C0}"
+  printf "%b%s%b\n" "${CD}" "hint: akses menu tetap sama, tampilannya aja dibuat beda dari potato." "${C0}"
+}
+
 show_combined_online() {
   local mode ip isp tmp_users tmp_count udpcustom
   mode="${1:-realtime}"
@@ -2897,10 +3042,7 @@ monitor_online_menu() {
 
 while true; do
   clear
-  echo "===================================="
-  echo "        SC 1FORCR MENU"
-  echo "===================================="
-  echo "Domain : ${DOMAIN}"
+  draw_dashboard
   echo
   echo "1) Add Account"
   echo "2) Renew Account"
@@ -2995,6 +3137,14 @@ EOF
   chmod +x /usr/local/sbin/uninstall-sc-1forcr
 }
 
+write_version_marker() {
+  mkdir -p "${APP_DIR}"
+  printf '%s\n' "${SCRIPT_VERSION}" > "${APP_DIR}/VERSION"
+  chmod 644 "${APP_DIR}/VERSION"
+  printf 'SCRIPT_VERSION=%s\n' "${SCRIPT_VERSION}" > /etc/sc-1forcr-version
+  chmod 644 /etc/sc-1forcr-version
+}
+
 main() {
   install_base_packages
   apply_system_optimizations
@@ -3017,12 +3167,14 @@ main() {
   write_iplimit_checker
   setup_services
   write_cli_menu
+  write_version_marker
 
   cat <<EOF
 
 =========================================
 SELESAI - SC 1FORCR TERPASANG
 =========================================
+Script Version : ${SCRIPT_VERSION}
 Domain         : ${DOMAIN}
 Email LE       : ${EMAIL}
 DB Path        : ${DB_PATH}
