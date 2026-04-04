@@ -3183,22 +3183,31 @@ monitor_online_menu() {
   done
 }
 
+SHOW_FULL_MENU=1
+
 while true; do
   clear
-draw_dashboard
-echo
-echo " ┌─────────────────────────────────────────────────"
-echo " │  1.) > ADD ACCOUNT       7.) > CHANGE DOMAIN"
-echo " │  2.) > RENEW ACCOUNT     8.) > MONITOR LOCK"
-echo " │  3.) > DELETE ACCOUNT    9.) > MONITOR ONLINE"
-echo " │  4.) > LIST ACCOUNT      10.) > TEST SPEED VPS"
-echo " │  5.) > SERVICE MENU      11.) > UPDATE SCRIPT"
-echo " │  6.) > BACKUP/RESTORE    12.) > UNINSTALL"
-echo " │  x.) > EXIT"
-echo " └─────────────────────────────────────────────────"
-echo " ─────────────────────────────────────────────────"
+  if [[ "${SHOW_FULL_MENU}" == "1" ]]; then
+    draw_dashboard
+    echo
+  fi
+
+  echo " ┌─────────────────────────────────────────────────"
+  echo " │  1.) > ADD ACCOUNT       7.) > CHANGE DOMAIN"
+  echo " │  2.) > RENEW ACCOUNT     8.) > MONITOR USER LOCK"
+  echo " │  3.) > DELETE ACCOUNT    9.) > MONITOR USER LOGIN"
+  echo " │  4.) > LIST ACCOUNT      10.) > TEST SPEED VPS"
+  echo " │  5.) > SERVICE MENU      11.) > UPDATE SCRIPT"
+  echo " │  6.) > BACKUP/RESTORE    12.) > UNINSTALL"
+  echo " │  m.) > MENU UTAMA"
+  echo " │  x.) > EXIT"
+  echo " └─────────────────────────────────────────────────"
+  if [[ "${SHOW_FULL_MENU}" == "1" ]]; then
+    echo " ─────────────────────────────────────────────────"
+  fi
   echo
-  if ! prompt_input m "Select From Options [1-12 or x] : "; then
+  if ! prompt_input m "Select From Options [1-12, m, x] : "; then
+    SHOW_FULL_MENU=0
     continue
   fi
   clear
@@ -3215,9 +3224,14 @@ echo " ────────────────────────�
     10) test_speed_vps ;;
     11) update_script_from_repo ;;
     12) /usr/local/sbin/uninstall-sc-1forcr ;;
+    m|M)
+      SHOW_FULL_MENU=1
+      continue
+      ;;
     x|X) exit 0 ;;
     *) echo "Pilihan tidak valid." ;;
   esac
+  SHOW_FULL_MENU=0
   echo
   read -rp "Enter untuk lanjut..." _ || true
 done
