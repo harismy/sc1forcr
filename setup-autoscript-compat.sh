@@ -2421,6 +2421,30 @@ account_table_by_type() {
   esac
 }
 
+print_account_picker_table() {
+  local type="$1" lock_only="${2:-0}" table where rows
+  table="$(account_table_by_type "${type}")"
+  [[ -z "${table}" ]] && return 1
+  where=""
+  if [[ "${lock_only}" == "1" ]]; then
+    where="WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')"
+  fi
+  rows="$(sqlite3 -separator '|' "$DB_PATH" \
+    "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))) FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
+  if [[ -z "${rows}" ]]; then
+    return 1
+  fi
+  printf "%-4s %-24s %-10s %-8s\n" "NO" "USERNAME" "STATUS" "SISA"
+  printf "%-4s %-24s %-10s %-8s\n" "----" "------------------------" "----------" "--------"
+  local i=0 u sisa st
+  while IFS='|' read -r u sisa st; do
+    [[ -z "${u}" ]] && continue
+    i=$((i + 1))
+    printf "%-4s %-24s %-10s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa:-0}h"
+  done <<< "${rows}"
+  return 0
+}
+
 pick_existing_username() {
   local type="$1" table rows input username
   table="$(account_table_by_type "${type}")"
@@ -2432,8 +2456,10 @@ pick_existing_username() {
     return 1
   fi
 
-  echo "Daftar akun ${type^^}:" >&2
-  echo "${rows}" | nl -w1 -s') ' >&2
+  echo "LIST AKUN ${type^^}" >&2
+  if ! print_account_picker_table "${type}" "0" >&2; then
+    echo "Tidak ada data akun untuk ditampilkan." >&2
+  fi
   prompt_input input "Pilih nomor atau isi username: " || return 1
   input="$(echo "${input}" | tr -d '[:space:]')"
   [[ -z "${input}" ]] && { echo "Input kosong." >&2; return 1; }
@@ -2461,8 +2487,10 @@ pick_locked_username() {
     return 1
   fi
 
-  echo "Daftar akun ${type^^} yang lock:" >&2
-  echo "${rows}" | nl -w1 -s') ' >&2
+  echo "LIST AKUN LOCK ${type^^}" >&2
+  if ! print_account_picker_table "${type}" "1" >&2; then
+    echo "Tidak ada data lock untuk ditampilkan." >&2
+  fi
   prompt_input input "Pilih nomor atau isi username: " || return 1
   input="$(echo "${input}" | tr -d '[:space:]')"
   [[ -z "${input}" ]] && { echo "Input kosong." >&2; return 1; }
@@ -2485,8 +2513,9 @@ renew_account() {
   [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
   ep="$(endpoint_renew "$type")"
   [[ -z "$ep" ]] && { echo "Endpoint renew tidak ada."; return; }
+  echo "RENEW AKUN ${type^^}"
   username="$(pick_existing_username "$type")" || return
-  echo "Dipilih: ${username}"
+  printf "%-12s : %s\n" "Username" "${username}"
   prompt_input exp "Tambah expired (hari) [30]: " || return
   exp="${exp:-30}"
   api_call "POST" "${ep}/${username}/${exp}" | jq .
@@ -2498,8 +2527,9 @@ delete_account() {
   [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
   ep="$(endpoint_delete "$type")"
   [[ -z "$ep" ]] && { echo "Endpoint delete tidak ada."; return; }
+  echo "DELETE AKUN ${type^^}"
   username="$(pick_existing_username "$type")" || return
-  echo "Dipilih: ${username}"
+  printf "%-12s : %s\n" "Username" "${username}"
   api_call "DELETE" "${ep}/${username}" | jq .
 }
 
@@ -2515,6 +2545,25 @@ unlock_account() {
 }
 
 list_accounts() {
+  print_account_table() {
+    local table="$1" title="$2" rows
+    rows="$(sqlite3 -separator '|' "$DB_PATH" \
+      "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))) FROM ${table} ORDER BY username;" 2>/dev/null || true)"
+    echo "LIST AKUN ${title}"
+    printf "%-4s %-24s %-10s %-8s\n" "NO" "USERNAME" "STATUS" "SISA"
+    printf "%-4s %-24s %-10s %-8s\n" "----" "------------------------" "----------" "--------"
+    if [[ -z "${rows}" ]]; then
+      echo "(kosong)"
+      return
+    fi
+    local i=0 u sisa st
+    while IFS='|' read -r u sisa st; do
+      [[ -z "${u}" ]] && continue
+      i=$((i + 1))
+      printf "%-4s %-24s %-10s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa:-0}h"
+    done <<< "${rows}"
+  }
+
   echo "Pilih list akun:"
   echo "1) SSH/ZIVPN (DB)"
   echo "2) VMESS (DB)"
@@ -2527,45 +2576,41 @@ list_accounts() {
 
   case "${l}" in
     1)
-      echo "=== SSH/ZIVPN (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_sshs ORDER BY username;"
+      print_account_table "account_sshs" "SSH/ZIVPN"
       ;;
     2)
-      echo "=== VMESS (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_vmesses ORDER BY username;"
+      print_account_table "account_vmesses" "VMESS"
       ;;
     3)
-      echo "=== VLESS (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_vlesses ORDER BY username;"
+      print_account_table "account_vlesses" "VLESS"
       ;;
     4)
-      echo "=== TROJAN (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_trojans ORDER BY username;"
+      print_account_table "account_trojans" "TROJAN"
       ;;
     5)
-      echo "=== ZIVPN auth.config ==="
+      echo "LIST AKUN ZIVPN auth.config"
+      printf "%-4s %-24s\n" "NO" "USERNAME"
+      printf "%-4s %-24s\n" "----" "------------------------"
       if [[ -f /etc/zivpn/config.json ]]; then
-        jq -r '.auth.config[]?' /etc/zivpn/config.json || true
+        jq -r '.auth.config[]?' /etc/zivpn/config.json | nl -w1 -s' ' || true
       else
         echo "File /etc/zivpn/config.json tidak ditemukan."
       fi
       ;;
     6)
-      echo "=== SSH/ZIVPN (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_sshs ORDER BY username;"
+      print_account_table "account_sshs" "SSH/ZIVPN"
       echo
-      echo "=== VMESS (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_vmesses ORDER BY username;"
+      print_account_table "account_vmesses" "VMESS"
       echo
-      echo "=== VLESS (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_vlesses ORDER BY username;"
+      print_account_table "account_vlesses" "VLESS"
       echo
-      echo "=== TROJAN (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_trojans ORDER BY username;"
+      print_account_table "account_trojans" "TROJAN"
       echo
-      echo "=== ZIVPN auth.config ==="
+      echo "LIST AKUN ZIVPN auth.config"
+      printf "%-4s %-24s\n" "NO" "USERNAME"
+      printf "%-4s %-24s\n" "----" "------------------------"
       if [[ -f /etc/zivpn/config.json ]]; then
-        jq -r '.auth.config[]?' /etc/zivpn/config.json || true
+        jq -r '.auth.config[]?' /etc/zivpn/config.json | nl -w1 -s' ' || true
       else
         echo "File /etc/zivpn/config.json tidak ditemukan."
       fi
@@ -3261,7 +3306,9 @@ show_combined_online() {
     return
   fi
 
-  echo "username|status|ssh_sesi|udphc_sesi|total_sesi"
+  echo "LIST USER LOGIN"
+  printf "%-24s %-12s %-10s %-10s %-10s\n" "USERNAME" "STATUS" "SSH_SESI" "UDPHC" "TOTAL"
+  printf "%-24s %-12s %-10s %-10s %-10s\n" "------------------------" "------------" "----------" "----------" "----------"
   awk '
     BEGIN { OFS="|" }
     NR==FNR {
@@ -3285,7 +3332,7 @@ show_combined_online() {
       } else {
         out="AMAN";
       }
-      print u, out, ssh, udp, cnt;
+      printf "%-24s %-12s %-10d %-10d %-10d\n", u, out, ssh, udp, cnt;
     }' "${tmp_status}" "${tmp_count}"
 
   local total_user total_sesi n
