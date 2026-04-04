@@ -2105,13 +2105,53 @@ create_account() {
   print_created_account "$type" "${resp}"
 }
 
+account_table_by_type() {
+  case "$1" in
+    ssh|zivpn) echo "account_sshs" ;;
+    vmess) echo "account_vmesses" ;;
+    vless) echo "account_vlesses" ;;
+    trojan) echo "account_trojans" ;;
+    *) echo "" ;;
+  esac
+}
+
+pick_existing_username() {
+  local type="$1" table rows input username
+  table="$(account_table_by_type "${type}")"
+  [[ -z "${table}" ]] && return 1
+
+  rows="$(sqlite3 "$DB_PATH" "SELECT username FROM ${table} ORDER BY username;" 2>/dev/null || true)"
+  if [[ -z "${rows}" ]]; then
+    echo "Tidak ada akun ${type} di DB." >&2
+    return 1
+  fi
+
+  echo "Daftar akun ${type^^}:" >&2
+  echo "${rows}" | nl -w1 -s') ' >&2
+  read -rp "Pilih nomor atau isi username: " input
+  input="$(echo "${input}" | tr -d '[:space:]')"
+  [[ -z "${input}" ]] && { echo "Input kosong." >&2; return 1; }
+
+  if [[ "${input}" =~ ^[0-9]+$ ]]; then
+    username="$(echo "${rows}" | sed -n "${input}p")"
+    [[ -z "${username}" ]] && { echo "Nomor tidak valid." >&2; return 1; }
+  else
+    username="$(echo "${rows}" | grep -Fxi "${input}" | head -n1 || true)"
+    [[ -z "${username}" ]] && { echo "Username tidak ditemukan." >&2; return 1; }
+  fi
+
+  echo "${username}"
+  return 0
+}
+
 renew_account() {
   local type ep username exp
   type="$(pick_type)"
   [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
   ep="$(endpoint_renew "$type")"
   [[ -z "$ep" ]] && { echo "Endpoint renew tidak ada."; return; }
-  read -rp "Username: " username
+  username="$(pick_existing_username "$type")" || return
+  echo "Dipilih: ${username}"
   read -rp "Tambah expired (hari) [30]: " exp
   exp="${exp:-30}"
   api_call "POST" "${ep}/${username}/${exp}" | jq .
@@ -2123,7 +2163,8 @@ delete_account() {
   [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
   ep="$(endpoint_delete "$type")"
   [[ -z "$ep" ]] && { echo "Endpoint delete tidak ada."; return; }
-  read -rp "Username: " username
+  username="$(pick_existing_username "$type")" || return
+  echo "Dipilih: ${username}"
   api_call "DELETE" "${ep}/${username}" | jq .
 }
 
