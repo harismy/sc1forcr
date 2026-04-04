@@ -2281,6 +2281,15 @@ endpoint_delete() {
     *) echo "" ;;
   esac
 }
+endpoint_unlock() {
+  case "$1" in
+    ssh|zivpn) echo "/unlocksshvpn" ;;
+    vmess) echo "/unlockvmess" ;;
+    vless) echo "/unlockvless" ;;
+    trojan) echo "/unlocktrojan" ;;
+    *) echo "" ;;
+  esac
+}
 
 print_created_account() {
   local type="$1" raw="$2"
@@ -2440,6 +2449,35 @@ pick_existing_username() {
   return 0
 }
 
+pick_locked_username() {
+  local type="$1" table rows input username
+  table="$(account_table_by_type "${type}")"
+  [[ -z "${table}" ]] && return 1
+
+  rows="$(sqlite3 "$DB_PATH" "SELECT username FROM ${table} WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP') ORDER BY username;" 2>/dev/null || true)"
+  if [[ -z "${rows}" ]]; then
+    echo "Tidak ada akun ${type} dengan status LOCK/LOCK_TMP." >&2
+    return 1
+  fi
+
+  echo "Daftar akun ${type^^} yang lock:" >&2
+  echo "${rows}" | nl -w1 -s') ' >&2
+  prompt_input input "Pilih nomor atau isi username: " || return 1
+  input="$(echo "${input}" | tr -d '[:space:]')"
+  [[ -z "${input}" ]] && { echo "Input kosong." >&2; return 1; }
+
+  if [[ "${input}" =~ ^[0-9]+$ ]]; then
+    username="$(echo "${rows}" | sed -n "${input}p")"
+    [[ -z "${username}" ]] && { echo "Nomor tidak valid." >&2; return 1; }
+  else
+    username="$(echo "${rows}" | grep -Fxi "${input}" | head -n1 || true)"
+    [[ -z "${username}" ]] && { echo "Username tidak ditemukan." >&2; return 1; }
+  fi
+
+  echo "${username}"
+  return 0
+}
+
 renew_account() {
   local type ep username exp
   type="$(pick_type)"
@@ -2462,6 +2500,17 @@ delete_account() {
   username="$(pick_existing_username "$type")" || return
   echo "Dipilih: ${username}"
   api_call "DELETE" "${ep}/${username}" | jq .
+}
+
+unlock_account() {
+  local type ep username
+  type="$(pick_type)"
+  [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
+  ep="$(endpoint_unlock "$type")"
+  [[ -z "$ep" ]] && { echo "Endpoint unlock tidak ada."; return; }
+  username="$(pick_locked_username "$type")" || return
+  echo "Unlock akun: ${username}"
+  api_call "PATCH" "${ep}/${username}" | jq .
 }
 
 list_accounts() {
@@ -3265,6 +3314,7 @@ while true; do
   echo " │  4.) > LIST ACCOUNT      10.) > TEST SPEED VPS"
   echo " │  5.) > SERVICE MENU      11.) > UPDATE SCRIPT"
   echo " │  6.) > BACKUP/RESTORE    12.) > UNINSTALL"
+  echo " │  13.) > UNLOCK ACCOUNT"
   echo " │  m.) > MENU UTAMA"
   echo " │  x.) > EXIT"
   echo " └─────────────────────────────────────────────────"
@@ -3272,7 +3322,7 @@ while true; do
     echo " ─────────────────────────────────────────────────"
   fi
   echo
-  if ! prompt_input m "Select From Options [1-12, m, x] : "; then
+  if ! prompt_input m "Select From Options [1-13, m, x] : "; then
     SHOW_FULL_MENU=0
     continue
   fi
@@ -3290,6 +3340,7 @@ while true; do
     10) test_speed_vps ;;
     11) update_script_from_repo ;;
     12) /usr/local/sbin/uninstall-sc-1forcr ;;
+    13) unlock_account ;;
     m|M)
       SHOW_FULL_MENU=1
       continue
