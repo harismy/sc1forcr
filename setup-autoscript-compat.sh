@@ -1766,7 +1766,8 @@ function parseSshAndUdpUsage() {
     }
     const ip = extractIp(src);
     addIpToUserMap(ipMap, user, ip);
-    addSessionKeyToUserMap(sessionMap, user, `udp:${src || ip || '-'}`);
+    // Count UDP sessions by source IP (not src port) to avoid false multi-login on reconnect.
+    if (ip) addSessionKeyToUserMap(sessionMap, user, `udp-ip:${ip}`);
   }
   return { ipMap, sessionMap };
 }
@@ -3090,12 +3091,19 @@ show_combined_online() {
       now=systime();
       if (ttl <= 0) ttl=180;
     }
+    function ip_only(v) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
+      gsub(/^\[/, "", v);
+      gsub(/\]$/, "", v);
+      sub(/:[0-9]+$/, "", v);
+      return v;
+    }
     {
       ts=$1;
       sub(/\..*$/, "", ts);
       if (ts !~ /^[0-9]+$/) ts=now;
       line=$0;
-      src=""; u="";
+      src=""; u=""; ip=""; key="";
       if (line ~ /\[src:[^]]+\][[:space:]]+\[user:[^]]+\][[:space:]]+Client connected/) {
         src=line;
         sub(/^.*\[src:/, "", src);
@@ -3104,8 +3112,10 @@ show_combined_online() {
         sub(/^.*\[user:/, "", u);
         sub(/\].*$/, "", u);
         u=norm_user(u);
-        if (src != "" && u != "") {
-          active[src]=u;
+        ip=ip_only(src);
+        if (src != "" && u != "" && ip != "") {
+          key=u "|" ip;
+          active[src]=key;
           seen[src]=ts + 0;
         }
         next;
@@ -3122,7 +3132,15 @@ show_combined_online() {
     END {
       for (s in active) {
         age=now - (s in seen ? seen[s] : now);
-        if (age <= ttl) cnt[active[s]]++;
+        if (age > ttl) continue;
+        key=active[s];
+        if (key == "") continue;
+        uniq[key]=1;
+      }
+      for (k in uniq) {
+        split(k, a, /\|/);
+        u=a[1];
+        if (u != "") cnt[u]++;
       }
       for (u in cnt) print u, cnt[u];
     }' > "${tmp_udp_count}" || true
