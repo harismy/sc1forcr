@@ -628,7 +628,7 @@ setup_udpcustom_udp_nat_rules() {
     return 0
   fi
 
-  local listen_port
+  local listen_port backend
   listen_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
   if [[ -z "${listen_port}" ]]; then
     listen_port="$(echo "${UDPCUSTOM_LISTEN_PORT}" | tr -cd '0-9')"
@@ -655,11 +655,16 @@ setup_udpcustom_udp_nat_rules() {
       iptables -t nat -I PREROUTING -p udp --dport "${UDPCUSTOM_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}"
   else
     log "UDPHC tanpa DNAT range (default performa). Isi UDPCUSTOM_DNAT_RANGE jika perlu mode tembak port."
-    # Bersihkan rule DNAT lama ke port UDPHC agar tidak jadi bottleneck.
-    while IFS= read -r rule; do
-      [[ -z "${rule}" ]] && continue
-      iptables -t nat ${rule/-A/-D} >/dev/null 2>&1 || true
-    done < <(iptables -t nat -S PREROUTING | grep -F -- "-j DNAT --to-destination :${listen_port}" || true)
+    # Jangan hapus DNAT backend lain (contoh ZIVPN) saat mode aktif bukan UDPHC.
+    if [[ "${backend}" == "udpcustom" || "${backend}" == "udp-custom" || "${backend}" == "udphc" ]]; then
+      # Bersihkan rule DNAT lama ke port UDPHC agar tidak jadi bottleneck.
+      while IFS= read -r rule; do
+        [[ -z "${rule}" ]] && continue
+        iptables -t nat ${rule/-A/-D} >/dev/null 2>&1 || true
+      done < <(iptables -t nat -S PREROUTING | grep -F -- "-j DNAT --to-destination :${listen_port}" || true)
+    else
+      log "ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}, cleanup DNAT UDPHC dilewati agar rule backend lain tetap aman."
+    fi
   fi
 
   if ! command -v netfilter-persistent >/dev/null 2>&1; then
@@ -2968,3 +2973,4 @@ EOF
 }
 
 main "$@"
+  backend="$(echo "${ACTIVE_UDP_BACKEND}" | tr '[:upper:]' '[:lower:]')"
