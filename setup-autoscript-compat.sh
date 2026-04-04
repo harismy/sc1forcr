@@ -3146,12 +3146,30 @@ show_combined_online() {
       for (u in cnt) print u, cnt[u];
     }' > "${tmp_udp_count}" || true
 
-  cat "${tmp_ssh_count}" "${tmp_udp_count}" 2>/dev/null | awk '
+  awk '
+    NR==FNR {
+      u=$1; n=$2 + 0;
+      if (u ~ /^[a-z0-9._-]+$/ && n > 0) {
+        ssh[u]+=n;
+        seen[u]=1;
+      }
+      next
+    }
     {
       u=$1; n=$2 + 0;
-      if (u ~ /^[a-z0-9._-]+$/ && n > 0) sum[u]+=n;
+      if (u ~ /^[a-z0-9._-]+$/ && n > 0) {
+        udp[u]+=n;
+        seen[u]=1;
+      }
     }
-    END { for (u in sum) print u, sum[u]; }' > "${tmp_count}" || true
+    END {
+      for (u in seen) {
+        s=ssh[u] + 0;
+        d=udp[u] + 0;
+        t=s + d;
+        if (t > 0) print u, s, d, t;
+      }
+    }' "${tmp_ssh_count}" "${tmp_udp_count}" > "${tmp_count}" || true
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
@@ -3165,7 +3183,7 @@ show_combined_online() {
     return
   fi
 
-  echo "username|status|jumlah_sesi"
+  echo "username|status|ssh_sesi|udphc_sesi|total_sesi"
   awk '
     BEGIN { OFS="|" }
     NR==FNR {
@@ -3177,7 +3195,9 @@ show_combined_online() {
     {
       n=split($0, b, /[[:space:]]+/);
       u=b[1];
-      cnt=(n >= 2 ? b[2] + 0 : 0);
+      ssh=(n >= 2 ? b[2] + 0 : 0);
+      udp=(n >= 3 ? b[3] + 0 : 0);
+      cnt=(n >= 4 ? b[4] + 0 : (ssh + udp));
       s=(u in st ? st[u] : "AMAN");
       l=(u in lim ? lim[u] : 0);
       if (s == "LOCK" || s == "LOCK_TMP") {
@@ -3187,13 +3207,13 @@ show_combined_online() {
       } else {
         out="AMAN";
       }
-      print u, out, cnt;
+      print u, out, ssh, udp, cnt;
     }' "${tmp_status}" "${tmp_count}"
 
   local total_user total_sesi n
   total_user="$(wc -l < "${tmp_count}" | tr -d ' ')"
   total_sesi=0
-  while read -r _ n; do
+  while read -r _ _ _ n; do
     [[ -n "${n:-}" ]] || continue
     total_sesi=$((total_sesi + n))
   done < "${tmp_count}"
