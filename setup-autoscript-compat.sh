@@ -750,6 +750,7 @@ SSH_HTTP_BACKEND_HOST=127.0.0.1
 SSH_HTTP_BACKEND_PORT=80
 UDPCUSTOM_CONFIG=/root/udp/config.json
 UDPCUSTOM_LISTEN_PORT=${UDPCUSTOM_LISTEN_PORT}
+UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
 EOF
 
   cat > "${APP_DIR}/api.js" <<'EOF'
@@ -1614,6 +1615,7 @@ const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
 const UDPCUSTOM_CONFIG = process.env.UDPCUSTOM_CONFIG || '/root/udp/config.json';
 const UDPCUSTOM_LISTEN_PORT = Number(process.env.UDPCUSTOM_LISTEN_PORT || 5667);
+const UDPCUSTOM_SERVICE = String(process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom').trim() || 'sc-1forcr-udpcustom';
 const LOCK_SECONDS = 15 * 60;
 
 const db = new sqlite3.Database(DB_PATH);
@@ -1739,7 +1741,7 @@ function parseSshAndUdpUsage() {
   try {
     jOut = execFileSync(
       'journalctl',
-      ['-u', 'sc-1forcr-udpcustom', '-u', 'udp-custom', '--since', '-20 min', '-n', '300', '--no-pager'],
+      ['-u', UDPCUSTOM_SERVICE, '--since', '-20 min', '-n', '300', '--no-pager'],
       { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 }
     );
   } catch (_) {}
@@ -3152,10 +3154,10 @@ show_combined_online() {
   : > "${tmp_udp_count}"
   if [[ "${mode}" == "history" ]]; then
     udp_ttl="3600"
-    journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom -n 2400 -o short-unix --no-pager 2>/dev/null
+    journalctl -u "${udpcustom}" -n 2400 -o short-unix --no-pager 2>/dev/null
   else
     udp_ttl="180"
-    journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom --since "-8 min" -n 800 -o short-unix --no-pager 2>/dev/null
+    journalctl -u "${udpcustom}" --since "-8 min" -n 800 -o short-unix --no-pager 2>/dev/null
   fi | awk -v ttl="${udp_ttl}" '
     function norm_user(v) {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
@@ -3355,6 +3357,69 @@ show_ssh_online_history() {
   show_combined_online "history"
 }
 
+show_ssh_only_online() {
+  local tmp_ssh_count tmp_status
+  tmp_ssh_count="$(mktemp)"
+  tmp_status="$(mktemp)"
+  trap 'rm -f "${tmp_ssh_count:-}" "${tmp_status:-}"' RETURN
+
+  ps -eo args= 2>/dev/null | awk '
+    {
+      u="";
+      if ($0 ~ /^sshd:[[:space:]]+/) {
+        if ($0 ~ /\[priv\]/ || $0 ~ /\[preauth\]/ || $0 ~ /\[listener\]/ || $0 ~ /\[accepted\]/) next;
+        u=$0;
+        sub(/^sshd:[[:space:]]*/, "", u);
+        sub(/[[:space:]].*$/, "", u);
+        sub(/@.*$/, "", u);
+        sub(/\[.*$/, "", u);
+      } else if ($0 ~ /^dropbear[[:space:]]+\[[^]]+\]/) {
+        u=$0;
+        sub(/^dropbear[[:space:]]+\[/, "", u);
+        sub(/\].*$/, "", u);
+      } else next;
+      u=tolower(u);
+      if (u !~ /^[a-z0-9._-]+$/) next;
+      if (u == "root" || u == "priv" || u == "net") next;
+      cnt[u]++;
+    }
+    END { for (u in cnt) print u, cnt[u]; }' > "${tmp_ssh_count}" || true
+
+  sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
+
+  echo "LIST USER LOGIN SSH"
+  if [[ ! -s "${tmp_ssh_count}" ]]; then
+    echo "Tidak ada user SSH online."
+    echo
+    echo "Total User SSH : 0"
+    echo "Total SESI SSH : 0"
+    return
+  fi
+
+  printf "%-24s %-12s %-10s\n" "USERNAME" "STATUS" "SSH_SESI"
+  printf "%-24s %-12s %-10s\n" "------------------------" "------------" "----------"
+  awk '
+    NR==FNR {
+      split($0, a, "|");
+      st[a[1]]=a[2];
+      next
+    }
+    {
+      u=$1;
+      n=$2 + 0;
+      s=(u in st ? st[u] : "AMAN");
+      out=(s == "LOCK" || s == "LOCK_TMP" ? "KENA_LOCK" : "AMAN");
+      printf "%-24s %-12s %-10d\n", u, out, n;
+      total_user++;
+      total_sesi+=n;
+    }
+    END {
+      print "";
+      printf "Total User SSH : %d\n", total_user + 0;
+      printf "Total SESI SSH : %d\n", total_sesi + 0;
+    }' "${tmp_status}" "${tmp_ssh_count}"
+}
+
 xray_log_snapshot() {
   local dst="$1"
   if [[ ! -f /var/log/xray/access.log ]]; then
@@ -3428,7 +3493,7 @@ show_udpcustom_online() {
   local udpcustom
   udpcustom="$(detect_udpcustom_service)"
   echo "=== UDP CUSTOM ONLINE (log terbaru) ==="
-  journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom -n 1200 --no-pager 2>/dev/null | \
+  journalctl -u "${udpcustom}" -n 1200 --no-pager 2>/dev/null | \
     sed -nE '
       s/.*\[src:([^]]+)\][[:space:]]+\[user:([^]]+)\][[:space:]]+Client connected.*/\2|\1/p;
       s/.*user[=: ]([^ ,]+).*src[=: ]([^ ,]+).*/\1|\2/p;
@@ -3499,25 +3564,27 @@ monitor_online_menu() {
     echo "===================================="
     echo "      MONITOR USER ONLINE"
     echo "===================================="
-    echo "1) SSH + UDP CUSTOM (Realtime ringan)"
-    echo "2) SSH + UDP CUSTOM (Histori log)"
-    echo "3) VMESS"
-    echo "4) VLESS"
-    echo "5) TROJAN"
-    echo "6) UDP CUSTOM"
+    echo "1) SSH Realtime"
+    echo "2) UDP CUSTOM Realtime"
+    echo "3) SSH + UDP CUSTOM realtime"
+    echo "4) SSH + UDP CUSTOM Gabungan histori"
+    echo "5) VMESS"
+    echo "6) VLESS"
+    echo "7) TROJAN"
     echo "0) Kembali"
     echo
-    if ! prompt_input o "Pilih menu: "; then
+    if ! prompt_input o "Pilih menu [0-7]: "; then
       return
     fi
     clear
     case "${o}" in
-      1) show_ssh_online ;;
-      2) show_ssh_online_history ;;
-      3) show_xray_online_by_table "account_vmesses" "VMESS" ;;
-      4) show_xray_online_by_table "account_vlesses" "VLESS" ;;
-      5) show_xray_online_by_table "account_trojans" "TROJAN" ;;
-      6) show_udpcustom_online ;;
+      1) show_ssh_only_online ;;
+      2) show_udpcustom_online ;;
+      3) show_ssh_online ;;
+      4) show_ssh_online_history ;;
+      5) show_xray_online_by_table "account_vmesses" "VMESS" ;;
+      6) show_xray_online_by_table "account_vlesses" "VLESS" ;;
+      7) show_xray_online_by_table "account_trojans" "TROJAN" ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
