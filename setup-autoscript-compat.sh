@@ -3027,11 +3027,8 @@ draw_dashboard() {
   printf " ─────────────────────────────────────────────────\n"
 }
 show_combined_online() {
-  local mode ip isp tmp_count tmp_status tmp_ssh_pids tmp_ssh_count tmp_udp_count udpcustom
+  local mode tmp_count tmp_status tmp_ssh_pids tmp_ssh_count tmp_udp_count udpcustom
   mode="${1:-realtime}"
-  ip="$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
-  ip="${ip:-unknown}"
-  isp="$(curl -fsS --max-time 4 "https://ipinfo.io/${ip}/org" 2>/dev/null || echo unknown)"
   udpcustom="$(detect_udpcustom_service)"
 
   tmp_count="$(mktemp)"
@@ -3047,8 +3044,8 @@ show_combined_online() {
       l=$4;
       if (l ~ /:22$/ || l ~ /:109$/ || l ~ /:143$/) {
         s=$0;
-        while (match(s, /pid=([0-9]+)/, m)) {
-          print m[1];
+        while (match(s, /pid=[0-9]+/)) {
+          print substr(s, RSTART + 4, RLENGTH - 4);
           s=substr(s, RSTART + RLENGTH);
         }
       }
@@ -3090,18 +3087,21 @@ show_combined_online() {
     {
       line=$0;
       src=""; u="";
-      if (match(line, /\[src:([^]]+)\][[:space:]]+\[user:([^]]+)\][[:space:]]+Client connected/, m)) {
-        src=m[1]; u=norm_user(m[2]);
+      if (line ~ /\[src:[^]]+\][[:space:]]+\[user:[^]]+\][[:space:]]+Client connected/) {
+        src=line;
+        sub(/^.*\[src:/, "", src);
+        sub(/\].*$/, "", src);
+        u=line;
+        sub(/^.*\[user:/, "", u);
+        sub(/\].*$/, "", u);
+        u=norm_user(u);
         if (src != "" && u != "") active[src]=u;
         next;
       }
-      if (match(line, /\[error:[^]]+\][[:space:]]+\[src:([^]]+)\][[:space:]]+Client disconnected/, m)) {
-        src=m[1];
-        if (src in active) delete active[src];
-        next;
-      }
-      if (match(line, /\[src:([^]]+)\][[:space:]]+Client disconnected/, m)) {
-        src=m[1];
+      if (line ~ /\[src:[^]]+\][[:space:]]+Client disconnected/) {
+        src=line;
+        sub(/^.*\[src:/, "", src);
+        sub(/\].*$/, "", src);
         if (src in active) delete active[src];
         next;
       }
@@ -3120,9 +3120,6 @@ show_combined_online() {
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
-  echo "IP     : ${ip}"
-  echo "DOMAIN : ${DOMAIN}"
-  echo "ISP    : ${isp}"
   echo "Users Login SSH/Dropbear + UDP Custom"
 
   if [[ ! -s "${tmp_count}" ]]; then
