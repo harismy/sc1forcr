@@ -814,20 +814,41 @@ function zivpnReload() {
   }
 }
 
+let zivpnReloadTimer = null;
+function scheduleZivpnReload(delayMs = 8000) {
+  if (zivpnReloadTimer) clearTimeout(zivpnReloadTimer);
+  zivpnReloadTimer = setTimeout(() => {
+    zivpnReloadTimer = null;
+    zivpnReload();
+  }, Number(delayMs) || 8000);
+}
+
 function syncZivpnUser(username, addMode) {
   try {
     let root = { auth: { mode: 'passwords', config: [] } };
     if (fs.existsSync(ZIVPN_CONFIG)) root = JSON.parse(fs.readFileSync(ZIVPN_CONFIG, 'utf8'));
     if (!root.auth || typeof root.auth !== 'object') root.auth = {};
     if (!Array.isArray(root.auth.config)) root.auth.config = [];
-    const set = new Set(root.auth.config.map((v) => String(v || '').trim().toLowerCase()).filter(Boolean));
+    const beforeSet = new Set(root.auth.config.map((v) => String(v || '').trim().toLowerCase()).filter(Boolean));
+    const set = new Set(beforeSet);
     const key = String(username || '').trim().toLowerCase();
     if (!key) return;
     if (addMode) set.add(key);
     else set.delete(key);
+    let changed = false;
+    if (set.size !== beforeSet.size) changed = true;
+    if (!changed) {
+      for (const item of set) {
+        if (!beforeSet.has(item)) {
+          changed = true;
+          break;
+        }
+      }
+    }
+    if (!changed) return;
     root.auth.config = Array.from(set);
     fs.writeFileSync(ZIVPN_CONFIG, JSON.stringify(root, null, 2));
-    zivpnReload();
+    scheduleZivpnReload();
   } catch (_) {}
 }
 
@@ -897,6 +918,15 @@ function sshPayload(username, password, expDate, limitip) {
   };
 }
 
+async function ensureUsernameNotExists(table, username) {
+  const row = await get(`SELECT 1 AS ok FROM ${table} WHERE LOWER(username)=LOWER(?)`, [username]);
+  if (row) {
+    const e = new Error(`username ${username} already exists`);
+    e.statusCode = 409;
+    throw e;
+  }
+}
+
 async function createOrUpdateSshFromBody(body, forcedDays = null) {
   const username = String(body?.username || '').trim();
   const password = String(body?.password || username || '').trim() || username;
@@ -904,10 +934,11 @@ async function createOrUpdateSshFromBody(body, forcedDays = null) {
   const quota = Number(body?.kuota || 0);
   const limitip = Number(body?.limitip || 0);
   if (!username) throw new Error('username required');
+  await ensureUsernameNotExists('account_sshs', username);
   const expDate = ymdPlusDays(expDays);
   ensureLinuxUser(username, password, expDate);
   await run(
-    "INSERT OR REPLACE INTO account_sshs(username,password,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)",
+    "INSERT INTO account_sshs(username,password,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)",
     [username, password, expDate, 'AKTIF', quota, limitip]
   );
   syncZivpnUser(username, true);
@@ -918,7 +949,7 @@ app.post('/vps/sshvpn', async (req, res) => {
   try {
     return ok(res, await createOrUpdateSshFromBody(req.body, null));
   } catch (e) {
-    return fail(res, 500, e.message);
+    return fail(res, Number(e?.statusCode || 500), e.message);
   }
 });
 
@@ -926,7 +957,7 @@ app.post('/vps/trialsshvpn', async (req, res) => {
   try {
     return ok(res, await createOrUpdateSshFromBody(req.body, 1));
   } catch (e) {
-    return fail(res, 500, e.message);
+    return fail(res, Number(e?.statusCode || 500), e.message);
   }
 });
 
@@ -978,11 +1009,13 @@ app.patch('/vps/unlocksshvpn/:username/pw', async (req, res) => {
 });
 
 async function createXray(protocol, username, expDays, quota, limitip, trial) {
+  if (!username) throw new Error('username required');
   const expDate = ymdPlusDays(trial ? 1 : expDays);
   let data = null;
   if (protocol === 'vmess') {
+    await ensureUsernameNotExists('account_vmesses', username);
     const uuid = crypto.randomUUID();
-    await run("INSERT OR REPLACE INTO account_vmesses(username,uuid,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)", [username, uuid, expDate, 'AKTIF', quota, limitip]);
+    await run("INSERT INTO account_vmesses(username,uuid,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)", [username, uuid, expDate, 'AKTIF', quota, limitip]);
     data = {
       hostname: DOMAIN, username, uuid, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
@@ -992,8 +1025,9 @@ async function createXray(protocol, username, expDays, quota, limitip, trial) {
       link: { tls: vmessLink(DOMAIN, uuid, true), none: vmessLink(DOMAIN, uuid, false), grpc: vmessLink(DOMAIN, uuid, true), uptls: vmessLink(DOMAIN, uuid, true), upntls: vmessLink(DOMAIN, uuid, false) }
     };
   } else if (protocol === 'vless') {
+    await ensureUsernameNotExists('account_vlesses', username);
     const uuid = crypto.randomUUID();
-    await run("INSERT OR REPLACE INTO account_vlesses(username,uuid,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)", [username, uuid, expDate, 'AKTIF', quota, limitip]);
+    await run("INSERT INTO account_vlesses(username,uuid,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)", [username, uuid, expDate, 'AKTIF', quota, limitip]);
     data = {
       hostname: DOMAIN, username, uuid, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
@@ -1003,8 +1037,9 @@ async function createXray(protocol, username, expDays, quota, limitip, trial) {
       link: { tls: vlessLink(DOMAIN, uuid, true), none: vlessLink(DOMAIN, uuid, false), grpc: vlessLink(DOMAIN, uuid, true), uptls: vlessLink(DOMAIN, uuid, true), upntls: vlessLink(DOMAIN, uuid, false) }
     };
   } else if (protocol === 'trojan') {
+    await ensureUsernameNotExists('account_trojans', username);
     const pass = crypto.randomUUID();
-    await run("INSERT OR REPLACE INTO account_trojans(username,password,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)", [username, pass, expDate, 'AKTIF', quota, limitip]);
+    await run("INSERT INTO account_trojans(username,password,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)", [username, pass, expDate, 'AKTIF', quota, limitip]);
     data = {
       hostname: DOMAIN, username, password: pass, uuid: pass, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
@@ -1023,7 +1058,7 @@ app.post('/vps/vmessall', async (req, res) => {
     const data = await createXray('vmess', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
     return ok(res, data);
   } catch (e) {
-    return fail(res, 500, e.message);
+    return fail(res, Number(e?.statusCode || 500), e.message);
   }
 });
 app.post('/vps/trialvmessall', async (req, res) => {
@@ -1031,7 +1066,7 @@ app.post('/vps/trialvmessall', async (req, res) => {
     const data = await createXray('vmess', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
     return ok(res, data);
   } catch (e) {
-    return fail(res, 500, e.message);
+    return fail(res, Number(e?.statusCode || 500), e.message);
   }
 });
 app.post('/vps/vlessall', async (req, res) => {
@@ -1039,7 +1074,7 @@ app.post('/vps/vlessall', async (req, res) => {
     const data = await createXray('vless', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
     return ok(res, data);
   } catch (e) {
-    return fail(res, 500, e.message);
+    return fail(res, Number(e?.statusCode || 500), e.message);
   }
 });
 app.post('/vps/trialvlessall', async (req, res) => {
@@ -1047,7 +1082,7 @@ app.post('/vps/trialvlessall', async (req, res) => {
     const data = await createXray('vless', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
     return ok(res, data);
   } catch (e) {
-    return fail(res, 500, e.message);
+    return fail(res, Number(e?.statusCode || 500), e.message);
   }
 });
 app.post('/vps/trojanall', async (req, res) => {
@@ -1055,7 +1090,7 @@ app.post('/vps/trojanall', async (req, res) => {
     const data = await createXray('trojan', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
     return ok(res, data);
   } catch (e) {
-    return fail(res, 500, e.message);
+    return fail(res, Number(e?.statusCode || 500), e.message);
   }
 });
 app.post('/vps/trialtrojanall', async (req, res) => {
@@ -1063,7 +1098,7 @@ app.post('/vps/trialtrojanall', async (req, res) => {
     const data = await createXray('trojan', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
     return ok(res, data);
   } catch (e) {
-    return fail(res, 500, e.message);
+    return fail(res, Number(e?.statusCode || 500), e.message);
   }
 });
 
