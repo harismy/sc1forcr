@@ -3030,6 +3030,7 @@ draw_dashboard() {
 show_combined_online() {
   local mode tmp_count tmp_status tmp_ssh_pids tmp_ssh_count tmp_udp_count udpcustom udp_ttl
   mode="${1:-realtime}"
+  udp_ttl="180"
   udpcustom="$(detect_udpcustom_service)"
 
   tmp_count="$(mktemp)"
