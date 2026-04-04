@@ -982,20 +982,34 @@ app.delete('/vps/deletesshvpn/:username', async (req, res) => {
   }
 });
 
-app.post('/vps/renewsshvpn/:username/:exp', async (req, res) => {
+async function renewSsh(req, res) {
   try {
     const username = String(req.params.username || '').trim();
     const exp = Number(req.params.exp || 30);
     const expDate = ymdPlusDays(exp);
-    const row = await get("SELECT password,limitip FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]);
+    const row = await get("SELECT password,limitip,quota,date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]);
     const pass = String(row?.password || username);
+    const currentQuota = Number(row?.quota || 0);
+    const bodyQuota = Number(req.body?.kuota);
+    const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : currentQuota;
+    const fromExp = String(row?.date_exp || '-');
     ensureLinuxUser(username, pass, expDate);
-    await run("UPDATE account_sshs SET date_exp=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)", [expDate, username]);
-    return ok(res, { username, exp: expDate, time: nowTime() });
+    await run("UPDATE account_sshs SET date_exp=?, quota=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)", [expDate, nextQuota, username]);
+    return ok(res, {
+      username,
+      from: fromExp,
+      to: expDate,
+      exp: expDate,
+      quota: String(nextQuota),
+      limitip: String(row?.limitip || 0),
+      time: nowTime()
+    });
   } catch (e) {
     return fail(res, 500, e.message);
   }
-});
+}
+app.post('/vps/renewsshvpn/:username/:exp', renewSsh);
+app.patch('/vps/renewsshvpn/:username/:exp', renewSsh);
 
 app.patch('/vps/locksshvpn/:username', async (req, res) => {
   const username = String(req.params.username || '').trim();
@@ -1111,11 +1125,23 @@ app.post('/vps/trialtrojanall', async (req, res) => {
   }
 });
 
-async function renewXray(table, username, exp) {
+async function renewXray(table, username, exp, body) {
+  const row = await get(`SELECT date_exp,quota,limitip FROM ${table} WHERE LOWER(username)=LOWER(?)`, [username]);
+  const currentQuota = Number(row?.quota || 0);
+  const bodyQuota = Number(body?.kuota);
+  const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : currentQuota;
   const expDate = ymdPlusDays(exp);
-  await run(`UPDATE ${table} SET date_exp=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)`, [expDate, username]);
+  await run(`UPDATE ${table} SET date_exp=?, quota=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)`, [expDate, nextQuota, username]);
   await renderAndReloadXray();
-  return { username, exp: expDate, time: nowTime() };
+  return {
+    username,
+    from: String(row?.date_exp || '-'),
+    to: expDate,
+    exp: expDate,
+    quota: String(nextQuota),
+    limitip: String(row?.limitip || 0),
+    time: nowTime()
+  };
 }
 async function delXray(table, username) {
   await run(`DELETE FROM ${table} WHERE LOWER(username)=LOWER(?)`, [username]);
@@ -1128,9 +1154,19 @@ async function setStatusXray(table, username, status) {
   return { username };
 }
 
-app.post('/vps/renewvmess/:username/:exp', async (req, res) => ok(res, await renewXray('account_vmesses', String(req.params.username || '').trim(), Number(req.params.exp || 30))));
-app.post('/vps/renewvless/:username/:exp', async (req, res) => ok(res, await renewXray('account_vlesses', String(req.params.username || '').trim(), Number(req.params.exp || 30))));
-app.post('/vps/renewtrojan/:username/:exp', async (req, res) => ok(res, await renewXray('account_trojans', String(req.params.username || '').trim(), Number(req.params.exp || 30))));
+const renewXrayHandler = (table) => async (req, res) => {
+  try {
+    return ok(res, await renewXray(table, String(req.params.username || '').trim(), Number(req.params.exp || 30), req.body));
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+};
+app.post('/vps/renewvmess/:username/:exp', renewXrayHandler('account_vmesses'));
+app.patch('/vps/renewvmess/:username/:exp', renewXrayHandler('account_vmesses'));
+app.post('/vps/renewvless/:username/:exp', renewXrayHandler('account_vlesses'));
+app.patch('/vps/renewvless/:username/:exp', renewXrayHandler('account_vlesses'));
+app.post('/vps/renewtrojan/:username/:exp', renewXrayHandler('account_trojans'));
+app.patch('/vps/renewtrojan/:username/:exp', renewXrayHandler('account_trojans'));
 
 app.delete('/vps/deletevmess/:username', async (req, res) => ok(res, await delXray('account_vmesses', String(req.params.username || '').trim())));
 app.delete('/vps/deletevless/:username', async (req, res) => ok(res, await delXray('account_vlesses', String(req.params.username || '').trim())));
@@ -1263,7 +1299,7 @@ const server = net.createServer((client) => {
   client.on('data', (chunk) => {
     if (stage === 'tunnel') return;
 
-    if (stage === 'first' && chunk.length >= 4 && chunk.slice(0, 4).toString() === 'SSH-') {
+    if ((stage === 'first' || stage === 'wait-upgrade') && chunk.length >= 4 && chunk.slice(0, 4).toString() === 'SSH-') {
       startRawSshTunnel(chunk);
       return;
     }
@@ -1373,6 +1409,18 @@ func tunnelBoth(a, b net.Conn) {
 	<-done
 }
 
+func flushReaderBufferedTo(reader *bufio.Reader, dst net.Conn) error {
+	n := reader.Buffered()
+	if n <= 0 {
+		return nil
+	}
+	buf := make([]byte, n)
+	if _, err := io.ReadFull(reader, buf); err != nil {
+		return err
+	}
+	return writeAll(dst, buf)
+}
+
 func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, httpPort int) {
 	defer client.Close()
 	reader := bufio.NewReaderSize(client, 64*1024)
@@ -1381,6 +1429,10 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 	if err == nil && string(peek) == "SSH-" {
 		sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
 		if err != nil {
+			return
+		}
+		if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+			_ = sshUp.Close()
 			return
 		}
 		tunnelBoth(client, sshUp)
@@ -1409,6 +1461,24 @@ func handleConn(client net.Conn, sshHost string, sshPort int, httpHost string, h
 	if strings.HasPrefix(first, "connect ") {
 		_, _ = client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 		raw.Reset()
+
+		// Some clients switch directly to raw SSH after CONNECT.
+		_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+		nextPeek, nextErr := reader.Peek(4)
+		_ = client.SetReadDeadline(time.Time{})
+		if nextErr == nil && string(nextPeek) == "SSH-" {
+			sshUp, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", sshHost, sshPort), 10*time.Second)
+			if err != nil {
+				return
+			}
+			if err := flushReaderBufferedTo(reader, sshUp); err != nil {
+				_ = sshUp.Close()
+				return
+			}
+			tunnelBoth(client, sshUp)
+			return
+		}
+
 		for {
 			line, err := reader.ReadBytes('\n')
 			if err != nil {
@@ -2243,19 +2313,19 @@ list_accounts() {
   case "${l}" in
     1)
       echo "=== SSH/ZIVPN (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_sshs ORDER BY username;"
+      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_sshs ORDER BY username;"
       ;;
     2)
       echo "=== VMESS (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_vmesses ORDER BY username;"
+      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_vmesses ORDER BY username;"
       ;;
     3)
       echo "=== VLESS (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_vlesses ORDER BY username;"
+      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_vlesses ORDER BY username;"
       ;;
     4)
       echo "=== TROJAN (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_trojans ORDER BY username;"
+      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_trojans ORDER BY username;"
       ;;
     5)
       echo "=== ZIVPN auth.config ==="
@@ -2267,16 +2337,16 @@ list_accounts() {
       ;;
     6)
       echo "=== SSH/ZIVPN (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_sshs ORDER BY username;"
+      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_sshs ORDER BY username;"
       echo
       echo "=== VMESS (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_vmesses ORDER BY username;"
+      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_vmesses ORDER BY username;"
       echo
       echo "=== VLESS (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_vlesses ORDER BY username;"
+      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_vlesses ORDER BY username;"
       echo
       echo "=== TROJAN (DB) ==="
-      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_trojans ORDER BY username;"
+      sqlite3 "$DB_PATH" "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)) AS sisa_hari, status FROM account_trojans ORDER BY username;"
       echo
       echo "=== ZIVPN auth.config ==="
       if [[ -f /etc/zivpn/config.json ]]; then
