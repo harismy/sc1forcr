@@ -2128,22 +2128,64 @@ delete_account() {
 }
 
 list_accounts() {
-  echo "=== SSH/ZIVPN (DB) ==="
-  sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_sshs ORDER BY username;"
-  echo
-  echo "=== VMESS (DB) ==="
-  sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_vmesses ORDER BY username;"
-  echo
-  echo "=== VLESS (DB) ==="
-  sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_vlesses ORDER BY username;"
-  echo
-  echo "=== TROJAN (DB) ==="
-  sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_trojans ORDER BY username;"
-  echo
-  if [[ -f /etc/zivpn/config.json ]]; then
-    echo "=== ZIVPN auth.config ==="
-    jq -r '.auth.config[]?' /etc/zivpn/config.json || true
-  fi
+  echo "Pilih list akun:"
+  echo "1) SSH/ZIVPN (DB)"
+  echo "2) VMESS (DB)"
+  echo "3) VLESS (DB)"
+  echo "4) TROJAN (DB)"
+  echo "5) ZIVPN auth.config"
+  echo "6) Semua"
+  read -rp "Input [1-6]: " l
+
+  case "${l}" in
+    1)
+      echo "=== SSH/ZIVPN (DB) ==="
+      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_sshs ORDER BY username;"
+      ;;
+    2)
+      echo "=== VMESS (DB) ==="
+      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_vmesses ORDER BY username;"
+      ;;
+    3)
+      echo "=== VLESS (DB) ==="
+      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_vlesses ORDER BY username;"
+      ;;
+    4)
+      echo "=== TROJAN (DB) ==="
+      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_trojans ORDER BY username;"
+      ;;
+    5)
+      echo "=== ZIVPN auth.config ==="
+      if [[ -f /etc/zivpn/config.json ]]; then
+        jq -r '.auth.config[]?' /etc/zivpn/config.json || true
+      else
+        echo "File /etc/zivpn/config.json tidak ditemukan."
+      fi
+      ;;
+    6)
+      echo "=== SSH/ZIVPN (DB) ==="
+      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_sshs ORDER BY username;"
+      echo
+      echo "=== VMESS (DB) ==="
+      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_vmesses ORDER BY username;"
+      echo
+      echo "=== VLESS (DB) ==="
+      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_vlesses ORDER BY username;"
+      echo
+      echo "=== TROJAN (DB) ==="
+      sqlite3 "$DB_PATH" "SELECT username, date_exp, status FROM account_trojans ORDER BY username;"
+      echo
+      echo "=== ZIVPN auth.config ==="
+      if [[ -f /etc/zivpn/config.json ]]; then
+        jq -r '.auth.config[]?' /etc/zivpn/config.json || true
+      else
+        echo "File /etc/zivpn/config.json tidak ditemukan."
+      fi
+      ;;
+    *)
+      echo "Pilihan tidak valid."
+      ;;
+  esac
 }
 
 udp_backend_status() {
