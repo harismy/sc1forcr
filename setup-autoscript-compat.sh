@@ -3027,48 +3027,96 @@ draw_dashboard() {
   printf " ─────────────────────────────────────────────────\n"
 }
 show_combined_online() {
-  local mode ip isp tmp_users tmp_count tmp_status udpcustom
+  local mode ip isp tmp_count tmp_status tmp_ssh_pids tmp_ssh_count tmp_udp_count udpcustom
   mode="${1:-realtime}"
   ip="$(curl -fsS --max-time 4 https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}')"
   ip="${ip:-unknown}"
   isp="$(curl -fsS --max-time 4 "https://ipinfo.io/${ip}/org" 2>/dev/null || echo unknown)"
   udpcustom="$(detect_udpcustom_service)"
 
-  tmp_users="$(mktemp)"
   tmp_count="$(mktemp)"
   tmp_status="$(mktemp)"
-  trap 'rm -f "${tmp_users:-}" "${tmp_count:-}" "${tmp_status:-}"' RETURN
+  tmp_ssh_pids="$(mktemp)"
+  tmp_ssh_count="$(mktemp)"
+  tmp_udp_count="$(mktemp)"
+  trap 'rm -f "${tmp_count:-}" "${tmp_status:-}" "${tmp_ssh_pids:-}" "${tmp_ssh_count:-}" "${tmp_udp_count:-}"' RETURN
 
-  # SSH/Dropbear user aktif dari process sshd + who (tanpa awk kompleks agar kompatibel)
-  ps -eo args= 2>/dev/null | \
-    sed -n 's/^sshd:[[:space:]]*//p' | \
-    sed -E 's/[[:space:]].*$//' | \
-    sed -E 's/@.*$//' | \
-    sed -E 's/\[.*$//' | \
-    tr '[:upper:]' '[:lower:]' | \
-    grep -E '^[a-z0-9._-]+$' | \
-    grep -v '^root$' >> "${tmp_users}" || true
+  # SSH realtime: hitung sesi established dari port SSH/Dropbear saja (tanpa dobel dari who).
+  ss -Htnp state established 2>/dev/null | awk '
+    {
+      l=$4;
+      if (l ~ /:22$/ || l ~ /:109$/ || l ~ /:143$/) {
+        s=$0;
+        while (match(s, /pid=([0-9]+)/, m)) {
+          print m[1];
+          s=substr(s, RSTART + RLENGTH);
+        }
+      }
+    }' | sort -u > "${tmp_ssh_pids}" || true
 
-  who 2>/dev/null | \
-    cut -d' ' -f1 | \
-    tr '[:upper:]' '[:lower:]' | \
-    grep -E '^[a-z0-9._-]+$' | \
-    grep -v '^root$' >> "${tmp_users}" || true
+  : > "${tmp_ssh_count}"
+  if [[ -s "${tmp_ssh_pids}" ]]; then
+    local pid_csv
+    pid_csv="$(paste -sd, "${tmp_ssh_pids}")"
+    ps -o pid=,args= -p "${pid_csv}" 2>/dev/null | awk '
+      {
+        pid=$1;
+        $1="";
+        sub(/^[[:space:]]+/, "", $0);
+        if ($0 !~ /^sshd:/) next;
+        u=$0;
+        sub(/^sshd:[[:space:]]*/, "", u);
+        sub(/[[:space:]].*$/, "", u);
+        sub(/@.*$/, "", u);
+        sub(/\[.*$/, "", u);
+        u=tolower(u);
+        if (u ~ /^[a-z0-9._-]+$/ && u != "root") cnt[u]++;
+      }
+      END { for (u in cnt) print u, cnt[u]; }' > "${tmp_ssh_count}" || true
+  fi
 
-  # UDP Custom user dari log (realtime ringan: 5 menit terakhir, history: lebih panjang)
+  # UDP Custom: pair Client connected/disconnected by src untuk estimasi sesi aktif.
   if [[ "${mode}" == "history" ]]; then
-    journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom -n 1200 --no-pager 2>/dev/null
+    journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom -n 2400 --no-pager 2>/dev/null
   else
-    journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom --since "-5 min" -n 250 --no-pager 2>/dev/null
-  fi | \
-    sed -nE '
-      s/.*\[src:[^]]+\][[:space:]]+\[user:([^]]+)\][[:space:]]+Client connected.*/\1/p;
-      s/.*\[user:([^]]+)\].*/\1/p;
-      s/.*user[=: ]([^ ,]+).*src[=: ][^ ,]+.*/\1/p;
-    ' | tr '[:upper:]' '[:lower:]' >> "${tmp_users}"
+    journalctl -u "${udpcustom}" -u sc-1forcr-udpcustom -u udp-custom --since "-20 min" -n 1200 --no-pager 2>/dev/null
+  fi | awk '
+    function norm_user(v) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
+      v=tolower(v);
+      if (v ~ /^[a-z0-9._-]+$/ && v != "root") return v;
+      return "";
+    }
+    {
+      line=$0;
+      src=""; u="";
+      if (match(line, /\[src:([^]]+)\][[:space:]]+\[user:([^]]+)\][[:space:]]+Client connected/, m)) {
+        src=m[1]; u=norm_user(m[2]);
+        if (src != "" && u != "") active[src]=u;
+        next;
+      }
+      if (match(line, /\[error:[^]]+\][[:space:]]+\[src:([^]]+)\][[:space:]]+Client disconnected/, m)) {
+        src=m[1];
+        if (src in active) delete active[src];
+        next;
+      }
+      if (match(line, /\[src:([^]]+)\][[:space:]]+Client disconnected/, m)) {
+        src=m[1];
+        if (src in active) delete active[src];
+        next;
+      }
+    }
+    END {
+      for (s in active) cnt[active[s]]++;
+      for (u in cnt) print u, cnt[u];
+    }' > "${tmp_udp_count}" || true
 
-  grep -E '^[a-z0-9._-]+$' "${tmp_users}" | sort | uniq -c | \
-    sed -E 's/^[[:space:]]*([0-9]+)[[:space:]]+(.+)$/\2 \1/' > "${tmp_count}" || true
+  cat "${tmp_ssh_count}" "${tmp_udp_count}" 2>/dev/null | awk '
+    {
+      u=$1; n=$2 + 0;
+      if (u ~ /^[a-z0-9._-]+$/ && n > 0) sum[u]+=n;
+    }
+    END { for (u in sum) print u, sum[u]; }' > "${tmp_count}" || true
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
@@ -3081,11 +3129,11 @@ show_combined_online() {
     echo "Tidak ada user online terdeteksi."
     echo
     echo "Total User : 0"
-    echo "Total PID  : 0"
+    echo "Total SESI : 0"
     return
   fi
 
-  echo "username|status|jumlah_login"
+  echo "username|status|jumlah_sesi"
   awk '
     BEGIN { OFS="|" }
     NR==FNR {
@@ -3110,16 +3158,16 @@ show_combined_online() {
       print u, out, cnt;
     }' "${tmp_status}" "${tmp_count}"
 
-  local total_user total_pid n
+  local total_user total_sesi n
   total_user="$(wc -l < "${tmp_count}" | tr -d ' ')"
-  total_pid=0
+  total_sesi=0
   while read -r _ n; do
     [[ -n "${n:-}" ]] || continue
-    total_pid=$((total_pid + n))
+    total_sesi=$((total_sesi + n))
   done < "${tmp_count}"
   echo
   echo "Total User : ${total_user}"
-  echo "Total PID  : ${total_pid}"
+  echo "Total SESI : ${total_sesi}"
 }
 
 show_ssh_online() {
