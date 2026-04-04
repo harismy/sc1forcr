@@ -3087,24 +3087,27 @@ show_combined_online() {
 
   echo "username|status|jumlah_login"
   awk '
-    BEGIN { FS="|"; OFS="|" }
+    BEGIN { OFS="|" }
     NR==FNR {
-      st[$1]=$2;
-      lim[$1]=$3 + 0;
+      split($0, a, "|");
+      st[a[1]]=a[2];
+      lim[a[1]]=a[3] + 0;
       next
     }
     {
-      u=$1; n=$2 + 0;
+      n=split($0, b, /[[:space:]]+/);
+      u=b[1];
+      cnt=(n >= 2 ? b[2] + 0 : 0);
       s=(u in st ? st[u] : "AMAN");
       l=(u in lim ? lim[u] : 0);
       if (s == "LOCK" || s == "LOCK_TMP") {
         out="KENA_LOCK";
-      } else if (l > 0 && n > l) {
+      } else if (l > 0 && cnt > l) {
         out="MULTI_LOGIN";
       } else {
         out="AMAN";
       }
-      print u, out, n;
+      print u, out, cnt;
     }' "${tmp_status}" "${tmp_count}"
 
   local total_user total_pid n
