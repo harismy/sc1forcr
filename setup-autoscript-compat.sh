@@ -812,6 +812,7 @@ SSH_HTTP_BACKEND_PORT=80
 UDPCUSTOM_CONFIG=/root/udp/config.json
 UDPCUSTOM_LISTEN_PORT=${UDPCUSTOM_LISTEN_PORT}
 UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
+ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}
 EOF
 
   cat > "${APP_DIR}/api.js" <<'EOF'
@@ -1677,6 +1678,7 @@ const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
 const UDPCUSTOM_CONFIG = process.env.UDPCUSTOM_CONFIG || '/root/udp/config.json';
 const UDPCUSTOM_LISTEN_PORT = Number(process.env.UDPCUSTOM_LISTEN_PORT || 5667);
 const UDPCUSTOM_SERVICE = String(process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom').trim() || 'sc-1forcr-udpcustom';
+const ACTIVE_UDP_BACKEND = String(process.env.ACTIVE_UDP_BACKEND || '').trim().toLowerCase();
 const LOCK_SECONDS = 15 * 60;
 
 const db = new sqlite3.Database(DB_PATH);
@@ -1902,6 +1904,14 @@ function restartService(service) {
   if (!safeExec('systemctl', ['restart', service])) safeExec('service', [service, 'restart']);
 }
 
+function shouldRestartZivpn() {
+  if (ACTIVE_UDP_BACKEND === 'udpcustom' || ACTIVE_UDP_BACKEND === 'udp-custom' || ACTIVE_UDP_BACKEND === 'udphc') {
+    return false;
+  }
+  if (ACTIVE_UDP_BACKEND === 'zivpn') return true;
+  return safeExec('systemctl', ['is-active', '--quiet', ZIVPN_SERVICE]);
+}
+
 function getUdpCustomListenPort() {
   try {
     if (!fs.existsSync(UDPCUSTOM_CONFIG)) return UDPCUSTOM_LISTEN_PORT;
@@ -2096,7 +2106,9 @@ async function main() {
   const l = await lockIfExceeded(now);
 
   if (u.xrayChanged || l.xrayChanged) await rebuildXrayFromDb();
-  if (u.zivpnChanged || l.zivpnChanged) restartService(ZIVPN_SERVICE);
+  if ((u.zivpnChanged || l.zivpnChanged) && shouldRestartZivpn()) {
+    restartService(ZIVPN_SERVICE);
+  }
   db.close();
 }
 
