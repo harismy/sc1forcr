@@ -536,10 +536,36 @@ resolve_zivpn_bin_url() {
   return 0
 }
 
-setup_zivpn_service_if_possible() {
+ensure_zivpn_tls_assets() {
+  local cert key
+  cert="/etc/zivpn/tls.crt"
+  key="/etc/zivpn/tls.key"
   mkdir -p /etc/zivpn
-  if [[ ! -f /etc/zivpn/config.json ]]; then
-    cat > /etc/zivpn/config.json <<EOF
+
+  if [[ -s "${cert}" && -s "${key}" ]]; then
+    chmod 644 "${cert}" >/dev/null 2>&1 || true
+    chmod 600 "${key}" >/dev/null 2>&1 || true
+    return 0
+  fi
+
+  log "Generate self-signed TLS untuk ZIVPN..."
+  openssl req -x509 -nodes -newkey rsa:2048 -sha256 -days 3650 \
+    -subj "/CN=${DOMAIN}" \
+    -keyout "${key}" \
+    -out "${cert}" >/dev/null 2>&1
+  chmod 644 "${cert}" >/dev/null 2>&1 || true
+  chmod 600 "${key}" >/dev/null 2>&1 || true
+}
+
+ensure_zivpn_config_schema() {
+  local cfg listen cert key tmp
+  cfg="/etc/zivpn/config.json"
+  cert="/etc/zivpn/tls.crt"
+  key="/etc/zivpn/tls.key"
+  listen=":${ZIVPN_LISTEN_PORT}"
+
+  if [[ ! -f "${cfg}" ]]; then
+    cat > "${cfg}" <<EOF
 {
   "auth": {
     "mode": "passwords",
@@ -549,10 +575,49 @@ setup_zivpn_service_if_possible() {
     "tcp": true,
     "udp": true
   },
-  "listen": ":${ZIVPN_LISTEN_PORT}"
+  "listen": "${listen}",
+  "zivpn_udp": {
+    "cert_path": "${cert}",
+    "key_path": "${key}"
+  }
 }
 EOF
+    return 0
   fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    log "jq tidak tersedia, skip auto-patch schema config ZIVPN."
+    return 0
+  fi
+
+  tmp="$(mktemp)"
+  if jq \
+    --arg listen "${listen}" \
+    --arg cert "${cert}" \
+    --arg key "${key}" \
+    '
+      .auth = (.auth // {"mode":"passwords","config":[]}) |
+      .auth.mode = (.auth.mode // "passwords") |
+      .auth.config = (if (.auth.config | type) == "array" then .auth.config else [] end) |
+      .network = (.network // {"tcp":true,"udp":true}) |
+      .network.tcp = (if .network.tcp == false then false else true end) |
+      .network.udp = (if .network.udp == false then false else true end) |
+      .listen = (if ((.listen | type) == "string" and .listen != "") then .listen else $listen end) |
+      .zivpn_udp = (.zivpn_udp // {}) |
+      .zivpn_udp.cert_path = $cert |
+      .zivpn_udp.key_path = $key
+    ' "${cfg}" > "${tmp}" 2>/dev/null; then
+    mv -f "${tmp}" "${cfg}"
+  else
+    rm -f "${tmp}" >/dev/null 2>&1 || true
+    log "Gagal patch schema config ZIVPN via jq, gunakan config lama."
+  fi
+}
+
+setup_zivpn_service_if_possible() {
+  mkdir -p /etc/zivpn
+  ensure_zivpn_tls_assets
+  ensure_zivpn_config_schema
 
   if command -v zivpn >/dev/null 2>&1; then
     log "Binary zivpn sudah ada."
@@ -2265,6 +2330,7 @@ UPDATE_SCRIPT_URL=${UPDATE_SCRIPT_URL}
 DB_PATH=${DB_PATH}
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
 UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
+ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 EOF
@@ -2813,10 +2879,11 @@ diagnose_udp_backends() {
 }
 
 repair_udp_backends() {
-  local udpcustom zstat ustat chosen
+  local udpcustom zstat ustat chosen preferred
   udpcustom="$(detect_udpcustom_service)"
   zstat="$(systemctl is-active "${ZIVPN_SERVICE}" 2>/dev/null || true)"
   ustat="$(systemctl is-active "${udpcustom}" 2>/dev/null || true)"
+  preferred="$(echo "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
   chosen=""
 
   echo "Auto-repair UDP backend..."
@@ -2834,14 +2901,25 @@ repair_udp_backends() {
     systemctl restart "${udpcustom}" >/dev/null 2>&1 || true
     chosen="udphc"
   else
-    # Tidak ada aktif: coba hidupkan ZIVPN dulu, fallback UDPHC.
-    systemctl enable "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
-    if systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1; then
-      chosen="zivpn"
-    else
+    # Tidak ada aktif: prioritaskan backend sesuai ACTIVE_UDP_BACKEND.
+    if [[ "${preferred}" == "udpcustom" || "${preferred}" == "udp-custom" || "${preferred}" == "udphc" ]]; then
       systemctl enable "${udpcustom}" >/dev/null 2>&1 || true
-      systemctl restart "${udpcustom}" >/dev/null 2>&1 || true
-      chosen="udphc"
+      if systemctl restart "${udpcustom}" >/dev/null 2>&1; then
+        chosen="udphc"
+      else
+        systemctl enable "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+        systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+        chosen="zivpn"
+      fi
+    else
+      systemctl enable "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+      if systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1; then
+        chosen="zivpn"
+      else
+        systemctl enable "${udpcustom}" >/dev/null 2>&1 || true
+        systemctl restart "${udpcustom}" >/dev/null 2>&1 || true
+        chosen="udphc"
+      fi
     fi
   fi
 
