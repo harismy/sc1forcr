@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # AutoScript kompatibel BotVPN/Potato
-# Target OS: Debian 12+ / Ubuntu 22+
+# Target OS: Debian 10+ / Ubuntu 20+
 #
 # Fitur:
 # - SSH
@@ -96,29 +96,90 @@ log() {
   echo "[autoscript-compat] $*"
 }
 
+check_supported_os() {
+  local id ver major
+  if [[ ! -f /etc/os-release ]]; then
+    echo "OS tidak dikenali (/etc/os-release tidak ditemukan)."
+    exit 1
+  fi
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  id="${ID:-}"
+  ver="${VERSION_ID:-0}"
+  major="${ver%%.*}"
+
+  case "${id}" in
+    debian)
+      if [[ "${major}" -lt 10 ]]; then
+        echo "Debian ${ver} tidak didukung. Minimal Debian 10."
+        exit 1
+      fi
+      ;;
+    ubuntu)
+      if [[ "${major}" -lt 20 ]]; then
+        echo "Ubuntu ${ver} tidak didukung. Minimal Ubuntu 20.04."
+        exit 1
+      fi
+      ;;
+    *)
+      echo "OS ${id:-unknown} belum didukung script ini."
+      echo "Gunakan Debian 10+ atau Ubuntu 20+."
+      exit 1
+      ;;
+  esac
+  log "OS terdeteksi: ${PRETTY_NAME:-${id} ${ver}}"
+}
+
+install_optional_pkg_if_available() {
+  local pkg="$1"
+  if apt-cache show "${pkg}" >/dev/null 2>&1; then
+    apt-get install -y "${pkg}"
+    return 0
+  fi
+  log "Paket opsional '${pkg}' tidak tersedia di repo, skip."
+  return 1
+}
+
 install_base_packages() {
   log "Install paket dasar..."
   apt-get update -y
   apt-get install -y \
     curl wget jq sqlite3 openssl uuid-runtime ca-certificates \
     gnupg lsb-release socat cron unzip \
-    vnstat speedtest-cli \
     haproxy \
-    nginx certbot python3-certbot-nginx \
+    nginx certbot \
     openssh-server dropbear pwgen \
     build-essential python3 make g++ gcc libc6-dev pkg-config bzip2 zlib1g-dev
+
+  # Paket opsional (beberapa distro/repo lama tidak selalu menyediakan).
+  install_optional_pkg_if_available python3-certbot-nginx || true
+  install_optional_pkg_if_available vnstat || true
+  install_optional_pkg_if_available speedtest-cli || true
 }
 
-install_node20_if_missing() {
+install_node_if_missing() {
   if command -v node >/dev/null 2>&1; then
     log "Node sudah ada: $(node -v)"
     return
   fi
-  log "Install Node.js 20..."
+  log "Install Node.js (prioritas 20, fallback 18)..."
   apt-get update -y
   apt-get install -y curl ca-certificates gnupg
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
+  if curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs; then
+    log "Node terpasang: $(node -v)"
+    return
+  fi
+
+  log "Node 20 gagal/kurang kompatibel, fallback ke Node 18..."
+  apt-get purge -y nodejs >/dev/null 2>&1 || true
+  rm -f /etc/apt/sources.list.d/nodesource.list
+  if curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && apt-get install -y nodejs; then
+    log "Node terpasang: $(node -v)"
+    return
+  fi
+
+  echo "Gagal install Node.js dari NodeSource (20/18)."
+  exit 1
 }
 
 install_go_if_missing() {
@@ -2697,6 +2758,86 @@ restart_active_udp_backend() {
   echo "Tidak ada backend UDP yang aktif."
 }
 
+udp_port_from_config() {
+  local cfg="$1" fallback="$2" port
+  port="${fallback}"
+  if [[ -f "${cfg}" ]]; then
+    port="$(jq -r '.listen // empty' "${cfg}" 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
+  fi
+  [[ -z "${port}" ]] && port="${fallback}"
+  echo "${port}"
+}
+
+is_udp_port_listening() {
+  local port="$1"
+  ss -lunp 2>/dev/null | awk -v p=":${port}" '$5 ~ p"$" {ok=1} END {exit(ok?0:1)}'
+}
+
+diagnose_udp_backends() {
+  local udpcustom zstat ustat zport uport
+  udpcustom="$(detect_udpcustom_service)"
+  zstat="$(systemctl is-active "${ZIVPN_SERVICE}" 2>/dev/null || true)"
+  ustat="$(systemctl is-active "${udpcustom}" 2>/dev/null || true)"
+  zport="$(udp_port_from_config /etc/zivpn/config.json 5667)"
+  uport="$(udp_port_from_config /root/udp/config.json 5667)"
+
+  echo "=== DIAGNOSE UDP BACKEND ==="
+  echo "ZIVPN service   : ${ZIVPN_SERVICE} (${zstat:-unknown})"
+  echo "UDPHC service   : ${udpcustom} (${ustat:-unknown})"
+  echo "ZIVPN port      : ${zport} ($(is_udp_port_listening "${zport}" && echo LISTEN || echo NO-LISTEN))"
+  echo "UDPHC port      : ${uport} ($(is_udp_port_listening "${uport}" && echo LISTEN || echo NO-LISTEN))"
+  echo
+  echo "NAT PREROUTING (ringkas):"
+  iptables -t nat -S PREROUTING 2>/dev/null | grep -E 'DNAT|5667|5668|6000:19999' || echo "(tidak ada rule terkait)"
+  echo
+  if [[ "${zstat}" != "active" ]]; then
+    echo "--- log ${ZIVPN_SERVICE} ---"
+    journalctl -u "${ZIVPN_SERVICE}" -n 25 --no-pager 2>/dev/null || true
+  fi
+  if [[ "${ustat}" != "active" ]]; then
+    echo "--- log ${udpcustom} ---"
+    journalctl -u "${udpcustom}" -n 25 --no-pager 2>/dev/null || true
+  fi
+}
+
+repair_udp_backends() {
+  local udpcustom zstat ustat chosen
+  udpcustom="$(detect_udpcustom_service)"
+  zstat="$(systemctl is-active "${ZIVPN_SERVICE}" 2>/dev/null || true)"
+  ustat="$(systemctl is-active "${udpcustom}" 2>/dev/null || true)"
+  chosen=""
+
+  echo "Auto-repair UDP backend..."
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  if [[ "${zstat}" == "active" && "${ustat}" == "active" ]]; then
+    # Single backend policy: default ke ZIVPN saat bentrok.
+    systemctl disable --now "${udpcustom}" >/dev/null 2>&1 || true
+    systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+    chosen="zivpn"
+  elif [[ "${zstat}" == "active" ]]; then
+    systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+    chosen="zivpn"
+  elif [[ "${ustat}" == "active" ]]; then
+    systemctl restart "${udpcustom}" >/dev/null 2>&1 || true
+    chosen="udphc"
+  else
+    # Tidak ada aktif: coba hidupkan ZIVPN dulu, fallback UDPHC.
+    systemctl enable "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+    if systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1; then
+      chosen="zivpn"
+    else
+      systemctl enable "${udpcustom}" >/dev/null 2>&1 || true
+      systemctl restart "${udpcustom}" >/dev/null 2>&1 || true
+      chosen="udphc"
+    fi
+  fi
+
+  sleep 1
+  echo "Backend dipilih: ${chosen:-unknown}"
+  diagnose_udp_backends
+}
+
 service_menu() {
   local udpcustom
   udpcustom="$(detect_udpcustom_service)"
@@ -2706,7 +2847,8 @@ service_menu() {
   echo "4) aktifkan ZIVPN (matikan UDPHC)"
   echo "5) aktifkan UDPHC (matikan ZIVPN)"
   echo "6) status backend UDP"
-  prompt_input s "Pilih [1-6]: " || return
+  echo "7) diagnose + auto-repair UDP backend"
+  prompt_input s "Pilih [1-7]: " || return
   clear
   case "$s" in
     1)
@@ -2728,6 +2870,9 @@ service_menu() {
       ;;
     6)
       udp_backend_status
+      ;;
+    7)
+      repair_udp_backends
       ;;
     *)
       echo "Pilihan tidak valid."
@@ -3721,11 +3866,12 @@ write_version_marker() {
 }
 
 main() {
+  check_supported_os
   install_base_packages
   setup_vnstat
   apply_system_optimizations
   setup_logrotate_optimizations
-  install_node20_if_missing
+  install_node_if_missing
   install_go_if_missing
   install_xray
   setup_dropbear
