@@ -26,6 +26,7 @@ set -euo pipefail
 #   UDPCUSTOM_SERVICE_NAME=sc-1forcr-udpcustom
 #   UDPCUSTOM_LISTEN_PORT=5667
 #   UDPCUSTOM_DNAT_RANGE=                        (opsional, default kosong = tanpa DNAT range untuk performa)
+#   UDPCUSTOM_DNAT_AUTO_RANGE=6000:6999         (opsional, dipakai jika backend UDPHC aktif & DNAT range kosong)
 #   UDPCUSTOM_DEFAULT_USER=freeudphc
 #   ACTIVE_UDP_BACKEND=zivpn                       (pilihan: zivpn|udpcustom)
 #   DROPBEAR_PORT=109
@@ -52,6 +53,7 @@ UDPCUSTOM_BIN_URL="${UDPCUSTOM_BIN_URL:-https://raw.github.com/http-custom/udp-c
 UDPCUSTOM_SERVICE_NAME="${UDPCUSTOM_SERVICE_NAME:-sc-1forcr-udpcustom}"
 UDPCUSTOM_LISTEN_PORT="${UDPCUSTOM_LISTEN_PORT:-5667}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
+UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-6000:6999}"
 UDPCUSTOM_DEFAULT_USER="${UDPCUSTOM_DEFAULT_USER:-freeudphc}"
 ACTIVE_UDP_BACKEND="${ACTIVE_UDP_BACKEND:-zivpn}"
 DROPBEAR_PORT="${DROPBEAR_PORT:-109}"
@@ -839,8 +841,9 @@ setup_udpcustom_udp_nat_rules() {
     return 0
   fi
 
-  local listen_port backend
+  local listen_port backend effective_dnat_range
   backend="$(echo "${ACTIVE_UDP_BACKEND:-}" | tr '[:upper:]' '[:lower:]')"
+  effective_dnat_range="${UDPCUSTOM_DNAT_RANGE}"
   listen_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
   if [[ -z "${listen_port}" ]]; then
     listen_port="$(echo "${UDPCUSTOM_LISTEN_PORT}" | tr -cd '0-9')"
@@ -853,8 +856,15 @@ setup_udpcustom_udp_nat_rules() {
 
   fw_allow_udp_input "${listen_port}"
 
-  if [[ -n "${UDPCUSTOM_DNAT_RANGE}" ]]; then
-    fw_add_udp_dnat_range "${UDPCUSTOM_DNAT_RANGE}" "${listen_port}"
+  if [[ -z "${effective_dnat_range}" && ( "${backend}" == "udpcustom" || "${backend}" == "udp-custom" || "${backend}" == "udphc" ) ]]; then
+    effective_dnat_range="${UDPCUSTOM_DNAT_AUTO_RANGE}"
+    log "UDPHC aktif dengan DNAT auto-range: ${effective_dnat_range}"
+  fi
+
+  if [[ -n "${effective_dnat_range}" ]]; then
+    fw_add_udp_dnat_range "${effective_dnat_range}" "${listen_port}"
+    # Hindari overlap jalur saat pindah dari ZIVPN ke UDPHC.
+    fw_delete_udp_dnat_range "${ZIVPN_DNAT_RANGE}" "${listen_port}"
   else
     log "UDPHC tanpa DNAT range (default performa). Isi UDPCUSTOM_DNAT_RANGE jika perlu mode tembak port."
     if [[ "${backend}" == "udpcustom" || "${backend}" == "udp-custom" || "${backend}" == "udphc" ]]; then
@@ -947,6 +957,8 @@ const DOMAIN = String(process.env.DOMAIN || '').trim();
 const AUTH_TOKEN = String(process.env.AUTH_TOKEN || '').trim();
 const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
+const UDPCUSTOM_CONFIG = process.env.UDPCUSTOM_CONFIG || '/root/udp/config.json';
+const UDPCUSTOM_SERVICE = process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom';
 
 const db = new sqlite3.Database(DB_PATH);
 
@@ -1034,6 +1046,21 @@ function scheduleZivpnReload(delayMs = 8000) {
   }, Number(delayMs) || 8000);
 }
 
+function udpcustomReload() {
+  if (!safeExec('systemctl', ['restart', UDPCUSTOM_SERVICE])) {
+    safeExec('service', [UDPCUSTOM_SERVICE, 'restart']);
+  }
+}
+
+let udpcustomReloadTimer = null;
+function scheduleUdpcustomReload(delayMs = 5000) {
+  if (udpcustomReloadTimer) clearTimeout(udpcustomReloadTimer);
+  udpcustomReloadTimer = setTimeout(() => {
+    udpcustomReloadTimer = null;
+    udpcustomReload();
+  }, Number(delayMs) || 5000);
+}
+
 function syncZivpnUser(username, addMode) {
   try {
     let root = { auth: { mode: 'passwords', config: [] } };
@@ -1061,6 +1088,89 @@ function syncZivpnUser(username, addMode) {
     fs.writeFileSync(ZIVPN_CONFIG, JSON.stringify(root, null, 2));
     scheduleZivpnReload();
   } catch (_) {}
+}
+
+function syncUdpcustomUser(secret, addMode) {
+  try {
+    const key = String(secret || '').trim();
+    if (!key) return;
+    let root = { auth: { mode: 'passwords', config: [] } };
+    if (fs.existsSync(UDPCUSTOM_CONFIG)) root = JSON.parse(fs.readFileSync(UDPCUSTOM_CONFIG, 'utf8'));
+    if (!root.auth || typeof root.auth !== 'object') root.auth = {};
+    if (!Array.isArray(root.auth.config)) root.auth.config = [];
+    root.auth.mode = 'passwords';
+
+    const beforeSet = new Set(root.auth.config.map((v) => String(v || '').trim()).filter(Boolean));
+    const set = new Set(beforeSet);
+    if (addMode) set.add(key);
+    else set.delete(key);
+
+    let changed = false;
+    if (set.size !== beforeSet.size) changed = true;
+    if (!changed) {
+      for (const item of set) {
+        if (!beforeSet.has(item)) {
+          changed = true;
+          break;
+        }
+      }
+    }
+    if (!changed) return;
+
+    root.auth.config = Array.from(set);
+    fs.writeFileSync(UDPCUSTOM_CONFIG, JSON.stringify(root, null, 2));
+    scheduleUdpcustomReload();
+  } catch (_) {}
+}
+
+let sshBackendSyncBusy = false;
+async function syncSshBackendsFromDb() {
+  if (sshBackendSyncBusy) return;
+  sshBackendSyncBusy = true;
+  try {
+    const rows = await all("SELECT username, password FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
+    const zivpnUsers = [];
+    const udphcSecrets = [];
+    const zivpnSeen = new Set();
+    const udphcSeen = new Set();
+
+    for (const row of rows) {
+      const username = String(row?.username || '').trim().toLowerCase();
+      if (username && !zivpnSeen.has(username)) {
+        zivpnSeen.add(username);
+        zivpnUsers.push(username);
+      }
+      const secret = String(row?.password || row?.username || '').trim();
+      if (secret && !udphcSeen.has(secret)) {
+        udphcSeen.add(secret);
+        udphcSecrets.push(secret);
+      }
+    }
+
+    try {
+      let z = { auth: { mode: 'passwords', config: [] } };
+      if (fs.existsSync(ZIVPN_CONFIG)) z = JSON.parse(fs.readFileSync(ZIVPN_CONFIG, 'utf8'));
+      if (!z.auth || typeof z.auth !== 'object') z.auth = {};
+      z.auth.mode = 'passwords';
+      z.auth.config = zivpnUsers;
+      fs.writeFileSync(ZIVPN_CONFIG, JSON.stringify(z, null, 2));
+      scheduleZivpnReload(1500);
+    } catch (_) {}
+
+    try {
+      let u = { auth: { mode: 'passwords', config: [] } };
+      if (fs.existsSync(UDPCUSTOM_CONFIG)) u = JSON.parse(fs.readFileSync(UDPCUSTOM_CONFIG, 'utf8'));
+      if (!u.auth || typeof u.auth !== 'object') u.auth = {};
+      u.auth.mode = 'passwords';
+      u.auth.config = udphcSecrets;
+      fs.writeFileSync(UDPCUSTOM_CONFIG, JSON.stringify(u, null, 2));
+      scheduleUdpcustomReload(1200);
+    } catch (_) {}
+  } catch (_) {
+    // no-op: keep API running even if background sync fails
+  } finally {
+    sshBackendSyncBusy = false;
+  }
 }
 
 function vmessLink(host, id, tls) {
@@ -1153,6 +1263,7 @@ async function createOrUpdateSshFromBody(body, forcedDays = null) {
     [username, password, expDate, 'AKTIF', quota, limitip]
   );
   syncZivpnUser(username, true);
+  syncUdpcustomUser(password, true);
   return sshPayload(username, password, expDate, limitip);
 }
 
@@ -1175,9 +1286,12 @@ app.post('/vps/trialsshvpn', async (req, res) => {
 app.delete('/vps/deletesshvpn/:username', async (req, res) => {
   try {
     const username = String(req.params.username || '').trim();
+    const row = await get("SELECT password FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
     deleteLinuxUser(username);
     await run("DELETE FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]);
     syncZivpnUser(username, false);
+    syncUdpcustomUser(String(row?.password || ''), false);
+    syncUdpcustomUser(username, false);
     return ok(res, { username });
   } catch (e) {
     return fail(res, 500, e.message);
@@ -1386,6 +1500,8 @@ app.use((err, _req, res, _next) => {
 });
 
 app.listen(PORT, '127.0.0.1', () => {
+  syncSshBackendsFromDb();
+  setInterval(syncSshBackendsFromDb, 2 * 60 * 1000);
   console.log(`sc-1forcr-api on 127.0.0.1:${PORT}`);
 });
 EOF
@@ -2437,6 +2553,7 @@ UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
 ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}
 ZIVPN_DNAT_RANGE=${ZIVPN_DNAT_RANGE}
 UDPCUSTOM_DNAT_RANGE=${UDPCUSTOM_DNAT_RANGE}
+UDPCUSTOM_DNAT_AUTO_RANGE=${UDPCUSTOM_DNAT_AUTO_RANGE}
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 EOF
@@ -2455,6 +2572,7 @@ source /etc/sc-1forcr.env
 API_BASE="http://127.0.0.1:${API_PORT}/vps"
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
+UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-6000:6999}"
 
 api_call() {
   local method="$1" path="$2" data="${3:-}"
@@ -2960,13 +3078,31 @@ switch_udp_to_zivpn() {
 }
 
 switch_udp_to_udpcustom() {
-  local udpcustom
+  local udpcustom udphc_port dnat_range range_nft
   udpcustom="$(detect_udpcustom_service)"
+  udphc_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
+  [[ -z "${udphc_port}" ]] && udphc_port="5667"
+  dnat_range="${UDPCUSTOM_DNAT_RANGE}"
+  [[ -z "${dnat_range}" ]] && dnat_range="${UDPCUSTOM_DNAT_AUTO_RANGE}"
   systemctl disable --now "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
   systemctl enable "${udpcustom}" >/dev/null 2>&1 || true
   systemctl restart "${udpcustom}" >/dev/null 2>&1 || true
-  if [[ -z "${UDPCUSTOM_DNAT_RANGE}" ]]; then
-    cleanup_zivpn_dnat_for_udphc
+  cleanup_zivpn_dnat_for_udphc
+  if [[ -n "${dnat_range}" ]]; then
+    if command -v iptables >/dev/null 2>&1; then
+      iptables -C INPUT -p udp --dport "${udphc_port}" -j ACCEPT >/dev/null 2>&1 || \
+        iptables -I INPUT -p udp --dport "${udphc_port}" -j ACCEPT
+      iptables -t nat -C PREROUTING -p udp --dport "${dnat_range}" -j DNAT --to-destination ":${udphc_port}" >/dev/null 2>&1 || \
+        iptables -t nat -I PREROUTING -p udp --dport "${dnat_range}" -j DNAT --to-destination ":${udphc_port}"
+    elif command -v nft >/dev/null 2>&1; then
+      range_nft="${dnat_range/:/-}"
+      nft add table ip nat >/dev/null 2>&1 || true
+      nft 'add chain ip nat prerouting { type nat hook prerouting priority dstnat; }' >/dev/null 2>&1 || true
+      nft list chain ip nat prerouting 2>/dev/null | grep -F -- "udp dport ${range_nft} dnat to :${udphc_port}" >/dev/null 2>&1 || \
+        nft add rule ip nat prerouting udp dport "${range_nft}" dnat to ":${udphc_port}"
+    fi
+  else
+    echo "UDPHC aktif tanpa DNAT range."
   fi
   echo "Mode UDP aktif: UDPHC (ZIVPN dimatikan)."
 }
@@ -3208,19 +3344,145 @@ backup_restore_menu() {
 }
 
 change_domain_menu() {
-  local new_domain email app_env pem
+  local new_domain email app_env pem email_arg
   prompt_input new_domain "Masukkan domain baru: " || return
   if [[ -z "${new_domain}" ]]; then
     echo "Domain tidak boleh kosong."
     return
   fi
-  prompt_input email "Masukkan email Let's Encrypt [admin@${new_domain}]: " || return
-  email="${email:-admin@${new_domain}}"
+
+  # Tidak perlu input email tiap ganti domain:
+  # pakai EMAIL lama jika valid, fallback admin@domain.
+  email="${EMAIL:-}"
+  if [[ -z "${email}" || "${email}" == "admin@example.com" || "${email}" == *"@example.com" ]]; then
+    email="admin@${new_domain}"
+  fi
 
   DOMAIN="${new_domain}"
   EMAIL="${email}"
-  setup_nginx_and_cert
-  setup_haproxy_tls_mux
+
+  mkdir -p /var/www/html
+  cat > /etc/nginx/sites-available/sc-1forcr.conf <<EONGINX
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${new_domain};
+    keepalive_timeout 30;
+
+    location /.well-known/acme-challenge/ { root /var/www/html; }
+
+    location = /cdn-cgi/trace {
+        access_log off;
+        default_type text/plain;
+        return 200 "fl=29f200\nh=\$host\nip=\$remote_addr\nts=\$msec\n";
+    }
+
+    location /vps/ {
+        proxy_pass http://127.0.0.1:${API_PORT};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location /vmess {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /vless {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10002;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location /trojan {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:10003;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+
+    location / {
+        access_log off;
+        proxy_redirect off;
+        proxy_pass http://127.0.0.1:2082;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade "websocket";
+        proxy_set_header Connection "Upgrade";
+        proxy_set_header Host \$host;
+    }
+}
+EONGINX
+
+  ln -sf /etc/nginx/sites-available/sc-1forcr.conf /etc/nginx/sites-enabled/sc-1forcr.conf
+  rm -f /etc/nginx/sites-enabled/default
+  nginx -t || { echo "Konfigurasi nginx invalid."; return; }
+  systemctl restart nginx || true
+
+  if [[ "${email}" == "admin@example.com" || "${email}" == *"@example.com" ]]; then
+    email_arg="--register-unsafely-without-email"
+  else
+    email_arg="-m ${email}"
+  fi
+
+  if ! certbot certonly --webroot -w /var/www/html -d "${new_domain}" --non-interactive --agree-tos ${email_arg}; then
+    echo "Gagal issue cert untuk domain ${new_domain}."
+    echo "Pastikan A record domain mengarah ke VPS, lalu ulangi."
+    return
+  fi
+
+  pem="/etc/haproxy/certs/${new_domain}.pem"
+  mkdir -p /etc/haproxy/certs
+  cat "/etc/letsencrypt/live/${new_domain}/fullchain.pem" "/etc/letsencrypt/live/${new_domain}/privkey.pem" > "${pem}" || {
+    echo "Gagal menyiapkan sertifikat HAProxy."
+    return
+  }
+  chmod 600 "${pem}"
+
+  cat > /etc/haproxy/haproxy.cfg <<EOHAP
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    daemon
+    maxconn 20000
+    nbthread 1
+
+defaults
+    log global
+    mode tcp
+    option tcplog
+    option dontlognull
+    timeout connect 10s
+    timeout client  2m
+    timeout server  2m
+
+frontend ft_443
+    bind *:443 ssl crt ${pem} alpn h2,http/1.1
+    default_backend bk_mux
+
+backend bk_mux
+    mode tcp
+    server mux_local 127.0.0.1:2082 check
+EOHAP
+
+  haproxy -c -f /etc/haproxy/haproxy.cfg || {
+    echo "Konfigurasi haproxy invalid."
+    return
+  }
+  systemctl restart haproxy || true
 
   pem="/etc/haproxy/certs/${new_domain}.pem"
   if [[ ! -s "${pem}" ]]; then
@@ -3952,6 +4214,9 @@ update_script_from_repo() {
   APP_DIR="/opt/sc-1forcr" \
   ZIVPN_SERVICE_NAME="${ZIVPN_SERVICE}" \
   UDPCUSTOM_SERVICE_NAME="${UDPCUSTOM_SERVICE}" \
+  ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE}" \
+  UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE}" \
+  UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE}" \
   DROPBEAR_PORT="${DROPBEAR_PORT}" \
   DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT}" \
   ACTIVE_UDP_BACKEND="${active_backend}" \
@@ -4228,7 +4493,7 @@ Catatan:
 - Jika binary zivpn belum ada, isi ZIVPN_BIN_URL lalu jalankan ulang script.
 - Rule UDP ZIVPN otomatis dipasang: INPUT udp ${ZIVPN_LISTEN_PORT}, DNAT ${ZIVPN_DNAT_RANGE} -> ${ZIVPN_LISTEN_PORT}.
 - UDP Custom juga otomatis disiapkan di service ${UDPCUSTOM_SERVICE_NAME} (config: /root/udp/config.json).
-- UDP Custom default tanpa DNAT range (lebih stabil/cepat). Jika perlu mode tembak port, isi UDPCUSTOM_DNAT_RANGE.
+- UDP Custom akan pakai DNAT range ${UDPCUSTOM_DNAT_RANGE:-${UDPCUSTOM_DNAT_AUTO_RANGE}} saat backend UDPHC aktif (override via UDPCUSTOM_DNAT_RANGE).
 - Hanya 1 backend UDP aktif sesuai ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND} (zivpn|udpcustom).
 - vnStat dan speedtest-cli otomatis terpasang untuk monitoring trafik + tes speed VPS.
 - Auto reboot aktif setiap hari jam 03:00 via systemd timer sc-1forcr-autoreboot.timer.
