@@ -22,33 +22,12 @@ AutoScript untuk VPS Debian 12+ / Ubuntu 22+ dengan fitur:
 
 ## 2) Install
 
-> Sesuaikan URL raw dengan path file di repo kamu.
-
-Jika file ada di folder `scripts/`:
-
-```bash
-curl -fL --retry 5 --retry-delay 2 https://raw.githubusercontent.com/harismy/sc1forcr/main/scripts/setup-autoscript-compat.sh -o /tmp/setup-autoscript-compat.sh
-sed -i 's/\r$//' /tmp/setup-autoscript-compat.sh
-chmod +x /tmp/setup-autoscript-compat.sh
-bash /tmp/setup-autoscript-compat.sh
-```
-
-Jika file ada di root repo:
-
 ```bash
 curl -fL --retry 5 --retry-delay 2 https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh -o /tmp/setup-autoscript-compat.sh
 sed -i 's/\r$//' /tmp/setup-autoscript-compat.sh
 chmod +x /tmp/setup-autoscript-compat.sh
 bash /tmp/setup-autoscript-compat.sh
 ```
-
-Install non-interaktif:
-
-```bash
-DOMAIN=tes.prem-1forcr.shop EMAIL=namakamu@gmail.com bash /tmp/setup-autoscript-compat.sh
-```
-
----
 
 ## 3) Menu VPS
 
