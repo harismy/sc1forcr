@@ -538,8 +538,8 @@ resolve_zivpn_bin_url() {
 
 ensure_zivpn_tls_assets() {
   local cert key
-  cert="/etc/zivpn/tls.crt"
-  key="/etc/zivpn/tls.key"
+  cert="/etc/zivpn/zivpn.crt"
+  key="/etc/zivpn/zivpn.key"
   mkdir -p /etc/zivpn
 
   if [[ -s "${cert}" && -s "${key}" ]]; then
@@ -560,25 +560,20 @@ ensure_zivpn_tls_assets() {
 ensure_zivpn_config_schema() {
   local cfg listen cert key tmp
   cfg="/etc/zivpn/config.json"
-  cert="/etc/zivpn/tls.crt"
-  key="/etc/zivpn/tls.key"
+  cert="/etc/zivpn/zivpn.crt"
+  key="/etc/zivpn/zivpn.key"
   listen=":${ZIVPN_LISTEN_PORT}"
 
   if [[ ! -f "${cfg}" ]]; then
     cat > "${cfg}" <<EOF
 {
+  "listen": "${listen}",
+  "cert": "${cert}",
+  "key": "${key}",
+  "obfs": "zivpn",
   "auth": {
     "mode": "passwords",
     "config": []
-  },
-  "network": {
-    "tcp": true,
-    "udp": true
-  },
-  "listen": "${listen}",
-  "zivpn_udp": {
-    "cert_path": "${cert}",
-    "key_path": "${key}"
   }
 }
 EOF
@@ -599,13 +594,11 @@ EOF
       .auth = (.auth // {"mode":"passwords","config":[]}) |
       .auth.mode = (.auth.mode // "passwords") |
       .auth.config = (if (.auth.config | type) == "array" then .auth.config else [] end) |
-      .network = (.network // {"tcp":true,"udp":true}) |
-      .network.tcp = (if .network.tcp == false then false else true end) |
-      .network.udp = (if .network.udp == false then false else true end) |
       .listen = (if ((.listen | type) == "string" and .listen != "") then .listen else $listen end) |
-      .zivpn_udp = (.zivpn_udp // {}) |
-      .zivpn_udp.cert_path = $cert |
-      .zivpn_udp.key_path = $key
+      .cert = $cert |
+      .key = $key |
+      .obfs = (if ((.obfs | type) == "string" and .obfs != "") then .obfs else "zivpn" end) |
+      del(.zivpn_udp)
     ' "${cfg}" > "${tmp}" 2>/dev/null; then
     mv -f "${tmp}" "${cfg}"
   else
@@ -671,12 +664,75 @@ EOF
   fi
 }
 
+fw_backend_kind() {
+  if command -v iptables >/dev/null 2>&1; then
+    echo "iptables"
+    return 0
+  fi
+  if command -v nft >/dev/null 2>&1; then
+    echo "nft"
+    return 0
+  fi
+  echo "none"
+}
+
+fw_allow_udp_input() {
+  local port="$1" fw
+  fw="$(fw_backend_kind)"
+  case "${fw}" in
+    iptables)
+      iptables -C INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || \
+        iptables -I INPUT -p udp --dport "${port}" -j ACCEPT
+      ;;
+    nft)
+      if nft list chain inet filter input >/dev/null 2>&1; then
+        nft list chain inet filter input | grep -F -- "udp dport ${port} accept" >/dev/null 2>&1 || \
+          nft add rule inet filter input udp dport "${port}" accept
+      elif nft list chain ip filter input >/dev/null 2>&1; then
+        nft list chain ip filter input | grep -F -- "udp dport ${port} accept" >/dev/null 2>&1 || \
+          nft add rule ip filter input udp dport "${port}" accept
+      else
+        log "Chain filter input tidak ditemukan di nftables. Rule allow UDP ${port} dilewati."
+      fi
+      ;;
+  esac
+}
+
+fw_add_udp_dnat_range() {
+  local range="$1" to_port="$2" fw
+  fw="$(fw_backend_kind)"
+  case "${fw}" in
+    iptables)
+      iptables -t nat -C PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1 || \
+        iptables -t nat -I PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}"
+      ;;
+    nft)
+      nft add table ip nat >/dev/null 2>&1 || true
+      nft 'add chain ip nat prerouting { type nat hook prerouting priority dstnat; }' >/dev/null 2>&1 || true
+      nft list chain ip nat prerouting 2>/dev/null | grep -F -- "udp dport ${range} dnat to :${to_port}" >/dev/null 2>&1 || \
+        nft add rule ip nat prerouting udp dport "${range}" dnat to ":${to_port}"
+      ;;
+  esac
+}
+
+fw_persist_rules() {
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+    return 0
+  fi
+  if command -v nft >/dev/null 2>&1 && systemctl is-enabled --quiet nftables 2>/dev/null; then
+    nft list ruleset >/etc/nftables.conf 2>/dev/null || true
+  fi
+  return 0
+}
+
 setup_zivpn_udp_nat_rules() {
   if ! command -v zivpn >/dev/null 2>&1; then
     return 0
   fi
-  if ! command -v iptables >/dev/null 2>&1; then
-    log "iptables tidak ditemukan. Skip rule DNAT ZIVPN."
+  if [[ "$(fw_backend_kind)" == "none" ]]; then
+    log "iptables/nft tidak ditemukan. Skip rule DNAT ZIVPN."
     return 0
   fi
 
@@ -691,28 +747,14 @@ setup_zivpn_udp_nat_rules() {
 
   log "Set rule UDP ZIVPN: listen=${listen_port}, dnat_range=${ZIVPN_DNAT_RANGE}"
 
-  iptables -C INPUT -p udp --dport "${listen_port}" -j ACCEPT >/dev/null 2>&1 || \
-    iptables -I INPUT -p udp --dport "${listen_port}" -j ACCEPT
-
-  # Cleanup rule lama yang terikat interface tertentu (sering tidak match setelah rename NIC).
-  while IFS= read -r rule; do
-    [[ -z "${rule}" ]] && continue
-    iptables -t nat ${rule/-A/-D} >/dev/null 2>&1 || true
-  done < <(iptables -t nat -S PREROUTING | \
-    grep -F -- "--dport ${ZIVPN_DNAT_RANGE} -j DNAT --to-destination :${listen_port}" | \
-    grep -F -- "-i " || true)
-
-  iptables -t nat -C PREROUTING -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || \
-    iptables -t nat -I PREROUTING -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}"
+  fw_allow_udp_input "${listen_port}"
+  fw_add_udp_dnat_range "${ZIVPN_DNAT_RANGE}" "${listen_port}"
 
   if ! command -v netfilter-persistent >/dev/null 2>&1; then
     log "Install netfilter-persistent agar rule iptables tidak hilang saat reboot..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
   fi
-  if command -v netfilter-persistent >/dev/null 2>&1; then
-    netfilter-persistent save >/dev/null 2>&1 || true
-    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
-  fi
+  fw_persist_rules
 }
 
 setup_udpcustom_service_if_possible() {
@@ -770,13 +812,12 @@ setup_udpcustom_udp_nat_rules() {
   if [[ ! -x /root/udp/udp-custom ]]; then
     return 0
   fi
-  if ! command -v iptables >/dev/null 2>&1; then
-    log "iptables tidak ditemukan. Skip rule DNAT UDP Custom."
+  if [[ "$(fw_backend_kind)" == "none" ]]; then
+    log "iptables/nft tidak ditemukan. Skip rule DNAT UDP Custom."
     return 0
   fi
 
-  local listen_port backend
-  backend="$(echo "${ACTIVE_UDP_BACKEND:-}" | tr '[:upper:]' '[:lower:]')"
+  local listen_port
   listen_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
   if [[ -z "${listen_port}" ]]; then
     listen_port="$(echo "${UDPCUSTOM_LISTEN_PORT}" | tr -cd '0-9')"
@@ -787,42 +828,20 @@ setup_udpcustom_udp_nat_rules() {
 
   log "Set rule UDP UDPHC: listen=${listen_port}, dnat_range=${UDPCUSTOM_DNAT_RANGE:-none}"
 
-  iptables -C INPUT -p udp --dport "${listen_port}" -j ACCEPT >/dev/null 2>&1 || \
-    iptables -I INPUT -p udp --dport "${listen_port}" -j ACCEPT
+  fw_allow_udp_input "${listen_port}"
 
   if [[ -n "${UDPCUSTOM_DNAT_RANGE}" ]]; then
-    # Cleanup rule lama yang terikat interface tertentu.
-    while IFS= read -r rule; do
-      [[ -z "${rule}" ]] && continue
-      iptables -t nat ${rule/-A/-D} >/dev/null 2>&1 || true
-    done < <(iptables -t nat -S PREROUTING | \
-      grep -F -- "--dport ${UDPCUSTOM_DNAT_RANGE} -j DNAT --to-destination :${listen_port}" | \
-      grep -F -- "-i " || true)
-
-    iptables -t nat -C PREROUTING -p udp --dport "${UDPCUSTOM_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}" >/dev/null 2>&1 || \
-      iptables -t nat -I PREROUTING -p udp --dport "${UDPCUSTOM_DNAT_RANGE}" -j DNAT --to-destination ":${listen_port}"
+    fw_add_udp_dnat_range "${UDPCUSTOM_DNAT_RANGE}" "${listen_port}"
   else
     log "UDPHC tanpa DNAT range (default performa). Isi UDPCUSTOM_DNAT_RANGE jika perlu mode tembak port."
-    # Jangan hapus DNAT backend lain (contoh ZIVPN) saat mode aktif bukan UDPHC.
-    if [[ "${backend}" == "udpcustom" || "${backend}" == "udp-custom" || "${backend}" == "udphc" ]]; then
-      # Bersihkan rule DNAT lama ke port UDPHC agar tidak jadi bottleneck.
-      while IFS= read -r rule; do
-        [[ -z "${rule}" ]] && continue
-        iptables -t nat ${rule/-A/-D} >/dev/null 2>&1 || true
-      done < <(iptables -t nat -S PREROUTING | grep -F -- "-j DNAT --to-destination :${listen_port}" || true)
-    else
-      log "ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}, cleanup DNAT UDPHC dilewati agar rule backend lain tetap aman."
-    fi
+    log "DNAT UDPHC tidak diubah karena UDPCUSTOM_DNAT_RANGE kosong."
   fi
 
   if ! command -v netfilter-persistent >/dev/null 2>&1; then
     log "Install netfilter-persistent agar rule iptables tidak hilang saat reboot..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y netfilter-persistent iptables-persistent >/dev/null 2>&1 || true
   fi
-  if command -v netfilter-persistent >/dev/null 2>&1; then
-    netfilter-persistent save >/dev/null 2>&1 || true
-    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
-  fi
+  fw_persist_rules
 }
 
 enforce_single_udp_backend() {
@@ -1774,6 +1793,13 @@ function safeExec(cmd, args) {
     return false;
   }
 }
+function readExec(cmd, args) {
+  try {
+    return execFileSync(cmd, args, { encoding: 'utf8', maxBuffer: 2 * 1024 * 1024 });
+  } catch (_) {
+    return '';
+  }
+}
 
 function addIpToUserMap(map, username, ip) {
   const u = String(username || '').trim().toLowerCase();
@@ -1996,21 +2022,68 @@ function isIpv6(ip) {
   return String(ip || '').includes(':');
 }
 
+function nftDropSnippet(ip, port) {
+  const fam = isIpv6(ip) ? 'ip6' : 'ip';
+  return `${fam} saddr ${ip} udp dport ${port} drop`;
+}
+
+function detectNftInputChain() {
+  if (safeExec('nft', ['list', 'chain', 'inet', 'filter', 'input'])) {
+    return ['inet', 'filter', 'input'];
+  }
+  if (safeExec('nft', ['list', 'chain', 'ip', 'filter', 'input'])) {
+    return ['ip', 'filter', 'input'];
+  }
+  return null;
+}
+
+function addNftUdpDropRule(ip, port) {
+  const chain = detectNftInputChain();
+  if (!chain) return false;
+  const src = String(ip || '').trim();
+  const dport = String(port);
+  const fam = isIpv6(src) ? 'ip6' : 'ip';
+  const chainDump = readExec('nft', ['list', 'chain', ...chain]);
+  if (chainDump.includes(nftDropSnippet(src, dport))) return true;
+  return safeExec('nft', ['add', 'rule', ...chain, fam, 'saddr', src, 'udp', 'dport', dport, 'drop']);
+}
+
+function removeNftUdpDropRule(ip, port) {
+  const chain = detectNftInputChain();
+  if (!chain) return;
+  const src = String(ip || '').trim();
+  const dport = String(port);
+  const fam = isIpv6(src) ? 'ip6' : 'ip';
+  while (safeExec('nft', ['delete', 'rule', ...chain, fam, 'saddr', src, 'udp', 'dport', dport, 'drop'])) {}
+}
+
 function addUdpDropRule(ip, port) {
   const src = String(ip || '').trim();
   if (!src) return false;
-  const cmd = isIpv6(src) ? 'ip6tables' : 'iptables';
-  const rule = ['INPUT', '-p', 'udp', '-s', src, '--dport', String(port), '-j', 'DROP'];
-  if (safeExec(cmd, ['-C', ...rule])) return true;
-  return safeExec(cmd, ['-I', ...rule]);
+  if (safeExec('iptables', ['-L'])) {
+    const cmd = isIpv6(src) ? 'ip6tables' : 'iptables';
+    const rule = ['INPUT', '-p', 'udp', '-s', src, '--dport', String(port), '-j', 'DROP'];
+    if (safeExec(cmd, ['-C', ...rule])) return true;
+    return safeExec(cmd, ['-I', ...rule]);
+  }
+  if (safeExec('nft', ['list', 'ruleset'])) {
+    return addNftUdpDropRule(src, port);
+  }
+  return false;
 }
 
 function removeUdpDropRule(ip, port) {
   const src = String(ip || '').trim();
   if (!src) return;
-  const cmd = isIpv6(src) ? 'ip6tables' : 'iptables';
-  const rule = ['INPUT', '-p', 'udp', '-s', src, '--dport', String(port), '-j', 'DROP'];
-  while (safeExec(cmd, ['-D', ...rule])) {}
+  if (safeExec('iptables', ['-L'])) {
+    const cmd = isIpv6(src) ? 'ip6tables' : 'iptables';
+    const rule = ['INPUT', '-p', 'udp', '-s', src, '--dport', String(port), '-j', 'DROP'];
+    while (safeExec(cmd, ['-D', ...rule])) {}
+    return;
+  }
+  if (safeExec('nft', ['list', 'ruleset'])) {
+    removeNftUdpDropRule(src, port);
+  }
 }
 
 async function ensureTables() {
@@ -2866,7 +2939,13 @@ diagnose_udp_backends() {
   echo "UDPHC port      : ${uport} ($(is_udp_port_listening "${uport}" && echo LISTEN || echo NO-LISTEN))"
   echo
   echo "NAT PREROUTING (ringkas):"
-  iptables -t nat -S PREROUTING 2>/dev/null | grep -E 'DNAT|5667|5668|6000:19999' || echo "(tidak ada rule terkait)"
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -t nat -S PREROUTING 2>/dev/null | grep -E 'DNAT|5667|5668|6000:19999' || echo "(tidak ada rule terkait)"
+  elif command -v nft >/dev/null 2>&1; then
+    nft list chain ip nat prerouting 2>/dev/null | grep -E 'dnat|5667|5668|6000-19999' || echo "(tidak ada rule terkait)"
+  else
+    echo "(iptables/nft tidak tersedia)"
+  fi
   echo
   if [[ "${zstat}" != "active" ]]; then
     echo "--- log ${ZIVPN_SERVICE} ---"
@@ -3955,6 +4034,58 @@ write_version_marker() {
   chmod 644 /etc/sc-1forcr-version
 }
 
+post_install_preflight() {
+  local fw zstat ustat xstat apistat wsstat zport uport range_nft nat_ok
+  fw="$(fw_backend_kind)"
+  zstat="$(systemctl is-active "${ZIVPN_SERVICE_NAME}" 2>/dev/null || true)"
+  ustat="$(systemctl is-active "${UDPCUSTOM_SERVICE_NAME}" 2>/dev/null || true)"
+  xstat="$(systemctl is-active xray 2>/dev/null || true)"
+  apistat="$(systemctl is-active sc-1forcr-api 2>/dev/null || true)"
+  wsstat="$(systemctl is-active sc-1forcr-sshws 2>/dev/null || true)"
+
+  zport="$(jq -r '.listen // empty' /etc/zivpn/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
+  [[ -z "${zport}" ]] && zport="${ZIVPN_LISTEN_PORT}"
+  uport="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
+  [[ -z "${uport}" ]] && uport="${UDPCUSTOM_LISTEN_PORT}"
+
+  nat_ok="n/a"
+  if [[ -n "${ZIVPN_DNAT_RANGE}" ]]; then
+    case "${fw}" in
+      iptables)
+        if iptables -t nat -S PREROUTING 2>/dev/null | grep -F -- "--dport ${ZIVPN_DNAT_RANGE}" | grep -F -- "--to-destination :${zport}" >/dev/null 2>&1; then
+          nat_ok="yes"
+        else
+          nat_ok="no"
+        fi
+        ;;
+      nft)
+        range_nft="${ZIVPN_DNAT_RANGE/:/-}"
+        if nft list chain ip nat prerouting 2>/dev/null | grep -F -- "udp dport ${range_nft}" | grep -F -- "dnat to :${zport}" >/dev/null 2>&1; then
+          nat_ok="yes"
+        else
+          nat_ok="no"
+        fi
+        ;;
+      *)
+        nat_ok="no-fw"
+        ;;
+    esac
+  fi
+
+  cat <<EOF
+
+=== PREFLIGHT CHECK ===
+- firewall backend : ${fw}
+- xray/api/sshws   : ${xstat}/${apistat}/${wsstat}
+- zivpn/udphc      : ${zstat}/${ustat}
+- zivpn listen     : ${zport} ($(ss -lunp 2>/dev/null | awk -v p=":${zport}" '$5 ~ p"$" {ok=1} END{print ok?"YES":"NO"}'))
+- udphc listen     : ${uport} ($(ss -lunp 2>/dev/null | awk -v p=":${uport}" '$5 ~ p"$" {ok=1} END{print ok?"YES":"NO"}'))
+- zivpn cert/key   : $( [[ -s /etc/zivpn/zivpn.crt && -s /etc/zivpn/zivpn.key ]] && echo OK || echo MISSING )
+- dnat ${ZIVPN_DNAT_RANGE:-none}->${zport} : ${nat_ok}
+=======================
+EOF
+}
+
 main() {
   check_supported_os
   install_base_packages
@@ -3981,6 +4112,7 @@ main() {
   setup_auto_reboot_timer
   write_cli_menu
   write_version_marker
+  post_install_preflight
 
   cat <<EOF
 
