@@ -38,7 +38,7 @@ set -euo pipefail
 DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-}"
 API_AUTH_TOKEN="${API_AUTH_TOKEN:-}"
-SCRIPT_VERSION="${SCRIPT_VERSION:-2026.04.05-1}"
+SCRIPT_VERSION="${SCRIPT_VERSION:-V.1FSC}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh}"
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
 APP_DIR="${APP_DIR:-/opt/sc-1forcr}"
@@ -972,10 +972,22 @@ function auth(req, res, next) {
   if (!token || token !== AUTH_TOKEN) return fail(res, 401, 'unauthorized');
   next();
 }
-function ymdPlusDays(days) {
-  const d = new Date();
+function ymdLocal(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+function ymdPlusDays(days, baseYmd = '') {
+  let d;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(String(baseYmd || ''))) {
+    d = new Date(`${baseYmd}T00:00:00`);
+  } else {
+    d = new Date();
+  }
+  d.setHours(0, 0, 0, 0);
   d.setDate(d.getDate() + Number(days || 0));
-  return d.toISOString().slice(0, 10);
+  return ymdLocal(d);
 }
 function nowTime() {
   return new Date().toTimeString().slice(0, 8);
@@ -1301,13 +1313,16 @@ async function renewSsh(req, res) {
   try {
     const username = String(req.params.username || '').trim();
     const exp = Number(req.params.exp || 30);
-    const expDate = ymdPlusDays(exp);
     const row = await get("SELECT password,limitip,quota,date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]);
     const pass = String(row?.password || username);
     const currentQuota = Number(row?.quota || 0);
     const bodyQuota = Number(req.body?.kuota);
     const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : currentQuota;
     const fromExp = String(row?.date_exp || '-');
+    const today = ymdPlusDays(0);
+    const baseExp = String(row?.date_exp || '');
+    const renewBase = (/^\d{4}-\d{2}-\d{2}$/.test(baseExp) && baseExp > today) ? baseExp : today;
+    const expDate = ymdPlusDays(exp, renewBase);
     ensureLinuxUser(username, pass, expDate);
     await run("UPDATE account_sshs SET date_exp=?, quota=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)", [expDate, nextQuota, username]);
     return ok(res, {
@@ -1445,7 +1460,10 @@ async function renewXray(table, username, exp, body) {
   const currentQuota = Number(row?.quota || 0);
   const bodyQuota = Number(body?.kuota);
   const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : currentQuota;
-  const expDate = ymdPlusDays(exp);
+  const today = ymdPlusDays(0);
+  const baseExp = String(row?.date_exp || '');
+  const renewBase = (/^\d{4}-\d{2}-\d{2}$/.test(baseExp) && baseExp > today) ? baseExp : today;
+  const expDate = ymdPlusDays(exp, renewBase);
   await run(`UPDATE ${table} SET date_exp=?, quota=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)`, [expDate, nextQuota, username]);
   await renderAndReloadXray();
   return {
@@ -2752,16 +2770,18 @@ prompt_input() {
 
 pick_type() {
   echo "Pilih tipe:" >&2
+  echo "0) kembali" >&2
   echo "1) ssh" >&2
   echo "2) vmess" >&2
   echo "3) vless" >&2
   echo "4) trojan" >&2
   echo "5) zivpn" >&2
-  if ! prompt_input t "Input [1-5]: "; then
+  if ! prompt_input t "Input [0-5]: "; then
     echo ""
     return 0
   fi
   case "$t" in
+    0) echo "" ;;
     1) echo "ssh" ;;
     2) echo "vmess" ;;
     3) echo "vless" ;;
@@ -2777,6 +2797,15 @@ endpoint_create() {
     vmess) echo "/vmessall" ;;
     vless) echo "/vlessall" ;;
     trojan) echo "/trojanall" ;;
+    *) echo "" ;;
+  esac
+}
+endpoint_trial() {
+  case "$1" in
+    ssh|zivpn) echo "/trialsshvpn" ;;
+    vmess) echo "/trialvmessall" ;;
+    vless) echo "/trialvlessall" ;;
+    trojan) echo "/trialtrojanall" ;;
     *) echo "" ;;
   esac
 }
@@ -2810,10 +2839,11 @@ endpoint_unlock() {
 
 print_created_account() {
   local type="$1" raw="$2"
-  local code
+  local code err_msg
   code="$(echo "${raw}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
   if [[ "${code}" != "200" ]]; then
-    echo "${raw}" | jq . 2>/dev/null || echo "${raw}"
+    err_msg="$(echo "${raw}" | jq -r '.meta.message // .message // "unknown error"' 2>/dev/null || echo "unknown error")"
+    echo "Gagal membuat akun ${type^^}: ${err_msg}"
     return
   fi
 
@@ -2846,19 +2876,17 @@ IP Limit     : ${lim}
 EOT_SSH
       ;;
     zivpn)
-      local host pass exp lim
+      local host user exp
       host="$(echo "${raw}" | jq -r '.data.hostname // "-"' )"
-      pass="$(echo "${raw}" | jq -r '.data.password // .data.username // "-"' )"
+      user="$(echo "${raw}" | jq -r '.data.username // "-"' )"
       exp="$(echo "${raw}" | jq -r '.data.exp // .data.expired // "-"' )"
-      lim="$(echo "${raw}" | jq -r '.data.limitip // "0"' )"
       cat <<EOT_ZIVPN
 =============================
  ZIVPN SSH ACCOUNT
 =============================
-udp password : ${pass}
+udp password : ${user}
 Hostname     : ${host}
 Expired      : ${exp}
-IP Limit     : ${lim} device
 EOT_ZIVPN
       ;;
     vmess|vless|trojan)
@@ -2894,37 +2922,119 @@ EOT_XRAY
 }
 
 create_account() {
-  local type ep username password exp limitip quota
+  local type ep username password exp limitip quota payload resp
+  while true; do
+    type="$(pick_type)"
+    [[ -z "$type" ]] && return
+    ep="$(endpoint_create "$type")"
+    [[ -z "$ep" ]] && { echo "Endpoint create tidak ada."; return; }
+
+    username="$(prompt_new_username "$type")" || continue
+    prompt_input exp "Expired (hari) [30]: " || continue
+    exp="${exp:-30}"
+    if [[ "$type" == "zivpn" ]]; then
+      # Mode ringkas ZIVPN: cukup username + masa aktif.
+      # Nilai lain tetap disimpan default di belakang layar.
+      limitip="0"
+      quota="0"
+      password="${username}"
+    else
+      prompt_input limitip "Limit IP [2]: " || continue
+      limitip="${limitip:-2}"
+      prompt_input quota "Quota GB [0]: " || continue
+      quota="${quota:-0}"
+    fi
+    if [[ "$type" == "ssh" ]]; then
+      prompt_input password "Password [default=username]: " || continue
+      password="${password:-$username}"
+    elif [[ "$type" != "zivpn" ]]; then
+      password=""
+    fi
+
+    if [[ -n "$password" ]]; then
+      payload="$(jq -nc --arg u "$username" --arg p "$password" --argjson e "$exp" --arg l "$limitip" --arg q "$quota" \
+        '{username:$u,password:$p,expired:$e,limitip:$l,kuota:$q}')"
+    else
+      payload="$(jq -nc --arg u "$username" --argjson e "$exp" --arg l "$limitip" --arg q "$quota" \
+        '{username:$u,expired:$e,limitip:$l,kuota:$q}')"
+    fi
+    resp="$(api_call "POST" "$ep" "$payload")"
+    print_created_account "$type" "${resp}"
+    return
+  done
+}
+
+schedule_trial_delete_1h() {
+  local type="$1" username="$2" del_ep unit safe_user
+  del_ep="$(endpoint_delete "${type}")"
+  [[ -z "${del_ep}" ]] && return
+  if ! command -v systemd-run >/dev/null 2>&1; then
+    echo "Catatan: systemd-run tidak tersedia, auto-delete trial 1 jam tidak dijadwalkan."
+    return
+  fi
+  safe_user="$(echo "${username}" | tr -c 'A-Za-z0-9._-' '_')"
+  unit="sc1forcr-trial-${type}-${safe_user}-$(date +%s)"
+  if systemd-run --quiet --unit "${unit}" --on-active=1h \
+    /usr/bin/curl -sS -X DELETE "${API_BASE}${del_ep}/${username}" \
+    -H "Authorization: ${AUTH_TOKEN}" >/dev/null 2>&1; then
+    echo "Trial 1 jam aktif. Auto-delete dijadwalkan (unit: ${unit})."
+  else
+    echo "Peringatan: gagal jadwalkan auto-delete trial 1 jam."
+  fi
+}
+
+create_trial_account() {
+  local type ep username password resp code
+  while true; do
+    type="$(pick_type)"
+    [[ -z "${type}" ]] && return
+    ep="$(endpoint_trial "${type}")"
+    [[ -z "${ep}" ]] && { echo "Endpoint trial tidak ada."; return; }
+
+    username="$(prompt_new_username "${type}")" || continue
+
+    if [[ "${type}" == "zivpn" ]]; then
+      password="${username}"
+    elif [[ "${type}" == "ssh" ]]; then
+      prompt_input password "Password [default=username]: " || continue
+      password="${password:-$username}"
+    else
+      password=""
+    fi
+
+    if [[ -n "${password}" ]]; then
+      resp="$(api_call "POST" "${ep}" "$(jq -nc --arg u "${username}" --arg p "${password}" --argjson e 1 --arg l "0" --arg q "0" '{username:$u,password:$p,expired:$e,limitip:$l,kuota:$q}')")"
+    else
+      resp="$(api_call "POST" "${ep}" "$(jq -nc --arg u "${username}" --argjson e 1 --arg l "0" --arg q "0" '{username:$u,expired:$e,limitip:$l,kuota:$q}')")"
+    fi
+
+    print_created_account "${type}" "${resp}"
+    code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+    if [[ "${code}" == "200" ]]; then
+      schedule_trial_delete_1h "${type}" "${username}"
+    fi
+    return
+  done
+}
+
+edit_limit_ip_account() {
+  local type table username new_limit
   type="$(pick_type)"
-  [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
-  ep="$(endpoint_create "$type")"
-  [[ -z "$ep" ]] && { echo "Endpoint create tidak ada."; return; }
-
-  prompt_input username "Username: " || return
-  prompt_input exp "Expired (hari) [30]: " || return
-  exp="${exp:-30}"
-  prompt_input limitip "Limit IP [2]: " || return
-  limitip="${limitip:-2}"
-  prompt_input quota "Quota GB [0]: " || return
-  quota="${quota:-0}"
-  if [[ "$type" == "ssh" || "$type" == "zivpn" ]]; then
-    prompt_input password "Password [default=username]: " || return
-    password="${password:-$username}"
-  else
-    password=""
+  [[ -z "${type}" ]] && { echo "Tipe tidak valid."; return; }
+  table="$(account_table_by_type "${type}")"
+  [[ -z "${table}" ]] && { echo "Tabel akun tidak ditemukan."; return; }
+  username="$(pick_existing_username "${type}")" || return
+  prompt_input new_limit "Limit IP baru [0]: " || return
+  new_limit="${new_limit:-0}"
+  if [[ ! "${new_limit}" =~ ^[0-9]+$ ]]; then
+    echo "Limit IP harus angka 0 atau lebih."
+    return
   fi
-
-  local payload
-  if [[ -n "$password" ]]; then
-    payload="$(jq -nc --arg u "$username" --arg p "$password" --argjson e "$exp" --arg l "$limitip" --arg q "$quota" \
-      '{username:$u,password:$p,expired:$e,limitip:$l,kuota:$q}')"
-  else
-    payload="$(jq -nc --arg u "$username" --argjson e "$exp" --arg l "$limitip" --arg q "$quota" \
-      '{username:$u,expired:$e,limitip:$l,kuota:$q}')"
-  fi
-  local resp
-  resp="$(api_call "POST" "$ep" "$payload")"
-  print_created_account "$type" "${resp}"
+  sqlite3 "${DB_PATH}" "UPDATE ${table} SET limitip=${new_limit} WHERE LOWER(username)=LOWER('${username}');" >/dev/null 2>&1 || {
+    echo "Gagal update limit IP."
+    return
+  }
+  echo "Berhasil update limit IP akun ${type^^} '${username}' jadi ${new_limit}."
 }
 
 account_table_by_type() {
@@ -2937,6 +3047,40 @@ account_table_by_type() {
   esac
 }
 
+username_exists_by_type() {
+  local type="$1" username="$2" table cnt
+  table="$(account_table_by_type "${type}")"
+  [[ -z "${table}" ]] && return 1
+  cnt="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM ${table} WHERE LOWER(username)=LOWER('${username}');" 2>/dev/null || echo 0)"
+  [[ "${cnt}" =~ ^[0-9]+$ ]] || cnt="0"
+  if [[ "${cnt}" -gt 0 ]]; then
+    return 0
+  fi
+  return 1
+}
+
+prompt_new_username() {
+  local type="$1" username=""
+  while true; do
+    prompt_input username "Username: " || return 1
+    username="$(echo "${username}" | tr -d '[:space:]')"
+    if [[ -z "${username}" ]]; then
+      echo "Username tidak boleh kosong."
+      continue
+    fi
+    if [[ ! "${username}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+      echo "Username hanya boleh huruf, angka, titik, underscore, dan dash."
+      continue
+    fi
+    if username_exists_by_type "${type}" "${username}"; then
+      echo "Username '${username}' sudah ada di database. Coba username lain."
+      continue
+    fi
+    echo "${username}"
+    return 0
+  done
+}
+
 print_account_picker_table() {
   local type="$1" lock_only="${2:-0}" table where rows
   table="$(account_table_by_type "${type}")"
@@ -2946,17 +3090,17 @@ print_account_picker_table() {
     where="WHERE UPPER(TRIM(COALESCE(status,''))) IN ('LOCK','LOCK_TMP')"
   fi
   rows="$(sqlite3 -separator '|' "$DB_PATH" \
-    "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))) FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
+    "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday(date('now','localtime'))) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ${where} ORDER BY username;" 2>/dev/null || true)"
   if [[ -z "${rows}" ]]; then
     return 1
   fi
-  printf "%-4s %-24s %-10s %-8s\n" "NO" "USERNAME" "STATUS" "SISA"
-  printf "%-4s %-24s %-10s %-8s\n" "----" "------------------------" "----------" "--------"
-  local i=0 u sisa st
-  while IFS='|' read -r u sisa st; do
+  printf "%-4s %-24s %-10s %-8s %-8s\n" "NO" "USERNAME" "STATUS" "SISA" "LIM_IP"
+  printf "%-4s %-24s %-10s %-8s %-8s\n" "----" "------------------------" "----------" "--------" "--------"
+  local i=0 u sisa st lim
+  while IFS='|' read -r u sisa st lim; do
     [[ -z "${u}" ]] && continue
     i=$((i + 1))
-    printf "%-4s %-24s %-10s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa:-0}h"
+    printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa:-0}h" "${lim:-0}"
   done <<< "${rows}"
   return 0
 }
@@ -3024,7 +3168,7 @@ pick_locked_username() {
 }
 
 renew_account() {
-  local type ep username exp
+  local type ep username exp resp code message from_date to_date quota limitip
   type="$(pick_type)"
   [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
   ep="$(endpoint_renew "$type")"
@@ -3034,11 +3178,31 @@ renew_account() {
   printf "%-12s : %s\n" "Username" "${username}"
   prompt_input exp "Tambah expired (hari) [30]: " || return
   exp="${exp:-30}"
-  api_call "POST" "${ep}/${username}/${exp}" | jq .
+  resp="$(api_call "POST" "${ep}/${username}/${exp}")"
+  code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+  message="$(echo "${resp}" | jq -r '.meta.message // .message // "unknown error"' 2>/dev/null || echo "unknown error")"
+  if [[ "${code}" != "200" ]]; then
+    echo "Gagal renew akun ${type^^}: ${message}"
+    return
+  fi
+  from_date="$(echo "${resp}" | jq -r '.data.from // "-"' 2>/dev/null || echo "-")"
+  to_date="$(echo "${resp}" | jq -r '.data.to // .data.exp // "-"' 2>/dev/null || echo "-")"
+  quota="$(echo "${resp}" | jq -r '.data.quota // "0"' 2>/dev/null || echo "0")"
+  limitip="$(echo "${resp}" | jq -r '.data.limitip // "0"' 2>/dev/null || echo "0")"
+  cat <<EOT_RENEW
+=============================
+ RENEW ${type^^} BERHASIL
+=============================
+Username     : ${username}
+Dari         : ${from_date}
+Sampai       : ${to_date}
+Quota        : ${quota}
+IP Limit     : ${limitip}
+EOT_RENEW
 }
 
 delete_account() {
-  local type ep username
+  local type ep username resp code message
   type="$(pick_type)"
   [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
   ep="$(endpoint_delete "$type")"
@@ -3046,37 +3210,51 @@ delete_account() {
   echo "DELETE AKUN ${type^^}"
   username="$(pick_existing_username "$type")" || return
   printf "%-12s : %s\n" "Username" "${username}"
-  api_call "DELETE" "${ep}/${username}" | jq .
+  resp="$(api_call "DELETE" "${ep}/${username}")"
+  code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+  message="$(echo "${resp}" | jq -r '.meta.message // .message // "unknown error"' 2>/dev/null || echo "unknown error")"
+  if [[ "${code}" != "200" ]]; then
+    echo "Gagal hapus akun ${type^^}: ${message}"
+    return
+  fi
+  echo "Akun ${type^^} '${username}' berhasil dihapus."
 }
 
 unlock_account() {
-  local type ep username
+  local type ep username resp code message
   type="$(pick_type)"
   [[ -z "$type" ]] && { echo "Tipe tidak valid."; return; }
   ep="$(endpoint_unlock "$type")"
   [[ -z "$ep" ]] && { echo "Endpoint unlock tidak ada."; return; }
   username="$(pick_locked_username "$type")" || return
   echo "Unlock akun: ${username}"
-  api_call "PATCH" "${ep}/${username}" | jq .
+  resp="$(api_call "PATCH" "${ep}/${username}")"
+  code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+  message="$(echo "${resp}" | jq -r '.meta.message // .message // "unknown error"' 2>/dev/null || echo "unknown error")"
+  if [[ "${code}" != "200" ]]; then
+    echo "Gagal unlock akun ${type^^}: ${message}"
+    return
+  fi
+  echo "Akun ${type^^} '${username}' berhasil di-unlock."
 }
 
 list_accounts() {
   print_account_table() {
     local table="$1" title="$2" rows
     rows="$(sqlite3 -separator '|' "$DB_PATH" \
-      "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday('now','localtime')) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))) FROM ${table} ORDER BY username;" 2>/dev/null || true)"
+      "SELECT username, MAX(0, CAST((julianday(date_exp) - julianday(date('now','localtime'))) AS INTEGER)), UPPER(TRIM(COALESCE(status,''))), CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ORDER BY username;" 2>/dev/null || true)"
     echo "LIST AKUN ${title}"
-    printf "%-4s %-24s %-10s %-8s\n" "NO" "USERNAME" "STATUS" "SISA"
-    printf "%-4s %-24s %-10s %-8s\n" "----" "------------------------" "----------" "--------"
+    printf "%-4s %-24s %-10s %-8s %-8s\n" "NO" "USERNAME" "STATUS" "SISA" "LIM_IP"
+    printf "%-4s %-24s %-10s %-8s %-8s\n" "----" "------------------------" "----------" "--------" "--------"
     if [[ -z "${rows}" ]]; then
       echo "(kosong)"
       return
     fi
-    local i=0 u sisa st
-    while IFS='|' read -r u sisa st; do
+    local i=0 u sisa st lim
+    while IFS='|' read -r u sisa st lim; do
       [[ -z "${u}" ]] && continue
       i=$((i + 1))
-      printf "%-4s %-24s %-10s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa:-0}h"
+      printf "%-4s %-24s %-10s %-8s %-8s\n" "${i}" "${u}" "${st:-AKTIF}" "${sisa:-0}h" "${lim:-0}"
     done <<< "${rows}"
   }
 
@@ -3087,10 +3265,12 @@ list_accounts() {
   echo "4) TROJAN (DB)"
   echo "5) ZIVPN auth.config"
   echo "6) Semua"
-  prompt_input l "Input [1-6]: " || return
+  echo "0) Kembali"
+  prompt_input l "Input [0-6]: " || return
   clear
 
   case "${l}" in
+    0) return ;;
     1)
       print_account_table "account_sshs" "SSH/ZIVPN"
       ;;
@@ -3135,6 +3315,70 @@ list_accounts() {
       echo "Pilihan tidak valid."
       ;;
   esac
+}
+
+akun_menu() {
+  while true; do
+    clear
+    echo "===================================="
+    echo "           MENU AKUN"
+    echo "===================================="
+    echo "1) Add Account"
+    echo "2) Trial Account (1 jam)"
+    echo "3) Renew Account"
+    echo "4) Edit Limit IP"
+    echo "5) Delete Account"
+    echo "6) List Account"
+    echo "7) Unlock Account"
+    echo "0) Kembali"
+    echo
+    if ! prompt_input am "Pilih menu [0-7]: "; then
+      return
+    fi
+    clear
+    case "${am}" in
+      1) create_account ;;
+      2) create_trial_account ;;
+      3) renew_account ;;
+      4) edit_limit_ip_account ;;
+      5) delete_account ;;
+      6) list_accounts ;;
+      7) unlock_account ;;
+      0) return ;;
+      *) echo "Pilihan tidak valid." ;;
+    esac
+    echo
+    read -rp "Enter untuk lanjut..." _ || true
+  done
+}
+
+tools_menu() {
+  while true; do
+    clear
+    echo "===================================="
+    echo "          MENU TOOLS"
+    echo "===================================="
+    echo "1) Informasi Key SC"
+    echo "2) Install API Summary 1FORCR"
+    echo "3) Setting Banner HTML"
+    echo "4) Update Script"
+    echo "0) Kembali"
+    echo
+    if ! prompt_input tm "Pilih menu [0-4]: "; then
+      return
+    fi
+    clear
+    case "${tm}" in
+      1) show_sc_key_info ;;
+      2) install_summary_api_1forcr ;;
+      3) set_html_banner_menu ;;
+      4) update_script_from_repo ;;
+      0) return ;;
+      *) echo "Pilihan tidak valid." ;;
+    esac
+    echo
+    read -rp "Enter untuk lanjut..." _ || true
+  done
 }
 
 udp_backend_status() {
@@ -3381,6 +3625,7 @@ repair_udp_backends() {
 service_menu() {
   local udpcustom
   udpcustom="$(detect_udpcustom_service)"
+  echo "0) kembali"
   echo "1) status semua"
   echo "2) restart semua"
   echo "3) restart backend UDP aktif"
@@ -3388,9 +3633,12 @@ service_menu() {
   echo "5) aktifkan UDPHC (matikan ZIVPN)"
   echo "6) status backend UDP"
   echo "7) diagnose + auto-repair UDP backend"
-  prompt_input s "Pilih [1-7]: " || return
+  prompt_input s "Pilih [0-7]: " || return
   clear
   case "$s" in
+    0)
+      return
+      ;;
     1)
       show_core_services_onoff
       ;;
@@ -3430,13 +3678,17 @@ backup_restore_menu() {
 
   mkdir -p "${bdir}"
 
+  echo "0) Kembali"
   echo "1) Backup config ZIVPN ke /root/config.json.zivpn"
   echo "2) Restore config ZIVPN dari /root/config.json.zivpn"
   echo "3) Backup akun (SSH/VMESS/VLESS/TROJAN) + config ZIVPN + config UDPHC"
   echo "4) Restore akun + config dari backup terbaru"
-  prompt_input b "Pilih [1-4]: " || return
+  prompt_input b "Pilih [0-4]: " || return
   clear
   case "$b" in
+    0)
+      return
+      ;;
     1)
       cp -f /etc/zivpn/config.json /root/config.json.zivpn
       echo "Backup selesai: /root/config.json.zivpn"
@@ -3865,7 +4117,8 @@ draw_dashboard() {
   local ssh_color="${GREEN}ON${NC}";   [[ "$ssh_on" != "ON" ]] && ssh_color="${RED}OFF${NC}"
 
   printf "│   XRAY    : ${xray_color}   │ SSH-WS : ${ws_color}   │ LOADBLC : ${lb_color}   \n"
-  printf "│   ZIVPN   : ${zivpn_color}   │ UDPHC  : ${udphc_color}   │ SSH    : ${ssh_color}   │ HEALTH : ${health_display}${NC} \n"
+  printf "│   ZIVPN   : ${zivpn_color}   │ UDPHC  : ${udphc_color}   │ SSH    : ${ssh_color}   \n"
+  printf "│ HEALTH : ${health_display}${NC} \n"
   hr
 
   # Account Summary
@@ -3877,7 +4130,7 @@ draw_dashboard() {
   # Version & Client
   printf "│ ${BLUE}${BOLD}■ VERSION & CLIENT${NC}${BOLD}${NC}                                  \n"
   printf "│   Version     : ${SCRIPT_VERSION:-unknown}${NC}                                 \n"
-  printf "│   Order By    : SC 1FORCR${NC}                                               \n"
+  printf "│   Distribusi  : Community / Open Source${NC}                                \n"
   printf "│   Client Name : ${ip}${NC}                                                \n"
   printf "│   Expiry In   : Unlimited${NC}                                              \n"
   printf "└─────────────────────────────────────────────────\n"
@@ -4372,6 +4625,122 @@ update_script_from_repo() {
   bash "${tmp}"
 }
 
+show_sc_key_info() {
+  echo "=== INFORMASI KEY SC ==="
+  echo "Domain        : ${DOMAIN}"
+  echo "API Base      : https://${DOMAIN}/vps"
+  echo "Auth Token    : ${AUTH_TOKEN}"
+  echo "DB Path       : ${DB_PATH}"
+  echo "Tabel servers : key='${AUTH_TOKEN}'"
+}
+
+install_summary_api_1forcr() {
+  local url tmp
+  url="https://raw.githubusercontent.com/harismy/apiCekTotalUserPotato/main/setup-summary-api.sh"
+  tmp="/tmp/setup-summary-api.sh"
+  echo "Install Summary API 1FORCR..."
+  if ! curl -fL --retry 5 --retry-delay 2 "${url}" -o "${tmp}"; then
+    echo "Gagal download script summary API."
+    return
+  fi
+  sed -i 's/\r$//' "${tmp}"
+  chmod +x "${tmp}"
+  bash "${tmp}"
+}
+
+apply_html_banner_config() {
+  local banner_file="$1"
+
+  if [[ -n "${banner_file}" && -f "${banner_file}" ]]; then
+    if grep -qE '^[[:space:]]*Banner[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null; then
+      sed -i "s|^[[:space:]]*Banner[[:space:]].*|Banner ${banner_file}|g" /etc/ssh/sshd_config
+    else
+      echo "Banner ${banner_file}" >> /etc/ssh/sshd_config
+    fi
+    if [[ -f /etc/default/dropbear ]]; then
+      if grep -q '^DROPBEAR_BANNER=' /etc/default/dropbear; then
+        sed -i "s|^DROPBEAR_BANNER=.*|DROPBEAR_BANNER=\"${banner_file}\"|g" /etc/default/dropbear
+      else
+        echo "DROPBEAR_BANNER=\"${banner_file}\"" >> /etc/default/dropbear
+      fi
+    fi
+    echo "Banner aktif: ${banner_file}"
+  else
+    if grep -qE '^[[:space:]]*Banner[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null; then
+      sed -i "s|^[[:space:]]*Banner[[:space:]].*|Banner none|g" /etc/ssh/sshd_config
+    else
+      echo "Banner none" >> /etc/ssh/sshd_config
+    fi
+    if [[ -f /etc/default/dropbear ]] && grep -q '^DROPBEAR_BANNER=' /etc/default/dropbear; then
+      sed -i 's|^DROPBEAR_BANNER=.*|DROPBEAR_BANNER=""|g' /etc/default/dropbear
+    fi
+    echo "Banner dinonaktifkan."
+  fi
+
+  systemctl restart ssh >/dev/null 2>&1 || true
+  systemctl restart dropbear >/dev/null 2>&1 || true
+}
+
+set_html_banner_menu() {
+  local banner_file tmp line
+  banner_file="/etc/sc-1forcr/banner.html"
+  mkdir -p /etc/sc-1forcr
+
+  while true; do
+    echo "===================================="
+    echo "        SETTING BANNER HTML"
+    echo "===================================="
+    echo "1) Set/Edit banner"
+    echo "2) Lihat banner aktif"
+    echo "3) Nonaktifkan banner"
+    echo "0) Kembali"
+    echo
+    if ! prompt_input bm "Pilih menu [0-3]: "; then
+      return
+    fi
+    case "${bm}" in
+      1)
+        tmp="$(mktemp)"
+        echo "Paste HTML banner. Akhiri dengan satu baris: EOF"
+        : > "${tmp}"
+        while IFS= read -r line </dev/tty; do
+          [[ "${line}" == "EOF" ]] && break
+          printf '%s\n' "${line}" >> "${tmp}"
+        done
+        if [[ ! -s "${tmp}" ]]; then
+          rm -f "${tmp}"
+          echo "Banner kosong, dibatalkan."
+        else
+          mv -f "${tmp}" "${banner_file}"
+          chmod 644 "${banner_file}"
+          apply_html_banner_config "${banner_file}"
+        fi
+        ;;
+      2)
+        if [[ -f "${banner_file}" ]]; then
+          echo "=== BANNER AKTIF (${banner_file}) ==="
+          cat "${banner_file}"
+        else
+          echo "Belum ada banner aktif."
+        fi
+        ;;
+      3)
+        rm -f "${banner_file}" >/dev/null 2>&1 || true
+        apply_html_banner_config ""
+        ;;
+      0)
+        return
+        ;;
+      *)
+        echo "Pilihan tidak valid."
+        ;;
+    esac
+    echo
+    read -rp "Enter untuk lanjut..." _ || true
+    clear
+  done
+}
+
 monitor_online_menu() {
   while true; do
     clear
@@ -4417,13 +4786,10 @@ while true; do
   fi
 
   echo " ┌─────────────────────────────────────────────────"
-  echo " │  1.) > ADD ACCOUNT       7.) > CHANGE DOMAIN"
-  echo " │  2.) > RENEW ACCOUNT     8.) > MONITOR USER LOCK"
-  echo " │  3.) > DELETE ACCOUNT    9.) > MONITOR USER LOGIN"
-  echo " │  4.) > LIST ACCOUNT      10.) > TEST SPEED VPS"
-  echo " │  5.) > SERVICE MENU      11.) > UPDATE SCRIPT"
-  echo " │  6.) > BACKUP/RESTORE    12.) > UNINSTALL"
-  echo " │  13.) > UNLOCK ACCOUNT"
+  echo " │  1.) > MENU AKUN         5.) > MONITOR USER LOCK"
+  echo " │  2.) > SERVICE MENU      6.) > MONITOR USER LOGIN"
+  echo " │  3.) > BACKUP/RESTORE    7.) > TOOLS"
+  echo " │  4.) > CHANGE DOMAIN"
   echo " │  m.) > MENU UTAMA"
   echo " │  x.) > EXIT"
   echo " └─────────────────────────────────────────────────"
@@ -4431,25 +4797,19 @@ while true; do
     echo " ─────────────────────────────────────────────────"
   fi
   echo
-  if ! prompt_input m "Select From Options [1-13, m, x] : "; then
+  if ! prompt_input m "Select From Options [1-7, m, x] : "; then
     SHOW_FULL_MENU=0
     continue
   fi
   clear
   case "$m" in
-    1) create_account ;;
-    2) renew_account ;;
-    3) delete_account ;;
-    4) list_accounts ;;
-    5) service_menu ;;
-    6) backup_restore_menu ;;
-    7) change_domain_menu ;;
-    8) monitor_temp_lock_menu ;;
-    9) monitor_online_menu ;;
-    10) test_speed_vps ;;
-    11) update_script_from_repo ;;
-    12) /usr/local/sbin/uninstall-sc-1forcr ;;
-    13) unlock_account ;;
+    1) akun_menu ;;
+    2) service_menu ;;
+    3) backup_restore_menu ;;
+    4) change_domain_menu ;;
+    5) monitor_temp_lock_menu ;;
+    6) monitor_online_menu ;;
+    7) tools_menu ;;
     m|M)
       SHOW_FULL_MENU=1
       continue
@@ -4590,12 +4950,52 @@ post_install_preflight() {
 EOF
 }
 
+show_install_banner() {
+  cat <<'EOF'
+=========================================
+AutoScript 1FORCR Nexus sedang di install
+harap tunggu :)
+=========================================
+EOF
+}
+
+show_install_progress() {
+  local pct="$1"
+  local msg="$2"
+  local width filled empty
+  local bar_filled bar_empty
+
+  width=40
+  filled=$((pct * width / 100))
+  empty=$((width - filled))
+  bar_filled="$(printf '%*s' "${filled}" '' | tr ' ' '=')"
+  bar_empty="$(printf '%*s' "${empty}" '' | tr ' ' '-')"
+
+  printf '[%s%s] %3d%% | %s\n' "${bar_filled}" "${bar_empty}" "${pct}" "${msg}"
+}
+
+open_menu_after_install() {
+  if [[ -x /usr/local/sbin/menu-sc-1forcr && -t 0 && -t 1 ]]; then
+    echo
+    echo "Membuka menu SC 1FORCR..."
+    /usr/local/sbin/menu-sc-1forcr || true
+  else
+    echo
+    echo "Install selesai. Jalankan perintah: menu"
+  fi
+}
+
 main() {
+  show_install_banner
+  show_install_progress 0 "Tunggu dulu mas, proses baru mulai..."
+
   check_supported_os
   install_base_packages
   setup_vnstat
   apply_system_optimizations
   setup_logrotate_optimizations
+  show_install_progress 20 "Tahan mas, baru setengah jalan awal..."
+
   install_node_if_missing
   install_go_if_missing
   install_xray
@@ -4608,6 +5008,8 @@ main() {
   setup_udpcustom_service_if_possible
   setup_udpcustom_udp_nat_rules
   enforce_single_udp_backend
+  show_install_progress 70 "Hampir selesai mas, core service sudah kepasang..."
+
   write_api_files
   write_go_mux_files
   build_go_files
@@ -4615,14 +5017,17 @@ main() {
   setup_services
   setup_udp_bootfix_service
   setup_auto_reboot_timer
+  show_install_progress 90 "Sedikit lagi, finishing konfigurasi..."
+
   write_cli_menu
   write_version_marker
   post_install_preflight
+  show_install_progress 100 "Berhasil keinstall semua. Selamat, SC anda sudah selesai terinstall. Cobain mas."
 
   cat <<EOF
 
 =========================================
-SELESAI - SC 1FORCR TERPASANG
+SELESAI - SC 1FORCR NEXUS TERPASANG
 =========================================
 Script Version : ${SCRIPT_VERSION}
 Domain         : ${DOMAIN}
@@ -4639,7 +5044,9 @@ curl -s -X POST "https://${DOMAIN}/vps/sshvpn" \\
   -d '{"username":"test123","password":"test123","expired":3,"limitip":"2","kuota":"0"}'
 
 Catatan:
-- Endpoint /vps/* sudah kompatibel pola bot kamu (create/trial/renew/delete/lock/unlock).
+- SC 1FORCR Nexus ini bersifat gratis, bebas dipakai, dan open source.
+- Tidak ada lisensi komersial wajib; silakan modifikasi sesuai kebutuhan.
+- Endpoint /vps/* sudah kompatibel pola bot 1FORCR (create/trial/renew/delete/lock/unlock).
 - WS paths aktif: /ssh-ws, /ws, /vmess, /vless, /trojan (port 80 & 443)
 - Dropbear aktif di port ${DROPBEAR_PORT} dan ${DROPBEAR_ALT_PORT}; ssh-ws bridge default ke ${DROPBEAR_PORT}
 - SSH mux runtime sudah pakai Go binary: ${APP_DIR}/bin/ssh-mux
@@ -4654,10 +5061,11 @@ Catatan:
 - Reboot hanya menjalankan sync + reboot (tanpa ubah konfigurasi layanan).
 - UDP boot-fix aktif via systemd sc-1forcr-udp-bootfix.service (re-apply backend/rule saat startup).
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
-- Update sekali klik dari menu: isi UPDATE_SCRIPT_URL lalu pilih menu 11 (Update Script dari Repo)
-- Uninstall helper: uninstall-sc-1forcr
+- Update sekali klik dari menu: isi UPDATE_SCRIPT_URL lalu gunakan Tools -> Update Script
 - Auto lock IP limit: timer systemd sc-1forcr-iplimit.timer (cek tiap 10 menit, lock sementara 15 menit)
 EOF
+
+  open_menu_after_install
 }
 
 main "$@"
