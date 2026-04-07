@@ -1,21 +1,22 @@
-# SC 1FORCR AutoScript
+# SC 1FORCR Nexus AutoScript
 
-AutoScript untuk VPS Debian 12+ / Ubuntu 22+ dengan fitur:
+AutoScript gratis dan open source untuk VPS dengan fitur:
 
-- SSH
+- SSH (OpenSSH + Dropbear)
 - VMess / VLESS / Trojan (Xray)
-- UDP + ZIVPN
-- Nginx + SSL Let's Encrypt
-- API kompatibel endpoint `/vps/*` (agar bot lama tetap jalan)
+- UDP backend: ZIVPN atau UDP Custom (single active backend)
+- Nginx + Let's Encrypt + HAProxy TLS mux
+- API kompatibel endpoint dengan bot 1FORCR`/vps/*` (bot lama tetap jalan)
 - Menu CLI `menu` / `menu-sc-1forcr`
-- Auto lock sementara 15 menit jika pemakaian IP melebihi `limitip` (cek tiap 15 menit)
+- Trial account (auto-delete 1 jam dari menu akun)
+- Auto lock sementara 15 menit saat melampaui `limitip`
 
 ---
 
 ## 1) Requirement
 
-- OS: Debian 12+ atau Ubuntu 22+
-- Domain sudah diarahkan ke IP VPS (A record)
+- OS: Debian 10+ atau Ubuntu 20+
+- Domain sudah diarahkan ke IP VPS (A record) di cloudflare
 - Jalankan sebagai `root`
 
 ---
@@ -43,81 +44,119 @@ atau:
 menu-sc-1forcr
 ```
 
-Menu utama:
+### Menu utama
 
-1. Add Account  
-2. Renew Account  
-3. Delete Account  
-4. List Account  
-5. Service Menu  
-6. Backup/Restore ZIVPN Config  
-7. Ganti Domain + Renew SSL  
-8. Monitor Lock Sementara (IP Limit)  
-9. Uninstall SC 1FORCR
+1. Menu Akun
+2. Service Menu
+3. Backup/Restore
+4. Change Domain
+5. Monitor User Lock
+6. Monitor User Login
+7. Tools
+
+### Menu Akun
+
+1. Add Account
+2. Trial Account (1 jam)
+3. Renew Account
+4. Edit Limit IP
+5. Delete Account
+6. List Account (termasuk kolom `LIM_IP`)
+7. Unlock Account
+
+### Tools
+
+1. Informasi Key SC
+2. Install API Summary 1FORCR
+3. Setting Banner HTML (SSH/Dropbear)
+4. Update Script
 
 ---
 
-## 4) Service yang dipakai
+## 4) Endpoint API yang dipakai bot
+
+Contoh endpoint utama:
+
+- SSH/ZIVPN:
+  - Create: `/vps/sshvpn`
+  - Trial: `/vps/trialsshvpn`
+  - Renew: `/vps/renewsshvpn/:username/:exp`
+  - Delete: `/vps/deletesshvpn/:username`
+- VMess:
+  - `/vps/vmessall`, `/vps/trialvmessall`, `/vps/renewvmess/:username/:exp`, `/vps/deletevmess/:username`
+- VLESS:
+  - `/vps/vlessall`, `/vps/trialvlessall`, `/vps/renewvless/:username/:exp`, `/vps/deletevless/:username`
+- Trojan:
+  - `/vps/trojanall`, `/vps/trialtrojanall`, `/vps/renewtrojan/:username/:exp`, `/vps/deletetrojan/:username`
+
+---
+
+## 5) Service yang dipakai
 
 - `sc-1forcr-api.service`
+- `sc-1forcr-sshws.service`
 - `sc-1forcr-iplimit.timer`
 - `sc-1forcr-iplimit.service`
+- `sc-1forcr-autoreboot.timer`
+- `sc-1forcr-udp-bootfix.service`
 - `xray.service`
 - `nginx.service`
+- `haproxy.service`
 - `ssh.service`
-- `zivpn.service` (jika binary tersedia)
+- `dropbear.service`
+- `zivpn.service` atau `sc-1forcr-udpcustom.service`
 
 Cek status:
 
 ```bash
-systemctl status sc-1forcr-api sc-1forcr-iplimit.timer xray nginx ssh
+systemctl status sc-1forcr-api sc-1forcr-sshws sc-1forcr-iplimit.timer xray nginx haproxy ssh dropbear
 ```
 
 ---
 
-## 5) Uninstall
+## 6) Uninstall
 
-Dari menu: pilih nomor `9`, atau:
+Menu uninstall disembunyikan dari menu utama. Jika tetap dibutuhkan:
 
 ```bash
 uninstall-sc-1forcr
 ```
 
-> Uninstall ini tidak menghapus service inti seperti `nginx`, `xray`, `ssh`, `zivpn`.
+Catatan: uninstall helper tidak menghapus seluruh komponen sistem inti (`nginx`, `xray`, `ssh`, cert, package apt, dll).
 
 ---
 
-## 6) Troubleshooting
+## 7) Troubleshooting
 
-### A) Certbot gagal (invalid email)
+### A) Certbot gagal
 
-Gunakan email valid (boleh Gmail), contoh:
-
-```bash
-EMAIL=namakamu@gmail.com
-```
-
-### B) Certbot gagal (domain belum resolve)
-
-- Pastikan A record domain ke IP VPS
-- Cek:
+- Pastikan domain A record sudah ke IP VPS.
+- Cek resolve:
 
 ```bash
 dig +short tes.prem-1forcr.shop
 ```
 
-### C) Cek log API
+### B) Cek log API
 
 ```bash
 journalctl -u sc-1forcr-api -f
 ```
 
-### D) Cek lock sementara IP-limit
+### C) Cek lock sementara IP-limit
 
-- dari menu pilih `8`
-- atau query DB:
+- Dari menu utama pilih `5) Monitor User Lock`
+- Atau query DB:
 
 ```bash
 sqlite3 /usr/sbin/potatonc/potato.db "SELECT * FROM temp_ip_locks;"
+```
+
+### D) ZIVPN/UDPHC setelah reboot
+
+- Pastikan service boot-fix aktif:
+
+```bash
+systemctl status sc-1forcr-udp-bootfix.service
 ```
 
