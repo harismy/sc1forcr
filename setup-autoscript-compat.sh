@@ -79,16 +79,8 @@ if [[ -z "${DOMAIN}" ]]; then
   exit 1
 fi
 
-if [[ -z "${EMAIL}" ]]; then
-  read -r -p "Masukkan email Let's Encrypt [admin@${DOMAIN}]: " EMAIL
-  EMAIL="${EMAIL:-admin@${DOMAIN}}"
-fi
-
-if [[ "${EMAIL}" == "admin@example.com" || "${EMAIL}" == *"@example.com" ]]; then
-  echo "EMAIL default ${EMAIL} tidak valid untuk Let's Encrypt."
-  echo "Gunakan email asli. Contoh: EMAIL=admin@${DOMAIN}"
-  exit 1
-fi
+# EMAIL opsional: jika kosong/invalid, certbot dijalankan tanpa email
+# dengan --register-unsafely-without-email.
 
 if [[ -z "${API_AUTH_TOKEN}" ]]; then
   API_AUTH_TOKEN="$(openssl rand -hex 24)"
@@ -464,7 +456,13 @@ EOF
   systemctl restart nginx
 
   log "Issue cert Let's Encrypt (webroot)..."
-  if ! certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}"; then
+  local certbot_email_arg
+  if [[ -z "${EMAIL}" || "${EMAIL}" == "admin@example.com" || "${EMAIL}" == *"@example.com" ]]; then
+    certbot_email_arg="--register-unsafely-without-email"
+  else
+    certbot_email_arg="-m ${EMAIL}"
+  fi
+  if ! certbot certonly --webroot -w /var/www/html -d "${DOMAIN}" --non-interactive --agree-tos ${certbot_email_arg}; then
     log "Let's Encrypt gagal. Lanjut tanpa TLS 443 (haproxy belum diaktifkan)."
   fi
 }
@@ -4358,7 +4356,7 @@ update_script_from_repo() {
 
   echo "Menjalankan update installer..."
   DOMAIN="${DOMAIN}" \
-  EMAIL="${EMAIL:-admin@${DOMAIN}}" \
+  EMAIL="${EMAIL:-}" \
   API_AUTH_TOKEN="${AUTH_TOKEN}" \
   UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL}" \
   DB_PATH="${DB_PATH}" \
@@ -4628,7 +4626,7 @@ SELESAI - SC 1FORCR TERPASANG
 =========================================
 Script Version : ${SCRIPT_VERSION}
 Domain         : ${DOMAIN}
-Email LE       : ${EMAIL}
+Email LE       : ${EMAIL:-without-email}
 DB Path        : ${DB_PATH}
 API Token      : ${API_AUTH_TOKEN}
 API Base       : https://${DOMAIN}/vps
