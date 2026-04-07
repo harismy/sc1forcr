@@ -145,13 +145,14 @@ install_optional_pkg_if_available() {
 install_base_packages() {
   log "Install paket dasar..."
   apt-get update -y
-  apt-get install -y \
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
     curl wget jq sqlite3 openssl uuid-runtime ca-certificates \
     gnupg lsb-release socat cron unzip \
     haproxy \
     nginx certbot \
     openssh-server dropbear pwgen \
-    build-essential python3 make g++ gcc libc6-dev pkg-config bzip2 zlib1g-dev
+    build-essential python3 make g++ gcc libc6-dev pkg-config bzip2 zlib1g-dev \
+    netfilter-persistent iptables-persistent
 
   # Paket opsional (beberapa distro/repo lama tidak selalu menyediakan).
   install_optional_pkg_if_available python3-certbot-nginx || true
@@ -2492,6 +2493,156 @@ EOF
   systemctl restart dropbear || true
 }
 
+setup_udp_bootfix_service() {
+  log "Setup UDP boot-fix service..."
+
+  cat > /usr/local/sbin/sc-1forcr-udp-bootfix <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/sc-1forcr.env"
+[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
+
+ZIVPN_SERVICE="${ZIVPN_SERVICE:-zivpn}"
+UDPCUSTOM_SERVICE="${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}"
+ACTIVE_UDP_BACKEND="$(echo "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
+ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
+UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
+UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-6000:6999}"
+
+fw_backend_kind() {
+  if command -v iptables >/dev/null 2>&1; then
+    echo "iptables"
+    return 0
+  fi
+  if command -v nft >/dev/null 2>&1; then
+    echo "nft"
+    return 0
+  fi
+  echo "none"
+}
+
+fw_allow_udp_input() {
+  local port="$1"
+  case "$(fw_backend_kind)" in
+    iptables)
+      iptables -C INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || \
+        iptables -I INPUT -p udp --dport "${port}" -j ACCEPT
+      ;;
+    nft)
+      if nft list chain inet filter input >/dev/null 2>&1; then
+        nft list chain inet filter input | grep -F -- "udp dport ${port} accept" >/dev/null 2>&1 || \
+          nft add rule inet filter input udp dport "${port}" accept
+      elif nft list chain ip filter input >/dev/null 2>&1; then
+        nft list chain ip filter input | grep -F -- "udp dport ${port} accept" >/dev/null 2>&1 || \
+          nft add rule ip filter input udp dport "${port}" accept
+      fi
+      ;;
+  esac
+}
+
+fw_add_udp_dnat_range() {
+  local range="$1" to_port="$2"
+  [[ -z "${range}" ]] && return 0
+  case "$(fw_backend_kind)" in
+    iptables)
+      iptables -t nat -C PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1 || \
+        iptables -t nat -I PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}"
+      ;;
+    nft)
+      local range_nft
+      range_nft="${range/:/-}"
+      nft add table ip nat >/dev/null 2>&1 || true
+      nft 'add chain ip nat prerouting { type nat hook prerouting priority dstnat; }' >/dev/null 2>&1 || true
+      nft list chain ip nat prerouting 2>/dev/null | grep -F -- "udp dport ${range_nft} dnat to :${to_port}" >/dev/null 2>&1 || \
+        nft add rule ip nat prerouting udp dport "${range_nft}" dnat to ":${to_port}"
+      ;;
+  esac
+}
+
+fw_delete_udp_dnat_range() {
+  local range="$1" to_port="$2"
+  [[ -z "${range}" ]] && return 0
+  case "$(fw_backend_kind)" in
+    iptables)
+      while iptables -t nat -C PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1; do
+        iptables -t nat -D PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1 || break
+      done
+      ;;
+    nft)
+      local range_nft handle
+      range_nft="${range/:/-}"
+      while IFS= read -r handle; do
+        [[ -z "${handle}" ]] && continue
+        nft delete rule ip nat prerouting handle "${handle}" >/dev/null 2>&1 || true
+      done < <(
+        nft -a list chain ip nat prerouting 2>/dev/null | \
+          awk -v sig="udp dport ${range_nft} dnat to :${to_port}" '$0 ~ sig {for (i=1;i<=NF;i++) if ($i=="handle") print $(i+1)}'
+      )
+      ;;
+  esac
+}
+
+fw_persist_rules() {
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+    return 0
+  fi
+  if command -v nft >/dev/null 2>&1 && systemctl is-enabled --quiet nftables 2>/dev/null; then
+    nft list ruleset >/etc/nftables.conf 2>/dev/null || true
+  fi
+  return 0
+}
+
+zivpn_port="$(jq -r '.listen // empty' /etc/zivpn/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
+[[ -z "${zivpn_port}" ]] && zivpn_port="5667"
+udphc_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
+[[ -z "${udphc_port}" ]] && udphc_port="5667"
+
+case "${ACTIVE_UDP_BACKEND}" in
+  udpcustom|udp-custom|udphc)
+    systemctl disable --now "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+    systemctl enable "${UDPCUSTOM_SERVICE}" >/dev/null 2>&1 || true
+    systemctl restart "${UDPCUSTOM_SERVICE}" >/dev/null 2>&1 || true
+    fw_allow_udp_input "${udphc_port}"
+    range="${UDPCUSTOM_DNAT_RANGE}"
+    [[ -z "${range}" ]] && range="${UDPCUSTOM_DNAT_AUTO_RANGE}"
+    fw_add_udp_dnat_range "${range}" "${udphc_port}"
+    fw_delete_udp_dnat_range "${ZIVPN_DNAT_RANGE}" "${udphc_port}"
+    ;;
+  *)
+    systemctl disable --now "${UDPCUSTOM_SERVICE}" >/dev/null 2>&1 || true
+    systemctl enable "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+    systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+    fw_allow_udp_input "${zivpn_port}"
+    fw_add_udp_dnat_range "${ZIVPN_DNAT_RANGE}" "${zivpn_port}"
+    ;;
+esac
+
+fw_persist_rules
+EOF
+  chmod +x /usr/local/sbin/sc-1forcr-udp-bootfix
+
+  cat > /etc/systemd/system/sc-1forcr-udp-bootfix.service <<'EOF'
+[Unit]
+Description=SC 1FORCR UDP Boot Fix
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-udp-bootfix
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
+}
+
 setup_auto_reboot_timer() {
   log "Setup auto reboot harian jam 03:00..."
 
@@ -4346,6 +4497,8 @@ systemctl stop sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-autoreboot.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-autoreboot.service >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udpcustom >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-udpcustom >/dev/null 2>&1 || true
 systemctl stop udp-custom >/dev/null 2>&1 || true
@@ -4356,6 +4509,7 @@ rm -f /etc/systemd/system/sc-1forcr-iplimit.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.timer
 rm -f /etc/systemd/system/sc-1forcr-autoreboot.service
 rm -f /etc/systemd/system/sc-1forcr-autoreboot.timer
+rm -f /etc/systemd/system/sc-1forcr-udp-bootfix.service
 rm -f /etc/systemd/system/sc-1forcr-udpcustom.service
 rm -f /etc/systemd/system/potato-compat-api.service
 systemctl daemon-reload
@@ -4370,6 +4524,7 @@ rm -f /usr/local/sbin/menu
 rm -f /usr/local/sbin/uninstall-sc-1forcr
 rm -f /usr/local/sbin/uninstall-potato-compat
 rm -f /usr/local/sbin/sc-1forcr-safe-reboot
+rm -f /usr/local/sbin/sc-1forcr-udp-bootfix
 
 echo "Uninstall SC 1FORCR selesai."
 echo "Catatan: layanan inti (ssh/nginx/xray/zivpn) tidak dihapus otomatis."
@@ -4460,6 +4615,7 @@ main() {
   build_go_files
   write_iplimit_checker
   setup_services
+  setup_udp_bootfix_service
   setup_auto_reboot_timer
   write_cli_menu
   write_version_marker
@@ -4498,6 +4654,7 @@ Catatan:
 - vnStat dan speedtest-cli otomatis terpasang untuk monitoring trafik + tes speed VPS.
 - Auto reboot aktif setiap hari jam 03:00 via systemd timer sc-1forcr-autoreboot.timer.
 - Reboot hanya menjalankan sync + reboot (tanpa ubah konfigurasi layanan).
+- UDP boot-fix aktif via systemd sc-1forcr-udp-bootfix.service (re-apply backend/rule saat startup).
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
 - Update sekali klik dari menu: isi UPDATE_SCRIPT_URL lalu pilih menu 11 (Update Script dari Repo)
 - Uninstall helper: uninstall-sc-1forcr
