@@ -5078,23 +5078,20 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_ssh_count tmp_status tmp_hc_pids tmp_ssh_hc_pid_count tmp_ssh_merge tmp_sshd_pairs dropbear_main_port dropbear_alt_port
+  local tmp_a tmp_b tmp_hc_pids tmp_ssh_count tmp_status dropbear_main_port dropbear_alt_port
+  tmp_a="$(mktemp)"
+  tmp_b="$(mktemp)"
+  tmp_hc_pids="$(mktemp)"
   tmp_ssh_count="$(mktemp)"
   tmp_status="$(mktemp)"
-  tmp_hc_pids="$(mktemp)"
-  tmp_ssh_hc_pid_count="$(mktemp)"
-  tmp_ssh_merge="$(mktemp)"
-  tmp_sshd_pairs="$(mktemp)"
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
   [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
   [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
-  trap 'rm -f "${tmp_ssh_count:-}" "${tmp_status:-}" "${tmp_hc_pids:-}" "${tmp_ssh_hc_pid_count:-}" "${tmp_ssh_merge:-}" "${tmp_sshd_pairs:-}"' RETURN
+  trap 'rm -f "${tmp_a:-}" "${tmp_b:-}" "${tmp_hc_pids:-}" "${tmp_ssh_count:-}" "${tmp_status:-}"' RETURN
 
-  : > "${tmp_ssh_count}"
-  : > "${tmp_sshd_pairs}"
-
-  # Hitung sesi SSH native dari socket :22 -> pid sshd -> username.
+  # SC1-SSH-REALTIME-EXACT-MERGE:
+  # sengaja samakan 1:1 dengan command manual di VPS yang sudah terbukti menghasilkan data.
   ss -Htnp state established 2>/dev/null | awk '
     {
       local_addr=$4;
@@ -5112,10 +5109,8 @@ show_ssh_only_online() {
         s=substr(s, RSTART + RLENGTH);
       }
     }' | sort -u | while read -r pid ip; do
-      [[ -n "${pid:-}" && -n "${ip:-}" ]] || continue
-      user="$(ps -o args= -p "${pid}" 2>/dev/null | awk '
-        {
-          if ($0 !~ /^sshd:[[:space:]]+/) next;
+      user="$(ps -o args= -p "$pid" 2>/dev/null | awk '
+        /^sshd:[[:space:]]+/ {
           if ($0 ~ /\[priv\]/ || $0 ~ /\[preauth\]/ || $0 ~ /\[listener\]/ || $0 ~ /\[accepted\]/) next;
           u=$0;
           sub(/^sshd:[[:space:]]*/, "", u);
@@ -5125,15 +5120,9 @@ show_ssh_only_online() {
           u=tolower(u);
           if (u ~ /^[a-z0-9._-]+$/ && u != "root" && u != "priv" && u != "net") print u;
         }' | head -n1)"
-      [[ -n "${user:-}" ]] || continue
-      printf '%s %s\n' "${user}" "${ip}"
-    done | sort -u > "${tmp_sshd_pairs}" || true
+      [[ -n "$user" ]] && printf '%s %s\n' "$user" "$ip"
+    done | awk '{cnt[$1]++} END {for (u in cnt) print u, cnt[u]}' > "${tmp_a}"
 
-  awk '{ if ($1 ~ /^[a-z0-9._-]+$/ && $2 != "") cnt[$1]++ } END { for (u in cnt) print u, cnt[u]; }' "${tmp_sshd_pairs}" > "${tmp_ssh_count}" || true
-
-  # SC1-SSH-REALTIME-PID-ONLY:
-  # untuk jalur HC/WS, pakai mapping PID dropbear aktif yang sudah terbukti cocok
-  # dengan command debug manual di VPS user.
   ss -Htnp state established 2>/dev/null | awk '
     {
       l=$4; r=$5;
@@ -5152,7 +5141,6 @@ show_ssh_only_online() {
     }' | sort -u > "${tmp_hc_pids}" || true
 
   if [[ -s "${tmp_hc_pids}" ]]; then
-    # Samakan persis dengan command debug yang sudah terbukti mengeluarkan "haris2 2".
     journalctl -u dropbear -n 50000 --no-pager 2>/dev/null | \
       awk '
         NR==FNR { p[$1]=1; next }
@@ -5175,22 +5163,19 @@ show_ssh_only_online() {
           cnt[u]++;
         }
         END { for (u in cnt) print u, cnt[u]; }
-      ' "${tmp_hc_pids}" - > "${tmp_ssh_hc_pid_count}" || true
+      ' "${tmp_hc_pids}" - > "${tmp_b}" || true
   fi
 
-  if [[ -s "${tmp_ssh_hc_pid_count}" ]]; then
-    awk '
-      NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
-      { b[$1]=$2+0; seen[$1]=1 }
-      END {
-        for (u in seen) {
-          x=(u in a ? a[u] : 0);
-          y=(u in b ? b[u] : 0);
-          print u, (x > y ? x : y);
-        }
-      }' "${tmp_ssh_count}" "${tmp_ssh_hc_pid_count}" > "${tmp_ssh_merge}" || true
-    mv -f "${tmp_ssh_merge}" "${tmp_ssh_count}"
-  fi
+  awk '
+    NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
+    { b[$1]=$2+0; seen[$1]=1 }
+    END {
+      for (u in seen) {
+        x=(u in a ? a[u] : 0);
+        y=(u in b ? b[u] : 0);
+        print u, (x > y ? x : y);
+      }
+    }' "${tmp_a}" "${tmp_b}" > "${tmp_ssh_count}" || true
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
