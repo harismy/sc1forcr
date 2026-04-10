@@ -5078,12 +5078,10 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_ssh_count tmp_status tmp_hc_ports tmp_hc_pids tmp_ssh_hc_count tmp_ssh_hc_pid_count tmp_ssh_merge tmp_sshd_pairs dropbear_main_port dropbear_alt_port
+  local tmp_ssh_count tmp_status tmp_hc_pids tmp_ssh_hc_pid_count tmp_ssh_merge tmp_sshd_pairs dropbear_main_port dropbear_alt_port
   tmp_ssh_count="$(mktemp)"
   tmp_status="$(mktemp)"
-  tmp_hc_ports="$(mktemp)"
   tmp_hc_pids="$(mktemp)"
-  tmp_ssh_hc_count="$(mktemp)"
   tmp_ssh_hc_pid_count="$(mktemp)"
   tmp_ssh_merge="$(mktemp)"
   tmp_sshd_pairs="$(mktemp)"
@@ -5091,7 +5089,7 @@ show_ssh_only_online() {
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
   [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
   [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
-  trap 'rm -f "${tmp_ssh_count:-}" "${tmp_status:-}" "${tmp_hc_ports:-}" "${tmp_hc_pids:-}" "${tmp_ssh_hc_count:-}" "${tmp_ssh_hc_pid_count:-}" "${tmp_ssh_merge:-}" "${tmp_sshd_pairs:-}"' RETURN
+  trap 'rm -f "${tmp_ssh_count:-}" "${tmp_status:-}" "${tmp_hc_pids:-}" "${tmp_ssh_hc_pid_count:-}" "${tmp_ssh_merge:-}" "${tmp_sshd_pairs:-}"' RETURN
 
   : > "${tmp_ssh_count}"
   : > "${tmp_sshd_pairs}"
@@ -5133,21 +5131,9 @@ show_ssh_only_online() {
 
   awk '{ if ($1 ~ /^[a-z0-9._-]+$/ && $2 != "") cnt[$1]++ } END { for (u in cnt) print u, cnt[u]; }' "${tmp_sshd_pairs}" > "${tmp_ssh_count}" || true
 
-  # HC/WS path often authenticates via dropbear with loopback source (127.0.0.1),
-  # so count active auth sessions by matching dropbear auth log with live ESTAB ports.
-  ss -Htnp state established 2>/dev/null | awk '
-    {
-      l=$4; r=$5;
-      lip=l; rip=r;
-      sub(/.*:/, "", l);
-      sub(/.*:/, "", r);
-      gsub(/^\[/, "", lip); gsub(/\]$/, "", lip); sub(/:[0-9]+$/, "", lip);
-      gsub(/^\[/, "", rip); gsub(/\]$/, "", rip); sub(/:[0-9]+$/, "", rip);
-      if ((l=="'"${dropbear_main_port}"'" || l=="'"${dropbear_alt_port}"'") && (rip=="127.0.0.1" || rip=="::1")) print r;
-      else if ((r=="'"${dropbear_main_port}"'" || r=="'"${dropbear_alt_port}"'") && (lip=="127.0.0.1" || lip=="::1")) print l;
-    }' | sed -E 's/.*:([0-9]+)$/\1/' | awk '/^[0-9]+$/' | sort -u > "${tmp_hc_ports}" || true
-
-  # Mapping yang lebih stabil: ambil PID child dropbear yang benar-benar memegang sesi aktif.
+  # SC1-SSH-REALTIME-PID-ONLY:
+  # untuk jalur HC/WS, pakai mapping PID dropbear aktif yang sudah terbukti cocok
+  # dengan command debug manual di VPS user.
   ss -Htnp state established 2>/dev/null | awk '
     {
       l=$4; r=$5;
@@ -5165,45 +5151,8 @@ show_ssh_only_online() {
       }
     }' | sort -u > "${tmp_hc_pids}" || true
 
-  if [[ -s "${tmp_hc_ports}" ]]; then
-    journalctl -u dropbear -n 50000 --no-pager 2>/dev/null | \
-      awk '
-        BEGIN { q=sprintf("%c",39); dq=sprintf("%c",34); }
-        NR==FNR { p[$1]=1; next }
-        {
-          line=$0;
-          low=tolower(line);
-          if (index(low, "auth succeeded for ") == 0) next;
-
-          u=line;
-          sub(/^.*[Aa]uth succeeded for /, "", u);
-          if (substr(u,1,1) == q || substr(u,1,1) == dq) {
-            quote=substr(u,1,1);
-            sub("^" quote, "", u);
-            sub(quote ".*$", "", u);
-          } else {
-            sub(/[[:space:]].*$/, "", u);
-          }
-          u=tolower(u);
-
-          prt=line;
-          if (prt !~ / from /) next;
-          sub(/^.* from .*:/, "", prt);
-          gsub(/[[:space:]]+/, "", prt);
-          if (prt !~ /^[0-9]+$/) next;
-
-          if (!(prt in p)) next;
-          if (u !~ /^[a-z0-9._-]+$/) next;
-          if (u=="root" || u=="priv" || u=="net") next;
-          cnt[u]++;
-        }
-        END { for (u in cnt) print u, cnt[u]; }
-      ' "${tmp_hc_ports}" - > "${tmp_ssh_hc_count}" || true
-  fi
-
   if [[ -s "${tmp_hc_pids}" ]]; then
-    # Samakan persis dengan command debug yang sudah terbukti mengeluarkan "haris2"
-    # pada VPS user, lalu agregasikan per-user.
+    # Samakan persis dengan command debug yang sudah terbukti mengeluarkan "haris2 2".
     journalctl -u dropbear -n 50000 --no-pager 2>/dev/null | \
       awk '
         NR==FNR { p[$1]=1; next }
@@ -5227,24 +5176,6 @@ show_ssh_only_online() {
         }
         END { for (u in cnt) print u, cnt[u]; }
       ' "${tmp_hc_pids}" - > "${tmp_ssh_hc_pid_count}" || true
-  fi
-
-  # Jangan jadikan hasil PID hanya sebagai kandidat tambahan.
-  # Di kasus user, justru file inilah yang terbukti paling akurat (`haris2 2`).
-  if [[ -s "${tmp_ssh_hc_pid_count}" && -s "${tmp_ssh_hc_count}" ]]; then
-    awk '
-      NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
-      { b[$1]=$2+0; seen[$1]=1 }
-      END {
-        for (u in seen) {
-          x=(u in a ? a[u] : 0);
-          y=(u in b ? b[u] : 0);
-          print u, (x > y ? x : y);
-        }
-      }' "${tmp_ssh_hc_count}" "${tmp_ssh_hc_pid_count}" > "${tmp_ssh_merge}" || true
-    mv -f "${tmp_ssh_merge}" "${tmp_ssh_hc_pid_count}"
-  elif [[ -s "${tmp_ssh_hc_count}" && ! -s "${tmp_ssh_hc_pid_count}" ]]; then
-    cp -f "${tmp_ssh_hc_count}" "${tmp_ssh_hc_pid_count}" >/dev/null 2>&1 || true
   fi
 
   if [[ -s "${tmp_ssh_hc_pid_count}" ]]; then
