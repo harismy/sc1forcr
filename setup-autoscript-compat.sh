@@ -5229,25 +5229,9 @@ show_ssh_only_online() {
       ' "${tmp_hc_pids}" - > "${tmp_ssh_hc_pid_count}" || true
   fi
 
-  if [[ -s "${tmp_ssh_hc_pid_count}" ]]; then
-    if [[ -s "${tmp_ssh_hc_count}" ]]; then
-      awk '
-        NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
-        { b[$1]=$2+0; seen[$1]=1 }
-        END {
-          for (u in seen) {
-            x=(u in a ? a[u] : 0);
-            y=(u in b ? b[u] : 0);
-            print u, (x > y ? x : y);
-          }
-        }' "${tmp_ssh_hc_count}" "${tmp_ssh_hc_pid_count}" > "${tmp_ssh_merge}" || true
-      mv -f "${tmp_ssh_merge}" "${tmp_ssh_hc_count}"
-    else
-      cp -f "${tmp_ssh_hc_pid_count}" "${tmp_ssh_hc_count}" >/dev/null 2>&1 || true
-    fi
-  fi
-
-  if [[ -s "${tmp_ssh_hc_count}" ]]; then
+  # Jangan jadikan hasil PID hanya sebagai kandidat tambahan.
+  # Di kasus user, justru file inilah yang terbukti paling akurat (`haris2 2`).
+  if [[ -s "${tmp_ssh_hc_pid_count}" && -s "${tmp_ssh_hc_count}" ]]; then
     awk '
       NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
       { b[$1]=$2+0; seen[$1]=1 }
@@ -5257,7 +5241,23 @@ show_ssh_only_online() {
           y=(u in b ? b[u] : 0);
           print u, (x > y ? x : y);
         }
-      }' "${tmp_ssh_count}" "${tmp_ssh_hc_count}" > "${tmp_ssh_merge}" || true
+      }' "${tmp_ssh_hc_count}" "${tmp_ssh_hc_pid_count}" > "${tmp_ssh_merge}" || true
+    mv -f "${tmp_ssh_merge}" "${tmp_ssh_hc_pid_count}"
+  elif [[ -s "${tmp_ssh_hc_count}" && ! -s "${tmp_ssh_hc_pid_count}" ]]; then
+    cp -f "${tmp_ssh_hc_count}" "${tmp_ssh_hc_pid_count}" >/dev/null 2>&1 || true
+  fi
+
+  if [[ -s "${tmp_ssh_hc_pid_count}" ]]; then
+    awk '
+      NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
+      { b[$1]=$2+0; seen[$1]=1 }
+      END {
+        for (u in seen) {
+          x=(u in a ? a[u] : 0);
+          y=(u in b ? b[u] : 0);
+          print u, (x > y ? x : y);
+        }
+      }' "${tmp_ssh_count}" "${tmp_ssh_hc_pid_count}" > "${tmp_ssh_merge}" || true
     mv -f "${tmp_ssh_merge}" "${tmp_ssh_count}"
   fi
 
