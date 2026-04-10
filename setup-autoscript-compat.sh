@@ -32,6 +32,8 @@ set -euo pipefail
 #   DROPBEAR_PORT=109
 #   DROPBEAR_ALT_PORT=143
 #   DROPBEAR_VERSION=2019.78
+#   TELEGRAM_BOT_TOKEN=123456:ABC...            (opsional, notif aksi menu ke Telegram)
+#   TELEGRAM_CHAT_ID=-1001234567890             (opsional)
 #   DB_PATH=/usr/sbin/potatonc/potato.db
 #   APP_DIR=/opt/sc-1forcr
 
@@ -59,6 +61,8 @@ ACTIVE_UDP_BACKEND="${ACTIVE_UDP_BACKEND:-zivpn}"
 DROPBEAR_PORT="${DROPBEAR_PORT:-109}"
 DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
 DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
   echo "setup-autoscript-compat ${SCRIPT_VERSION}"
@@ -250,6 +254,7 @@ EOF
   mkdir -p /etc/systemd/system/dropbear.service.d
   cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
 [Service]
+Type=simple
 ExecStart=
 ExecStart=${custom_bin} -R -E -F -p ${main_port} -p ${alt_port}
 EOF
@@ -904,6 +909,13 @@ enforce_single_udp_backend() {
 }
 
 write_api_files() {
+  local ssh_ws_target_port
+  ssh_ws_target_port="$(echo "${DROPBEAR_PORT}" | tr -cd '0-9')"
+  [[ -z "${ssh_ws_target_port}" ]] && ssh_ws_target_port="109"
+  if [[ "${ssh_ws_target_port}" -lt 1 || "${ssh_ws_target_port}" -gt 65535 ]]; then
+    ssh_ws_target_port="109"
+  fi
+
   log "Menulis API kompatibilitas..."
   mkdir -p "${APP_DIR}"
 
@@ -930,7 +942,7 @@ AUTH_TOKEN=${API_AUTH_TOKEN}
 ZIVPN_CONFIG=/etc/zivpn/config.json
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
 SSH_WS_PORT=2082
-SSH_WS_TARGET_PORT=22
+SSH_WS_TARGET_PORT=${ssh_ws_target_port}
 SSH_HTTP_BACKEND_HOST=127.0.0.1
 SSH_HTTP_BACKEND_PORT=80
 UDPCUSTOM_CONFIG=/root/udp/config.json
@@ -2705,6 +2717,9 @@ EOF
 }
 
 write_cli_menu() {
+  local menu_runtime
+  menu_runtime="${APP_DIR}/menu-sc-1forcr.sh"
+
   log "Menulis CLI menu..."
 
   cat > /etc/sc-1forcr.env <<EOF
@@ -2723,10 +2738,13 @@ UDPCUSTOM_DNAT_RANGE=${UDPCUSTOM_DNAT_RANGE}
 UDPCUSTOM_DNAT_AUTO_RANGE=${UDPCUSTOM_DNAT_AUTO_RANGE}
 DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
+TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 EOF
   chmod 600 /etc/sc-1forcr.env
 
-  cat > /usr/local/sbin/menu-sc-1forcr <<'EOF'
+  mkdir -p "${APP_DIR}"
+  cat > "${menu_runtime}" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -2754,6 +2772,25 @@ api_call() {
   fi
 }
 
+telegram_notify() {
+  local text="$1"
+  [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]] && return 0
+  curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${TELEGRAM_CHAT_ID}" \
+    -d "disable_web_page_preview=true" \
+    --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+}
+
+telegram_notify_action() {
+  local action="$1" type="$2" username="$3"
+  telegram_notify "SC 1FORCR
+Action: ${action}
+Type: ${type}
+Username: ${username}
+Domain: ${DOMAIN}
+Time: $(date '+%F %T')"
+}
+
 cancelled() {
   echo
   echo "Dibatalkan. Kembali ke menu sebelumnya."
@@ -2766,6 +2803,32 @@ prompt_input() {
     return 130
   fi
   return 0
+}
+
+mask_secret() {
+  local s="$1" n
+  n="${#s}"
+  if [[ -z "${s}" ]]; then
+    echo "-"
+    return
+  fi
+  if [[ "${n}" -le 8 ]]; then
+    echo "****"
+    return
+  fi
+  echo "${s:0:4}****${s:n-4:4}"
+}
+
+update_sc_env_var() {
+  local key="$1" value="$2" tmp
+  tmp="$(mktemp)"
+  awk -v k="${key}" -v v="${value}" '
+    BEGIN { done=0 }
+    $0 ~ ("^" k "=") { print k "=" v; done=1; next }
+    { print }
+    END { if (!done) print k "=" v }
+  ' /etc/sc-1forcr.env > "${tmp}" && mv -f "${tmp}" /etc/sc-1forcr.env
+  chmod 600 /etc/sc-1forcr.env
 }
 
 pick_type() {
@@ -2922,7 +2985,7 @@ EOT_XRAY
 }
 
 create_account() {
-  local type ep username password exp limitip quota payload resp
+  local type ep username password exp limitip quota payload resp code
   while true; do
     type="$(pick_type)"
     [[ -z "$type" ]] && return
@@ -2960,6 +3023,8 @@ create_account() {
     fi
     resp="$(api_call "POST" "$ep" "$payload")"
     print_created_account "$type" "${resp}"
+    code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
+    [[ "${code}" == "200" ]] && telegram_notify_action "CREATE" "${type}" "${username}"
     return
   done
 }
@@ -3012,6 +3077,7 @@ create_trial_account() {
     code="$(echo "${resp}" | jq -r '.meta.code // empty' 2>/dev/null || true)"
     if [[ "${code}" == "200" ]]; then
       schedule_trial_delete_1h "${type}" "${username}"
+      telegram_notify_action "TRIAL_1H" "${type}" "${username}"
     fi
     return
   done
@@ -3065,15 +3131,15 @@ prompt_new_username() {
     prompt_input username "Username: " || return 1
     username="$(echo "${username}" | tr -d '[:space:]')"
     if [[ -z "${username}" ]]; then
-      echo "Username tidak boleh kosong."
+      echo "Username tidak boleh kosong." >&2
       continue
     fi
     if [[ ! "${username}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-      echo "Username hanya boleh huruf, angka, titik, underscore, dan dash."
+      echo "Username hanya boleh huruf, angka, titik, underscore, dan dash." >&2
       continue
     fi
     if username_exists_by_type "${type}" "${username}"; then
-      echo "Username '${username}' sudah ada di database. Coba username lain."
+      echo "Username '${username}' sudah ada di database. Coba username lain." >&2
       continue
     fi
     echo "${username}"
@@ -3199,6 +3265,7 @@ Sampai       : ${to_date}
 Quota        : ${quota}
 IP Limit     : ${limitip}
 EOT_RENEW
+  telegram_notify_action "RENEW" "${type}" "${username}"
 }
 
 delete_account() {
@@ -3218,6 +3285,7 @@ delete_account() {
     return
   fi
   echo "Akun ${type^^} '${username}' berhasil dihapus."
+  telegram_notify_action "DELETE" "${type}" "${username}"
 }
 
 unlock_account() {
@@ -3236,6 +3304,7 @@ unlock_account() {
     return
   fi
   echo "Akun ${type^^} '${username}' berhasil di-unlock."
+  telegram_notify_action "UNLOCK" "${type}" "${username}"
 }
 
 list_accounts() {
@@ -3362,9 +3431,10 @@ tools_menu() {
     echo "2) Install API Summary 1FORCR"
     echo "3) Setting Banner HTML"
     echo "4) Update Script"
+    echo "5) Setting Notif Telegram"
     echo "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-4]: "; then
+    if ! prompt_input tm "Pilih menu [0-5]: "; then
       return
     fi
     clear
@@ -3373,6 +3443,7 @@ tools_menu() {
       2) install_summary_api_1forcr ;;
       3) set_html_banner_menu ;;
       4) update_script_from_repo ;;
+      5) set_telegram_notif_config ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -4630,8 +4701,50 @@ show_sc_key_info() {
   echo "Domain        : ${DOMAIN}"
   echo "API Base      : https://${DOMAIN}/vps"
   echo "Auth Token    : ${AUTH_TOKEN}"
-  echo "DB Path       : ${DB_PATH}"
-  echo "Tabel servers : key='${AUTH_TOKEN}'"
+}
+
+set_telegram_notif_config() {
+  local token chat send_test ans
+  echo "=== SETTING NOTIF TELEGRAM ==="
+  echo "Bot Token     : $(mask_secret "${TELEGRAM_BOT_TOKEN:-}")"
+  echo "Chat ID       : ${TELEGRAM_CHAT_ID:-"-"}"
+  echo
+  echo "Kosongkan input untuk mempertahankan nilai lama."
+  echo "Ketik 'batal' untuk kembali."
+
+  if ! prompt_input token "TELEGRAM_BOT_TOKEN: "; then
+    return
+  fi
+  [[ "${token,,}" == "batal" ]] && return
+
+  if ! prompt_input chat "TELEGRAM_CHAT_ID: "; then
+    return
+  fi
+  [[ "${chat,,}" == "batal" ]] && return
+
+  if [[ -n "${token}" ]]; then
+    TELEGRAM_BOT_TOKEN="${token}"
+    update_sc_env_var "TELEGRAM_BOT_TOKEN" "${TELEGRAM_BOT_TOKEN}"
+  fi
+  if [[ -n "${chat}" ]]; then
+    TELEGRAM_CHAT_ID="${chat}"
+    update_sc_env_var "TELEGRAM_CHAT_ID" "${TELEGRAM_CHAT_ID}"
+  fi
+
+  echo "Konfigurasi Telegram tersimpan."
+  echo "Bot Token     : $(mask_secret "${TELEGRAM_BOT_TOKEN:-}")"
+  echo "Chat ID       : ${TELEGRAM_CHAT_ID:-"-"}"
+
+  if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+    if prompt_input ans "Kirim pesan test sekarang? [y/N]: "; then
+      if [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]; then
+        telegram_notify "Test notif SC 1FORCR
+Domain: ${DOMAIN}
+Time: $(date '+%F %T')"
+        echo "Pesan test dikirim (cek chat Telegram)."
+      fi
+    fi
+  fi
 }
 
 install_summary_api_1forcr() {
@@ -4649,7 +4762,18 @@ install_summary_api_1forcr() {
 }
 
 apply_html_banner_config() {
-  local banner_file="$1"
+  local banner_file="$1" main_port alt_port dropbear_bin
+
+  main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
+  alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
+  [[ -z "${main_port}" ]] && main_port="109"
+  [[ -z "${alt_port}" ]] && alt_port="143"
+  if [[ "${main_port}" -lt 1 || "${main_port}" -gt 65535 ]]; then main_port="109"; fi
+  if [[ "${alt_port}" -lt 1 || "${alt_port}" -gt 65535 ]]; then alt_port="143"; fi
+
+  # Prioritaskan binary custom build, fallback ke dropbear bawaan sistem.
+  dropbear_bin="$(ls -1 /usr/local/sbin/dropbear-* 2>/dev/null | head -n1 || true)"
+  [[ -z "${dropbear_bin}" || ! -x "${dropbear_bin}" ]] && dropbear_bin="/usr/sbin/dropbear"
 
   if [[ -n "${banner_file}" && -f "${banner_file}" ]]; then
     if grep -qE '^[[:space:]]*Banner[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null; then
@@ -4664,6 +4788,13 @@ apply_html_banner_config() {
         echo "DROPBEAR_BANNER=\"${banner_file}\"" >> /etc/default/dropbear
       fi
     fi
+    mkdir -p /etc/systemd/system/dropbear.service.d
+    cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
+[Service]
+Type=simple
+ExecStart=
+ExecStart=${dropbear_bin} -R -E -F -p ${main_port} -p ${alt_port} -b ${banner_file}
+EOF
     echo "Banner aktif: ${banner_file}"
   else
     if grep -qE '^[[:space:]]*Banner[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null; then
@@ -4674,9 +4805,17 @@ apply_html_banner_config() {
     if [[ -f /etc/default/dropbear ]] && grep -q '^DROPBEAR_BANNER=' /etc/default/dropbear; then
       sed -i 's|^DROPBEAR_BANNER=.*|DROPBEAR_BANNER=""|g' /etc/default/dropbear
     fi
+    mkdir -p /etc/systemd/system/dropbear.service.d
+    cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
+[Service]
+Type=simple
+ExecStart=
+ExecStart=${dropbear_bin} -R -E -F -p ${main_port} -p ${alt_port}
+EOF
     echo "Banner dinonaktifkan."
   fi
 
+  systemctl daemon-reload >/dev/null 2>&1 || true
   systemctl restart ssh >/dev/null 2>&1 || true
   systemctl restart dropbear >/dev/null 2>&1 || true
 }
@@ -4823,6 +4962,13 @@ while true; do
 done
 EOF
 
+  chmod +x "${menu_runtime}"
+
+  cat > /usr/local/sbin/menu-sc-1forcr <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+exec "${menu_runtime}" "\$@"
+EOF
   chmod +x /usr/local/sbin/menu-sc-1forcr
   ln -sf /usr/local/sbin/menu-sc-1forcr /usr/local/sbin/menu
 
