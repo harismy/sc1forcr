@@ -2757,64 +2757,92 @@ if [[ "${mode}" == "scheduled" ]]; then
 fi
 
 ts_wib="$(TZ=Asia/Jakarta date +%Y%m%d-%H%M%S)"
-archive="${AUTO_BACKUP_DIR}/sc1forcr-full-${ts_wib}-WIB.tar.gz"
-list_file="$(mktemp)"
-trap 'rm -f "${list_file}"' EXIT
+backup_json="${AUTO_BACKUP_DIR}/sc1forcr-accounts-${ts_wib}-WIB.json"
 
-add_if_exists() {
-  local p="$1"
-  if [[ -e "/${p}" ]]; then
-    printf '%s\n' "${p}" >> "${list_file}"
-  fi
-  return 0
-}
-
-add_if_exists "etc/sc-1forcr.env"
-add_if_exists "etc/sc-1forcr-version"
-add_if_exists "etc/sc-1forcr/banner.html"
-add_if_exists "etc/sc-1forcr/banner.txt"
-add_if_exists "opt/sc-1forcr/.env"
-add_if_exists "opt/sc-1forcr/VERSION"
-add_if_exists "opt/sc-1forcr/menu-sc-1forcr.sh"
-add_if_exists "usr/local/etc/xray/config.json"
-add_if_exists "etc/zivpn/config.json"
-add_if_exists "etc/zivpn/zivpn.crt"
-add_if_exists "etc/zivpn/zivpn.key"
-add_if_exists "root/udp/config.json"
-add_if_exists "etc/nginx/sites-available/sc-1forcr.conf"
-add_if_exists "etc/nginx/sites-enabled/sc-1forcr.conf"
-add_if_exists "etc/haproxy/haproxy.cfg"
-add_if_exists "etc/default/dropbear"
-add_if_exists "etc/systemd/system/dropbear.service.d/override.conf"
-add_if_exists "etc/ssh/sshd_config"
-add_if_exists "etc/systemd/system/sc-1forcr-api.service"
-add_if_exists "etc/systemd/system/sc-1forcr-sshws.service"
-add_if_exists "etc/systemd/system/sc-1forcr-iplimit.service"
-add_if_exists "etc/systemd/system/sc-1forcr-iplimit.timer"
-add_if_exists "etc/systemd/system/sc-1forcr-autoreboot.service"
-add_if_exists "etc/systemd/system/sc-1forcr-autoreboot.timer"
-add_if_exists "etc/systemd/system/sc-1forcr-udp-bootfix.service"
-add_if_exists "etc/systemd/system/sc-1forcr-autobackup.service"
-add_if_exists "etc/systemd/system/sc-1forcr-autobackup.timer"
-
-if [[ -f "${DB_PATH}" ]]; then
-  db_rel="${DB_PATH#/}"
-  add_if_exists "${db_rel}"
-fi
-
-if [[ -n "${DOMAIN}" ]]; then
-  add_if_exists "etc/letsencrypt/live/${DOMAIN}"
-  add_if_exists "etc/letsencrypt/archive/${DOMAIN}"
-  add_if_exists "etc/letsencrypt/renewal/${DOMAIN}.conf"
-fi
-
-if [[ ! -s "${list_file}" ]]; then
-  echo "Tidak ada file konfigurasi untuk dibackup."
+if [[ ! -f "${DB_PATH}" ]]; then
+  echo "DB tidak ditemukan: ${DB_PATH}"
   exit 1
 fi
 
-tar -czf "${archive}" -C / -T "${list_file}"
-chmod 600 "${archive}" >/dev/null 2>&1 || true
+python3 - "${DB_PATH}" "${DOMAIN}" "${backup_json}" <<'PY'
+import json
+import sqlite3
+import sys
+from datetime import datetime, timezone
+
+db_path = sys.argv[1]
+domain = sys.argv[2]
+out_path = sys.argv[3]
+
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+cur = conn.cursor()
+
+def fetch(table, cols):
+    q = "SELECT " + ",".join(cols) + f" FROM {table} ORDER BY username"
+    try:
+        rows = cur.execute(q).fetchall()
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        item = {}
+        for c in cols:
+            item[c] = r[c]
+        out.append(item)
+    return out
+
+payload = {
+    "meta": {
+        "format": "sc1forcr-accounts-backup-v1",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "source_domain": domain or "unknown",
+    },
+    "data": {
+        "ssh": fetch("account_sshs", ["username", "password", "date_exp", "status", "quota", "limitip"]),
+        "vmess": fetch("account_vmesses", ["username", "uuid", "date_exp", "status", "quota", "limitip"]),
+        "vless": fetch("account_vlesses", ["username", "uuid", "date_exp", "status", "quota", "limitip"]),
+        "trojan": fetch("account_trojans", ["username", "password", "date_exp", "status", "quota", "limitip"]),
+        "zivpn_auth": [],
+        "banner_html": "",
+        "banner_txt": "",
+    },
+}
+
+try:
+    with open("/etc/zivpn/config.json", "r", encoding="utf-8") as f:
+        zcfg = json.load(f)
+    auth = ((zcfg or {}).get("auth") or {}).get("config")
+    if isinstance(auth, list):
+        out = []
+        seen = set()
+        for item in auth:
+            v = str(item).strip().lower()
+            if not v or v in seen:
+                continue
+            seen.add(v)
+            out.append(v)
+        payload["data"]["zivpn_auth"] = out
+except Exception:
+    pass
+
+try:
+    with open("/etc/sc-1forcr/banner.html", "r", encoding="utf-8") as f:
+        payload["data"]["banner_html"] = f.read()
+except Exception:
+    pass
+
+try:
+    with open("/etc/sc-1forcr/banner.txt", "r", encoding="utf-8") as f:
+        payload["data"]["banner_txt"] = f.read()
+except Exception:
+    pass
+
+with open(out_path, "w", encoding="utf-8") as f:
+    json.dump(payload, f, ensure_ascii=False, indent=2)
+PY
+
+chmod 600 "${backup_json}" >/dev/null 2>&1 || true
 
 if [[ "${mode}" == "scheduled" ]]; then
   TZ=Asia/Jakarta date +%F > /var/lib/sc-1forcr/last-auto-backup-date
@@ -2822,23 +2850,32 @@ fi
 
 keep_days="$(echo "${AUTO_BACKUP_KEEP_DAYS}" | tr -cd '0-9')"
 [[ -z "${keep_days}" ]] && keep_days="7"
-find "${AUTO_BACKUP_DIR}" -maxdepth 1 -type f -name 'sc1forcr-full-*-WIB.tar.gz' -mtime +"${keep_days}" -delete >/dev/null 2>&1 || true
+find "${AUTO_BACKUP_DIR}" -maxdepth 1 -type f -name 'sc1forcr-accounts-*-WIB.json' -mtime +"${keep_days}" -delete >/dev/null 2>&1 || true
 
 if [[ -n "${TELEGRAM_BOT_TOKEN}" && -n "${TELEGRAM_CHAT_ID}" ]]; then
   host="$(hostname 2>/dev/null || echo vps)"
+  ssh_count="$(jq -r '.data.ssh | length' "${backup_json}" 2>/dev/null || echo 0)"
+  vmess_count="$(jq -r '.data.vmess | length' "${backup_json}" 2>/dev/null || echo 0)"
+  vless_count="$(jq -r '.data.vless | length' "${backup_json}" 2>/dev/null || echo 0)"
+  trojan_count="$(jq -r '.data.trojan | length' "${backup_json}" 2>/dev/null || echo 0)"
+  zivpn_count="$(jq -r '.data.zivpn_auth | length' "${backup_json}" 2>/dev/null || echo 0)"
+  banner_html_on="$(jq -r 'if (.data.banner_html // "") != "" then "yes" else "no" end' "${backup_json}" 2>/dev/null || echo no)"
+  banner_txt_on="$(jq -r 'if (.data.banner_txt // "") != "" then "yes" else "no" end' "${backup_json}" 2>/dev/null || echo no)"
   caption="SC 1FORCR auto backup
 Domain: ${DOMAIN}
 Host: ${host}
 WIB: $(TZ=Asia/Jakarta date '+%F %T')
-File: $(basename "${archive}")"
+File: $(basename "${backup_json}")
+SSH:${ssh_count} VMESS:${vmess_count} VLESS:${vless_count} TROJAN:${trojan_count} ZIVPN:${zivpn_count}
+BannerHTML:${banner_html_on} BannerTXT:${banner_txt_on}"
   curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
     -F "chat_id=${TELEGRAM_CHAT_ID}" \
     -F "disable_content_type_detection=true" \
     -F "caption=${caption}" \
-    -F "document=@${archive}" >/dev/null 2>&1 || true
+    -F "document=@${backup_json}" >/dev/null 2>&1 || true
 fi
 
-echo "Backup selesai: ${archive}"
+echo "Backup akun selesai: ${backup_json}"
 EOF
   chmod +x /usr/local/sbin/sc-1forcr-auto-backup
 
@@ -2853,29 +2890,218 @@ fi
 
 backup_file="${1:-}"
 if [[ -z "${backup_file}" || ! -f "${backup_file}" ]]; then
-  echo "Usage: sc-1forcr-restore-backup /path/backup.tar.gz"
+  echo "Usage: sc-1forcr-restore-backup /path/backup.json"
   exit 1
 fi
 
-echo "Restore dari: ${backup_file}"
-tar -xzf "${backup_file}" -C /
+if ! jq -e '.data' "${backup_file}" >/dev/null 2>&1; then
+  echo "File backup bukan JSON akun yang valid."
+  exit 1
+fi
 
 if [[ -f /etc/sc-1forcr.env ]]; then
   # shellcheck disable=SC1091
   source /etc/sc-1forcr.env || true
 fi
-
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
-if [[ -f "${DB_PATH}" ]]; then
-  chown root:root "${DB_PATH}" >/dev/null 2>&1 || true
-  chmod 600 "${DB_PATH}" >/dev/null 2>&1 || true
-fi
+mkdir -p "$(dirname "${DB_PATH}")"
 
-systemctl daemon-reload >/dev/null 2>&1 || true
-systemctl restart nginx haproxy xray ssh dropbear >/dev/null 2>&1 || true
-systemctl restart sc-1forcr-api sc-1forcr-sshws >/dev/null 2>&1 || true
-systemctl restart sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
-echo "Restore selesai. Cek service: systemctl status sc-1forcr-api sc-1forcr-sshws xray nginx haproxy dropbear"
+sqlite3 "${DB_PATH}" <<'SQL'
+CREATE TABLE IF NOT EXISTS account_sshs (
+  username TEXT PRIMARY KEY,
+  password TEXT,
+  date_exp TEXT,
+  status TEXT DEFAULT 'AKTIF',
+  quota INTEGER DEFAULT 0,
+  limitip INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS account_vmesses (
+  username TEXT PRIMARY KEY,
+  uuid TEXT,
+  date_exp TEXT,
+  status TEXT DEFAULT 'AKTIF',
+  quota INTEGER DEFAULT 0,
+  limitip INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS account_vlesses (
+  username TEXT PRIMARY KEY,
+  uuid TEXT,
+  date_exp TEXT,
+  status TEXT DEFAULT 'AKTIF',
+  quota INTEGER DEFAULT 0,
+  limitip INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS account_trojans (
+  username TEXT PRIMARY KEY,
+  password TEXT,
+  date_exp TEXT,
+  status TEXT DEFAULT 'AKTIF',
+  quota INTEGER DEFAULT 0,
+  limitip INTEGER DEFAULT 0
+);
+SQL
+
+python3 - "${backup_file}" "${DB_PATH}" <<'PY'
+import json
+import sqlite3
+import sys
+
+backup_path = sys.argv[1]
+db_path = sys.argv[2]
+
+with open(backup_path, "r", encoding="utf-8") as f:
+    root = json.load(f)
+data = root.get("data") or {}
+
+conn = sqlite3.connect(db_path)
+cur = conn.cursor()
+
+def to_int(v, d=0):
+    try:
+        return int(v)
+    except Exception:
+        return d
+
+def upsert_ssh(rows):
+    for r in rows:
+        u = str((r or {}).get("username", "")).strip()
+        if not u:
+            continue
+        cur.execute(
+            """
+            INSERT INTO account_sshs(username,password,date_exp,status,quota,limitip)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(username) DO UPDATE SET
+              password=excluded.password,
+              date_exp=excluded.date_exp,
+              status=excluded.status,
+              quota=excluded.quota,
+              limitip=excluded.limitip
+            """,
+            (
+                u,
+                str((r or {}).get("password", "")),
+                str((r or {}).get("date_exp", "")),
+                str((r or {}).get("status", "AKTIF")) or "AKTIF",
+                to_int((r or {}).get("quota", 0)),
+                to_int((r or {}).get("limitip", 0)),
+            ),
+        )
+
+def upsert_uuid(table, rows):
+    for r in rows:
+        u = str((r or {}).get("username", "")).strip()
+        if not u:
+            continue
+        cur.execute(
+            f"""
+            INSERT INTO {table}(username,uuid,date_exp,status,quota,limitip)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(username) DO UPDATE SET
+              uuid=excluded.uuid,
+              date_exp=excluded.date_exp,
+              status=excluded.status,
+              quota=excluded.quota,
+              limitip=excluded.limitip
+            """,
+            (
+                u,
+                str((r or {}).get("uuid", "")),
+                str((r or {}).get("date_exp", "")),
+                str((r or {}).get("status", "AKTIF")) or "AKTIF",
+                to_int((r or {}).get("quota", 0)),
+                to_int((r or {}).get("limitip", 0)),
+            ),
+        )
+
+def upsert_trojan(rows):
+    for r in rows:
+        u = str((r or {}).get("username", "")).strip()
+        if not u:
+            continue
+        cur.execute(
+            """
+            INSERT INTO account_trojans(username,password,date_exp,status,quota,limitip)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(username) DO UPDATE SET
+              password=excluded.password,
+              date_exp=excluded.date_exp,
+              status=excluded.status,
+              quota=excluded.quota,
+              limitip=excluded.limitip
+            """,
+            (
+                u,
+                str((r or {}).get("password", "")),
+                str((r or {}).get("date_exp", "")),
+                str((r or {}).get("status", "AKTIF")) or "AKTIF",
+                to_int((r or {}).get("quota", 0)),
+                to_int((r or {}).get("limitip", 0)),
+            ),
+        )
+
+upsert_ssh(data.get("ssh") or [])
+upsert_uuid("account_vmesses", data.get("vmess") or [])
+upsert_uuid("account_vlesses", data.get("vless") or [])
+upsert_trojan(data.get("trojan") or [])
+
+zivpn_auth = data.get("zivpn_auth") or []
+if isinstance(zivpn_auth, list):
+    clean = []
+    seen = set()
+    for item in zivpn_auth:
+        v = str(item).strip().lower()
+        if not v or v in seen:
+            continue
+        seen.add(v)
+        clean.append(v)
+    try:
+        with open("/etc/zivpn/config.json", "r", encoding="utf-8") as f:
+            zcfg = json.load(f)
+    except Exception:
+        zcfg = {}
+    if not isinstance(zcfg, dict):
+        zcfg = {}
+    auth = zcfg.get("auth")
+    if not isinstance(auth, dict):
+        auth = {}
+    auth["mode"] = "passwords"
+    auth["config"] = clean
+    zcfg["auth"] = auth
+    try:
+        with open("/etc/zivpn/config.json", "w", encoding="utf-8") as f:
+            json.dump(zcfg, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+banner_html = str(data.get("banner_html") or "")
+banner_txt = str(data.get("banner_txt") or "")
+try:
+    import os
+    os.makedirs("/etc/sc-1forcr", exist_ok=True)
+    if banner_html:
+        with open("/etc/sc-1forcr/banner.html", "w", encoding="utf-8") as f:
+            f.write(banner_html)
+    if banner_txt:
+        with open("/etc/sc-1forcr/banner.txt", "w", encoding="utf-8") as f:
+            f.write(banner_txt)
+except Exception:
+    pass
+
+conn.commit()
+conn.close()
+PY
+
+chown root:root "${DB_PATH}" >/dev/null 2>&1 || true
+chmod 600 "${DB_PATH}" >/dev/null 2>&1 || true
+chmod 644 /etc/sc-1forcr/banner.html >/dev/null 2>&1 || true
+chmod 644 /etc/sc-1forcr/banner.txt >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+systemctl restart xray >/dev/null 2>&1 || true
+systemctl restart "${ZIVPN_SERVICE:-zivpn}" >/dev/null 2>&1 || true
+systemctl restart ssh >/dev/null 2>&1 || true
+systemctl restart dropbear >/dev/null 2>&1 || true
+echo "Restore akun selesai dari: ${backup_file}"
 EOF
   chmod +x /usr/local/sbin/sc-1forcr-restore-backup
 
@@ -3939,8 +4165,8 @@ service_menu() {
 backup_restore_menu() {
   local full_file
   echo "0) Kembali"
-  echo "1) FULL BACKUP (semua config + akun) & kirim ke Telegram"
-  echo "2) Restore FULL BACKUP (.tar.gz) dari path file"
+  echo "1) BACKUP AKUN + AUTH ZIVPN (1 file JSON) & kirim ke Telegram"
+  echo "2) Restore AKUN + AUTH ZIVPN (.json) dari path file"
   prompt_input b "Pilih [0-2]: " || return
   clear
   case "$b" in
@@ -3955,7 +4181,7 @@ backup_restore_menu() {
       fi
       ;;
     2)
-      prompt_input full_file "Path file backup (.tar.gz): " || return
+      prompt_input full_file "Path file backup (.json): " || return
       if [[ -z "${full_file}" || ! -f "${full_file}" ]]; then
         echo "File backup tidak ditemukan."
         return
@@ -5383,9 +5609,9 @@ Catatan:
 - vnStat dan speedtest-cli otomatis terpasang untuk monitoring trafik + tes speed VPS.
 - Auto reboot aktif setiap hari jam 03:00 via systemd timer sc-1forcr-autoreboot.timer.
 - Reboot hanya menjalankan sync + reboot (tanpa ubah konfigurasi layanan).
-- Auto backup full config dikirim ke Telegram setiap jam 02:00 WIB via sc-1forcr-autobackup.timer.
+- Auto backup semua akun (JSON) dikirim ke Telegram setiap jam 02:00 WIB via sc-1forcr-autobackup.timer.
 - Backup manual: /usr/local/sbin/sc-1forcr-auto-backup manual
-- Restore full backup: /usr/local/sbin/sc-1forcr-restore-backup /path/file.tar.gz
+- Restore akun dari backup: /usr/local/sbin/sc-1forcr-restore-backup /path/file.json
 - UDP boot-fix aktif via systemd sc-1forcr-udp-bootfix.service (re-apply backend/rule saat startup).
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
 - Update sekali klik dari menu: isi UPDATE_SCRIPT_URL lalu gunakan Tools -> Update Script
