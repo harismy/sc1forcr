@@ -5202,30 +5202,24 @@ show_ssh_only_online() {
   fi
 
   if [[ -s "${tmp_hc_pids}" ]]; then
+    # Samakan persis dengan command debug yang sudah terbukti mengeluarkan "haris2"
+    # pada VPS user, lalu agregasikan per-user.
     journalctl -u dropbear -n 50000 --no-pager 2>/dev/null | \
       awk '
-        BEGIN { q=sprintf("%c",39); dq=sprintf("%c",34); }
         NR==FNR { p[$1]=1; next }
-        {
-          line=$0;
-          low=tolower(line);
-          if (index(low, "auth succeeded for ") == 0) next;
+        /auth succeeded for / {
+          x=$0;
+          sub(/^.*\[/, "", x);
+          sub(/\].*$/, "", x);
+          if (!(x in p)) next;
 
-          pid=line;
-          if (pid !~ /\[[0-9]+\]/) next;
-          sub(/^.*\[/, "", pid);
-          sub(/\].*$/, "", pid);
-          if (!(pid in p)) next;
-
-          u=line;
-          sub(/^.*[Aa]uth succeeded for /, "", u);
-          if (substr(u,1,1) == q || substr(u,1,1) == dq) {
-            quote=substr(u,1,1);
-            sub("^" quote, "", u);
-            sub(quote ".*$", "", u);
-          } else {
-            sub(/[[:space:]].*$/, "", u);
-          }
+          u=$0;
+          sub(/^.*auth succeeded for /, "", u);
+          sub(/^'\''/, "", u);
+          sub(/^"/, "", u);
+          sub(/'\''.*/, "", u);
+          sub(/".*/, "", u);
+          sub(/[[:space:]].*/, "", u);
           u=tolower(u);
           if (u !~ /^[a-z0-9._-]+$/) next;
           if (u=="root" || u=="priv" || u=="net") next;
