@@ -2091,18 +2091,18 @@ function parseSshAndUdpUsage() {
   try {
     dropbearLog = execFileSync(
       'journalctl',
-      ['-u', 'dropbear', '--since', '-20 min', '-n', '10000', '--no-pager'],
+      ['-u', 'dropbear', '-n', '50000', '--no-pager'],
       { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }
     );
   } catch (_) {}
   for (const lineRaw of String(dropbearLog || '').split('\n')) {
     const line = String(lineRaw || '').trim();
     if (!line || !/Password auth succeeded for /i.test(line)) continue;
-    const m = line.match(/Password auth succeeded for '([^']+)' from (.+):([0-9]{1,5})\s*$/i);
+    const m = line.match(/Password auth succeeded for '([^']+)' from (.+):([0-9 ]{1,10})\s*$/i);
     if (!m) continue;
     const user = String(m[1] || '').trim().toLowerCase();
     const src = String(m[2] || '').replace(/\s+/g, '').trim();
-    const clientPort = String(m[3] || '').trim();
+    const clientPort = String(m[3] || '').replace(/\s+/g, '').trim();
     if (!user || !clientPort) continue;
     if (!dropbearActiveClientPorts.has(clientPort)) continue;
     addSessionKeyToUserMap(sessionMap, user, `dropbear-port:${clientPort}`);
@@ -5091,14 +5091,15 @@ show_ssh_only_online() {
     }' | sed -E 's/.*:([0-9]+)$/\1/' | awk '/^[0-9]+$/' | sort -u > "${tmp_hc_ports}" || true
 
   if [[ -s "${tmp_hc_ports}" ]]; then
-    journalctl -u dropbear --since "-20 min" -n 10000 --no-pager 2>/dev/null | \
+    journalctl -u dropbear -n 50000 --no-pager 2>/dev/null | \
       awk '
         NR==FNR { p[$1]=1; next }
         {
           line=$0;
           if (line !~ /Password auth succeeded for /) next;
-          if (match(line, /Password auth succeeded for '\''([^'\'']+)'\'' from .*:([0-9]{1,5})[[:space:]]*$/, m)) {
+          if (match(line, /Password auth succeeded for '\''([^'\'']+)'\'' from .*:([0-9[:space:]]{1,10})[[:space:]]*$/, m)) {
             u=tolower(m[1]); prt=m[2];
+            gsub(/[[:space:]]+/, "", prt);
             if (!(prt in p)) next;
             if (u !~ /^[a-z0-9._-]+$/) next;
             if (u=="root" || u=="priv" || u=="net") next;
