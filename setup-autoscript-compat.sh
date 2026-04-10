@@ -5078,39 +5078,58 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_ssh_count tmp_status tmp_hc_ports tmp_ssh_hc_count tmp_ssh_merge dropbear_main_port dropbear_alt_port
+  local tmp_ssh_count tmp_status tmp_hc_ports tmp_ssh_hc_count tmp_ssh_merge tmp_sshd_pairs dropbear_main_port dropbear_alt_port
   tmp_ssh_count="$(mktemp)"
   tmp_status="$(mktemp)"
   tmp_hc_ports="$(mktemp)"
   tmp_ssh_hc_count="$(mktemp)"
   tmp_ssh_merge="$(mktemp)"
+  tmp_sshd_pairs="$(mktemp)"
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
   [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
   [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
-  trap 'rm -f "${tmp_ssh_count:-}" "${tmp_status:-}" "${tmp_hc_ports:-}" "${tmp_ssh_hc_count:-}" "${tmp_ssh_merge:-}"' RETURN
+  trap 'rm -f "${tmp_ssh_count:-}" "${tmp_status:-}" "${tmp_hc_ports:-}" "${tmp_ssh_hc_count:-}" "${tmp_ssh_merge:-}" "${tmp_sshd_pairs:-}"' RETURN
 
-  ps -eo args= 2>/dev/null | awk '
+  : > "${tmp_ssh_count}"
+  : > "${tmp_sshd_pairs}"
+
+  # Hitung sesi SSH native dari socket :22 -> pid sshd -> username.
+  ss -Htnp state established 2>/dev/null | awk '
     {
-      u="";
-      if ($0 ~ /^sshd:[[:space:]]+/) {
-        if ($0 ~ /\[priv\]/ || $0 ~ /\[preauth\]/ || $0 ~ /\[listener\]/ || $0 ~ /\[accepted\]/) next;
-        u=$0;
-        sub(/^sshd:[[:space:]]*/, "", u);
-        sub(/[[:space:]].*$/, "", u);
-        sub(/@.*$/, "", u);
-        sub(/\[.*$/, "", u);
-      } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
-        u=$0;
-        sub(/^.*dropbear[^[:space:]]*[[:space:]]+\[/, "", u);
-        sub(/\].*$/, "", u);
-      } else next;
-      u=tolower(u);
-      if (u !~ /^[a-z0-9._-]+$/) next;
-      if (u == "root" || u == "priv" || u == "net") next;
-      cnt[u]++;
-    }
-    END { for (u in cnt) print u, cnt[u]; }' > "${tmp_ssh_count}" || true
+      local_addr=$4;
+      remote_addr=$5;
+      if (local_addr !~ /:22$/) next;
+      ip=remote_addr;
+      gsub(/^\[/, "", ip);
+      gsub(/\]$/, "", ip);
+      sub(/:[0-9]+$/, "", ip);
+      if (ip == "") next;
+      s=$0;
+      while (match(s, /pid=[0-9]+/)) {
+        pid=substr(s, RSTART + 4, RLENGTH - 4);
+        if (pid ~ /^[0-9]+$/) print pid, ip;
+        s=substr(s, RSTART + RLENGTH);
+      }
+    }' | sort -u | while read -r pid ip; do
+      [[ -n "${pid:-}" && -n "${ip:-}" ]] || continue
+      user="$(ps -o args= -p "${pid}" 2>/dev/null | awk '
+        {
+          if ($0 !~ /^sshd:[[:space:]]+/) next;
+          if ($0 ~ /\[priv\]/ || $0 ~ /\[preauth\]/ || $0 ~ /\[listener\]/ || $0 ~ /\[accepted\]/) next;
+          u=$0;
+          sub(/^sshd:[[:space:]]*/, "", u);
+          sub(/[[:space:]].*$/, "", u);
+          sub(/@.*$/, "", u);
+          sub(/\[.*$/, "", u);
+          u=tolower(u);
+          if (u ~ /^[a-z0-9._-]+$/ && u != "root" && u != "priv" && u != "net") print u;
+        }' | head -n1)"
+      [[ -n "${user:-}" ]] || continue
+      printf '%s %s\n' "${user}" "${ip}"
+    done | sort -u > "${tmp_sshd_pairs}" || true
+
+  awk '{ if ($1 ~ /^[a-z0-9._-]+$/ && $2 != "") cnt[$1]++ } END { for (u in cnt) print u, cnt[u]; }' "${tmp_sshd_pairs}" > "${tmp_ssh_count}" || true
 
   # HC/WS path often authenticates via dropbear with loopback source (127.0.0.1),
   # so count active auth sessions by matching dropbear auth log with live ESTAB ports.
