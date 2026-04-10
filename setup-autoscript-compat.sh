@@ -951,6 +951,8 @@ SSH_WS_PORT=2082
 SSH_WS_TARGET_PORT=${ssh_ws_target_port}
 SSH_HTTP_BACKEND_HOST=127.0.0.1
 SSH_HTTP_BACKEND_PORT=80
+DROPBEAR_PORT=${DROPBEAR_PORT}
+DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 UDPCUSTOM_CONFIG=/root/udp/config.json
 UDPCUSTOM_LISTEN_PORT=${UDPCUSTOM_LISTEN_PORT}
 UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
@@ -976,6 +978,8 @@ const ZIVPN_CONFIG = process.env.ZIVPN_CONFIG || '/etc/zivpn/config.json';
 const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
 const UDPCUSTOM_CONFIG = process.env.UDPCUSTOM_CONFIG || '/root/udp/config.json';
 const UDPCUSTOM_SERVICE = process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom';
+const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
+const DROPBEAR_ALT_PORT = String(process.env.DROPBEAR_ALT_PORT || '143').trim();
 
 const db = new sqlite3.Database(DB_PATH);
 
@@ -2019,10 +2023,36 @@ function isLoopbackIp(ip) {
   return v === '127.0.0.1' || v === '::1' || v === 'localhost';
 }
 
+function getDropbearPortSet() {
+  const ports = [DROPBEAR_PORT, DROPBEAR_ALT_PORT]
+    .map((v) => String(v || '').trim())
+    .filter((v) => /^[0-9]{1,5}$/.test(v));
+  if (ports.length === 0) return new Set(['109', '143']);
+  return new Set(ports);
+}
+
+function parseDropbearAuthLine(lineRaw) {
+  const line = String(lineRaw || '').trim();
+  if (!line || !/auth succeeded/i.test(line)) return null;
+
+  const userMatch =
+    line.match(/auth succeeded for ['"]([^'"]+)['"]/i) ||
+    line.match(/auth succeeded for ([^\s'"`]+)/i);
+  if (!userMatch) return null;
+
+  const fromMatch = line.match(/ from (.+?)(?::([0-9]{1,5}))?\s*$/i);
+  const username = String(userMatch[1] || '').trim().toLowerCase();
+  const source = String(fromMatch?.[1] || '').replace(/\s+/g, '').trim();
+  const port = String(fromMatch?.[2] || '').trim();
+  if (!username || !port) return null;
+
+  return { username, source, port };
+}
+
 function parseSshAndUdpUsage() {
   const ipMap = new Map();
   const sessionMap = new Map();
-  const dropbearPorts = new Set(['109', '143']);
+  const dropbearPorts = getDropbearPortSet();
   const dropbearActiveClientPorts = new Set();
 
   // SSH realtime (native sshd): established sockets + sshd PID owner -> username.
@@ -2096,13 +2126,11 @@ function parseSshAndUdpUsage() {
     );
   } catch (_) {}
   for (const lineRaw of String(dropbearLog || '').split('\n')) {
-    const line = String(lineRaw || '').trim();
-    if (!line || !/Password auth succeeded for /i.test(line)) continue;
-    const m = line.match(/Password auth succeeded for '([^']+)' from (.+):([0-9 ]{1,10})\s*$/i);
-    if (!m) continue;
-    const user = String(m[1] || '').trim().toLowerCase();
-    const src = String(m[2] || '').replace(/\s+/g, '').trim();
-    const clientPort = String(m[3] || '').replace(/\s+/g, '').trim();
+    const parsed = parseDropbearAuthLine(lineRaw);
+    if (!parsed) continue;
+    const user = parsed.username;
+    const src = parsed.source;
+    const clientPort = parsed.port;
     if (!user || !clientPort) continue;
     if (!dropbearActiveClientPorts.has(clientPort)) continue;
     addSessionKeyToUserMap(sessionMap, user, `dropbear-port:${clientPort}`);
@@ -4763,10 +4791,14 @@ draw_dashboard() {
   printf " ─────────────────────────────────────────────────\n"
 }
 show_combined_online() {
-  local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_udp_pair tmp_udp_count udpcustom udp_ttl
+  local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_udp_pair tmp_udp_count udpcustom udp_ttl dropbear_main_port dropbear_alt_port
   mode="${1:-realtime}"
   udp_ttl="180"
   udpcustom="$(detect_udpcustom_service)"
+  dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
+  dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
+  [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
+  [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
 
   tmp_count="$(mktemp)"
   tmp_status="$(mktemp)"
@@ -4787,7 +4819,7 @@ show_combined_online() {
     {
       l=$4;
       r=$5;
-      if (l ~ /:22$/ || l ~ /:109$/ || l ~ /:143$/) {
+      if (l ~ /:22$/ || l ~ /:'"${dropbear_main_port}"'$/ || l ~ /:'"${dropbear_alt_port}"'$/) {
         ip=r;
         gsub(/^\[/, "", ip);
         gsub(/\]$/, "", ip);
@@ -4928,9 +4960,9 @@ show_combined_online() {
         sub(/[[:space:]].*$/, "", u);
         sub(/@.*$/, "", u);
         sub(/\[.*$/, "", u);
-      } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/) {
+      } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
         u=$0;
-        sub(/^dropbear[^[:space:]]*[[:space:]]+\[/, "", u);
+        sub(/^.*dropbear[^[:space:]]*[[:space:]]+\[/, "", u);
         sub(/\].*$/, "", u);
       } else next;
       u=tolower(u);
@@ -5046,12 +5078,16 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_ssh_count tmp_status tmp_hc_ports tmp_ssh_hc_count tmp_ssh_merge
+  local tmp_ssh_count tmp_status tmp_hc_ports tmp_ssh_hc_count tmp_ssh_merge dropbear_main_port dropbear_alt_port
   tmp_ssh_count="$(mktemp)"
   tmp_status="$(mktemp)"
   tmp_hc_ports="$(mktemp)"
   tmp_ssh_hc_count="$(mktemp)"
   tmp_ssh_merge="$(mktemp)"
+  dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
+  dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
+  [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
+  [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
   trap 'rm -f "${tmp_ssh_count:-}" "${tmp_status:-}" "${tmp_hc_ports:-}" "${tmp_ssh_hc_count:-}" "${tmp_ssh_merge:-}"' RETURN
 
   ps -eo args= 2>/dev/null | awk '
@@ -5064,9 +5100,9 @@ show_ssh_only_online() {
         sub(/[[:space:]].*$/, "", u);
         sub(/@.*$/, "", u);
         sub(/\[.*$/, "", u);
-      } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/) {
+      } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
         u=$0;
-        sub(/^dropbear[^[:space:]]*[[:space:]]+\[/, "", u);
+        sub(/^.*dropbear[^[:space:]]*[[:space:]]+\[/, "", u);
         sub(/\].*$/, "", u);
       } else next;
       u=tolower(u);
@@ -5086,27 +5122,33 @@ show_ssh_only_online() {
       sub(/.*:/, "", r);
       gsub(/^\[/, "", lip); gsub(/\]$/, "", lip); sub(/:[0-9]+$/, "", lip);
       gsub(/^\[/, "", rip); gsub(/\]$/, "", rip); sub(/:[0-9]+$/, "", rip);
-      if ((l=="109" || l=="143") && (rip=="127.0.0.1" || rip=="::1")) print r;
-      else if ((r=="109" || r=="143") && (lip=="127.0.0.1" || lip=="::1")) print l;
+      if ((l=="'"${dropbear_main_port}"'" || l=="'"${dropbear_alt_port}"'") && (rip=="127.0.0.1" || rip=="::1")) print r;
+      else if ((r=="'"${dropbear_main_port}"'" || r=="'"${dropbear_alt_port}"'") && (lip=="127.0.0.1" || lip=="::1")) print l;
     }' | sed -E 's/.*:([0-9]+)$/\1/' | awk '/^[0-9]+$/' | sort -u > "${tmp_hc_ports}" || true
 
   if [[ -s "${tmp_hc_ports}" ]]; then
     journalctl -u dropbear -n 50000 --no-pager 2>/dev/null | \
       awk '
-        BEGIN { q=sprintf("%c",39); }
+        BEGIN { q=sprintf("%c",39); dq=sprintf("%c",34); }
         NR==FNR { p[$1]=1; next }
         {
           line=$0;
-          if (index(line, "Password auth succeeded for " q) == 0) next;
+          low=tolower(line);
+          if (index(low, "auth succeeded for ") == 0) next;
 
           u=line;
-          sub(/^.*Password auth succeeded for /, "", u);
-          if (substr(u,1,1) != q) next;
-          sub("^" q, "", u);
-          sub(q ".*$", "", u);
+          sub(/^.*[Aa]uth succeeded for /, "", u);
+          if (substr(u,1,1) == q || substr(u,1,1) == dq) {
+            quote=substr(u,1,1);
+            sub("^" quote, "", u);
+            sub(quote ".*$", "", u);
+          } else {
+            sub(/[[:space:]].*$/, "", u);
+          }
           u=tolower(u);
 
           prt=line;
+          if (prt !~ / from /) next;
           sub(/^.* from .*:/, "", prt);
           gsub(/[[:space:]]+/, "", prt);
           if (prt !~ /^[0-9]+$/) next;
