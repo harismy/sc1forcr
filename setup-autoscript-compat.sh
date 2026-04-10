@@ -5097,7 +5097,7 @@ show_ssh_only_online() {
         {
           line=$0;
           if (line !~ /Password auth succeeded for /) next;
-          if (match(line, /Password auth succeeded for '\''([^'\'']+)'\'' from .*:([0-9[:space:]]{1,10})[[:space:]]*$/, m)) {
+          if (match(line, /Password auth succeeded for '\''([^'\'']+)'\'' from .*:([0-9][0-9[:space:]]*)[[:space:]]*$/, m)) {
             u=tolower(m[1]); prt=m[2];
             gsub(/[[:space:]]+/, "", prt);
             if (!(prt in p)) next;
