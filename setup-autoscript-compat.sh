@@ -5093,18 +5093,28 @@ show_ssh_only_online() {
   if [[ -s "${tmp_hc_ports}" ]]; then
     journalctl -u dropbear -n 50000 --no-pager 2>/dev/null | \
       awk '
+        BEGIN { q=sprintf("%c",39); }
         NR==FNR { p[$1]=1; next }
         {
           line=$0;
-          if (line !~ /Password auth succeeded for /) next;
-          if (match(line, /Password auth succeeded for '\''([^'\'']+)'\'' from .*:([0-9][0-9[:space:]]*)[[:space:]]*$/, m)) {
-            u=tolower(m[1]); prt=m[2];
-            gsub(/[[:space:]]+/, "", prt);
-            if (!(prt in p)) next;
-            if (u !~ /^[a-z0-9._-]+$/) next;
-            if (u=="root" || u=="priv" || u=="net") next;
-            cnt[u]++;
-          }
+          if (index(line, "Password auth succeeded for " q) == 0) next;
+
+          u=line;
+          sub(/^.*Password auth succeeded for /, "", u);
+          if (substr(u,1,1) != q) next;
+          sub("^" q, "", u);
+          sub(q ".*$", "", u);
+          u=tolower(u);
+
+          prt=line;
+          sub(/^.* from .*:/, "", prt);
+          gsub(/[[:space:]]+/, "", prt);
+          if (prt !~ /^[0-9]+$/) next;
+
+          if (!(prt in p)) next;
+          if (u !~ /^[a-z0-9._-]+$/) next;
+          if (u=="root" || u=="priv" || u=="net") next;
+          cnt[u]++;
         }
         END { for (u in cnt) print u, cnt[u]; }
       ' "${tmp_hc_ports}" - > "${tmp_ssh_hc_count}" || true
