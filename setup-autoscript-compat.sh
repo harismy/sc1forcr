@@ -3809,6 +3809,121 @@ list_accounts() {
   esac
 }
 
+show_account_detail() {
+  local type username username_sql row
+  type="$(pick_type)"
+  [[ -z "${type}" ]] && { echo "Tipe tidak valid."; return; }
+  username="$(pick_existing_username "${type}")" || return
+  username_sql="${username//\'/''}"
+
+  case "${type}" in
+    ssh|zivpn)
+      row="$(sqlite3 -separator '|' "${DB_PATH}" \
+        "SELECT username,password,date_exp,UPPER(TRIM(COALESCE(status,''))),CAST(COALESCE(quota,0) AS INTEGER),CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+      if [[ -z "${row}" ]]; then
+        echo "Data akun tidak ditemukan."
+        return
+      fi
+      IFS='|' read -r d_user d_pass d_exp d_status d_quota d_limit <<< "${row}"
+      cat <<EOT_SSH_DETAIL
+=============================
+ DETAIL AKUN ${type^^}
+=============================
+Username     : ${d_user}
+Password     : ${d_pass}
+Expired      : ${d_exp}
+Status       : ${d_status}
+Quota        : ${d_quota}
+Limit IP     : ${d_limit}
+Host         : ${DOMAIN}
+SSH WS       : ${DOMAIN}:80@${d_user}:${d_pass}
+SSH SSL      : ${DOMAIN}:443@${d_user}:${d_pass}
+EOT_SSH_DETAIL
+      if [[ -f /etc/zivpn/config.json ]]; then
+        if jq -e --arg u "${d_user}" '.auth.config // [] | map(tostring|ascii_downcase) | index($u|ascii_downcase)' /etc/zivpn/config.json >/dev/null 2>&1; then
+          echo "ZIVPN AUTH   : TERDAFTAR"
+        else
+          echo "ZIVPN AUTH   : TIDAK TERDAFTAR"
+        fi
+      fi
+      ;;
+    vmess)
+      row="$(sqlite3 -separator '|' "${DB_PATH}" \
+        "SELECT username,uuid,date_exp,UPPER(TRIM(COALESCE(status,''))),CAST(COALESCE(quota,0) AS INTEGER),CAST(COALESCE(limitip,0) AS INTEGER) FROM account_vmesses WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+      if [[ -z "${row}" ]]; then
+        echo "Data akun tidak ditemukan."
+        return
+      fi
+      IFS='|' read -r d_user d_uuid d_exp d_status d_quota d_limit <<< "${row}"
+      vmess_tls="$(printf '{"v":"2","ps":"%s","add":"%s","port":"443","id":"%s","aid":"0","net":"ws","type":"none","host":"%s","path":"/vmess","tls":"tls","sni":"%s"}' "${d_user}" "${DOMAIN}" "${d_uuid}" "${DOMAIN}" "${DOMAIN}" | base64 -w 0 2>/dev/null || true)"
+      vmess_ntls="$(printf '{"v":"2","ps":"%s","add":"%s","port":"80","id":"%s","aid":"0","net":"ws","type":"none","host":"%s","path":"/vmess","tls":"none","sni":"%s"}' "${d_user}" "${DOMAIN}" "${d_uuid}" "${DOMAIN}" "${DOMAIN}" | base64 -w 0 2>/dev/null || true)"
+      cat <<EOT_VMESS_DETAIL
+=============================
+ DETAIL AKUN VMESS
+=============================
+Username     : ${d_user}
+UUID         : ${d_uuid}
+Expired      : ${d_exp}
+Status       : ${d_status}
+Quota        : ${d_quota}
+Limit IP     : ${d_limit}
+Host         : ${DOMAIN}
+Link TLS     : vmess://${vmess_tls}
+Link NON TLS : vmess://${vmess_ntls}
+EOT_VMESS_DETAIL
+      ;;
+    vless)
+      row="$(sqlite3 -separator '|' "${DB_PATH}" \
+        "SELECT username,uuid,date_exp,UPPER(TRIM(COALESCE(status,''))),CAST(COALESCE(quota,0) AS INTEGER),CAST(COALESCE(limitip,0) AS INTEGER) FROM account_vlesses WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+      if [[ -z "${row}" ]]; then
+        echo "Data akun tidak ditemukan."
+        return
+      fi
+      IFS='|' read -r d_user d_uuid d_exp d_status d_quota d_limit <<< "${row}"
+      cat <<EOT_VLESS_DETAIL
+=============================
+ DETAIL AKUN VLESS
+=============================
+Username     : ${d_user}
+UUID         : ${d_uuid}
+Expired      : ${d_exp}
+Status       : ${d_status}
+Quota        : ${d_quota}
+Limit IP     : ${d_limit}
+Host         : ${DOMAIN}
+Link TLS     : vless://${d_uuid}@${DOMAIN}:443?type=ws&path=%2Fvless&security=tls&sni=${DOMAIN}#${d_user}
+Link NON TLS : vless://${d_uuid}@${DOMAIN}:80?type=ws&path=%2Fvless&security=none&sni=${DOMAIN}#${d_user}
+EOT_VLESS_DETAIL
+      ;;
+    trojan)
+      row="$(sqlite3 -separator '|' "${DB_PATH}" \
+        "SELECT username,password,date_exp,UPPER(TRIM(COALESCE(status,''))),CAST(COALESCE(quota,0) AS INTEGER),CAST(COALESCE(limitip,0) AS INTEGER) FROM account_trojans WHERE LOWER(username)=LOWER('${username_sql}') LIMIT 1;" 2>/dev/null || true)"
+      if [[ -z "${row}" ]]; then
+        echo "Data akun tidak ditemukan."
+        return
+      fi
+      IFS='|' read -r d_user d_pass d_exp d_status d_quota d_limit <<< "${row}"
+      cat <<EOT_TROJAN_DETAIL
+=============================
+ DETAIL AKUN TROJAN
+=============================
+Username     : ${d_user}
+Password     : ${d_pass}
+Expired      : ${d_exp}
+Status       : ${d_status}
+Quota        : ${d_quota}
+Limit IP     : ${d_limit}
+Host         : ${DOMAIN}
+Link TLS     : trojan://${d_pass}@${DOMAIN}:443?type=ws&path=%2Ftrojan&security=tls&sni=${DOMAIN}#${d_user}
+Link NON TLS : trojan://${d_pass}@${DOMAIN}:80?type=ws&path=%2Ftrojan&security=none&sni=${DOMAIN}#${d_user}
+EOT_TROJAN_DETAIL
+      ;;
+    *)
+      echo "Tipe tidak valid."
+      ;;
+  esac
+}
+
 akun_menu() {
   while true; do
     clear
@@ -3822,9 +3937,10 @@ akun_menu() {
     echo "5) Delete Account"
     echo "6) List Account"
     echo "7) Unlock Account"
+    echo "8) Lihat Detail Account"
     echo "0) Kembali"
     echo
-    if ! prompt_input am "Pilih menu [0-7]: "; then
+    if ! prompt_input am "Pilih menu [0-8]: "; then
       return
     fi
     clear
@@ -3836,6 +3952,7 @@ akun_menu() {
       5) delete_account ;;
       6) list_accounts ;;
       7) unlock_account ;;
+      8) show_account_detail ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
