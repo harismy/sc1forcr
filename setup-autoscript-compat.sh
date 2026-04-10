@@ -34,6 +34,9 @@ set -euo pipefail
 #   DROPBEAR_VERSION=2019.78
 #   TELEGRAM_BOT_TOKEN=123456:ABC...            (opsional, notif aksi menu ke Telegram)
 #   TELEGRAM_CHAT_ID=-1001234567890             (opsional)
+#   AUTO_BACKUP_ENABLE=1                         (opsional, 1=aktif timer backup harian)
+#   AUTO_BACKUP_DIR=/root/backup-sc-1forcr      (opsional)
+#   AUTO_BACKUP_KEEP_DAYS=7                      (opsional)
 #   DB_PATH=/usr/sbin/potatonc/potato.db
 #   APP_DIR=/opt/sc-1forcr
 
@@ -63,6 +66,9 @@ DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT:-143}"
 DROPBEAR_VERSION="${DROPBEAR_VERSION:-2019.78}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE:-1}"
+AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
+AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
   echo "setup-autoscript-compat ${SCRIPT_VERSION}"
@@ -2716,6 +2722,191 @@ EOF
   systemctl enable --now sc-1forcr-autoreboot.timer
 }
 
+setup_auto_backup_timer() {
+  log "Setup auto backup harian kirim Telegram jam 02:00 WIB..."
+
+  cat > /usr/local/sbin/sc-1forcr-auto-backup <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/sc-1forcr.env"
+[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
+
+DOMAIN="${DOMAIN:-unknown}"
+DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
+AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE:-1}"
+AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
+AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+
+mode="${1:-manual}"
+mkdir -p "${AUTO_BACKUP_DIR}" /var/lib/sc-1forcr
+
+if [[ "${AUTO_BACKUP_ENABLE}" != "1" ]]; then
+  exit 0
+fi
+
+if [[ "${mode}" == "scheduled" ]]; then
+  wib_hour="$(TZ=Asia/Jakarta date +%H)"
+  wib_date="$(TZ=Asia/Jakarta date +%F)"
+  stamp_file="/var/lib/sc-1forcr/last-auto-backup-date"
+  last_date="$(cat "${stamp_file}" 2>/dev/null || true)"
+  [[ "${wib_hour}" == "02" ]] || exit 0
+  [[ "${last_date}" == "${wib_date}" ]] && exit 0
+fi
+
+ts_wib="$(TZ=Asia/Jakarta date +%Y%m%d-%H%M%S)"
+archive="${AUTO_BACKUP_DIR}/sc1forcr-full-${ts_wib}-WIB.tar.gz"
+list_file="$(mktemp)"
+trap 'rm -f "${list_file}"' EXIT
+
+add_if_exists() {
+  local p="$1"
+  [[ -e "/${p}" ]] && printf '%s\n' "${p}" >> "${list_file}"
+}
+
+add_if_exists "etc/sc-1forcr.env"
+add_if_exists "etc/sc-1forcr-version"
+add_if_exists "etc/sc-1forcr/banner.html"
+add_if_exists "etc/sc-1forcr/banner.txt"
+add_if_exists "opt/sc-1forcr/.env"
+add_if_exists "opt/sc-1forcr/VERSION"
+add_if_exists "opt/sc-1forcr/menu-sc-1forcr.sh"
+add_if_exists "usr/local/etc/xray/config.json"
+add_if_exists "etc/zivpn/config.json"
+add_if_exists "etc/zivpn/zivpn.crt"
+add_if_exists "etc/zivpn/zivpn.key"
+add_if_exists "root/udp/config.json"
+add_if_exists "etc/nginx/sites-available/sc-1forcr.conf"
+add_if_exists "etc/nginx/sites-enabled/sc-1forcr.conf"
+add_if_exists "etc/haproxy/haproxy.cfg"
+add_if_exists "etc/default/dropbear"
+add_if_exists "etc/systemd/system/dropbear.service.d/override.conf"
+add_if_exists "etc/ssh/sshd_config"
+add_if_exists "etc/systemd/system/sc-1forcr-api.service"
+add_if_exists "etc/systemd/system/sc-1forcr-sshws.service"
+add_if_exists "etc/systemd/system/sc-1forcr-iplimit.service"
+add_if_exists "etc/systemd/system/sc-1forcr-iplimit.timer"
+add_if_exists "etc/systemd/system/sc-1forcr-autoreboot.service"
+add_if_exists "etc/systemd/system/sc-1forcr-autoreboot.timer"
+add_if_exists "etc/systemd/system/sc-1forcr-udp-bootfix.service"
+add_if_exists "etc/systemd/system/sc-1forcr-autobackup.service"
+add_if_exists "etc/systemd/system/sc-1forcr-autobackup.timer"
+
+if [[ -f "${DB_PATH}" ]]; then
+  db_rel="${DB_PATH#/}"
+  add_if_exists "${db_rel}"
+fi
+
+if [[ -n "${DOMAIN}" ]]; then
+  add_if_exists "etc/letsencrypt/live/${DOMAIN}"
+  add_if_exists "etc/letsencrypt/archive/${DOMAIN}"
+  add_if_exists "etc/letsencrypt/renewal/${DOMAIN}.conf"
+fi
+
+if [[ ! -s "${list_file}" ]]; then
+  echo "Tidak ada file konfigurasi untuk dibackup."
+  exit 1
+fi
+
+tar -czf "${archive}" -C / -T "${list_file}"
+chmod 600 "${archive}" >/dev/null 2>&1 || true
+
+if [[ "${mode}" == "scheduled" ]]; then
+  TZ=Asia/Jakarta date +%F > /var/lib/sc-1forcr/last-auto-backup-date
+fi
+
+keep_days="$(echo "${AUTO_BACKUP_KEEP_DAYS}" | tr -cd '0-9')"
+[[ -z "${keep_days}" ]] && keep_days="7"
+find "${AUTO_BACKUP_DIR}" -maxdepth 1 -type f -name 'sc1forcr-full-*-WIB.tar.gz' -mtime +"${keep_days}" -delete >/dev/null 2>&1 || true
+
+if [[ -n "${TELEGRAM_BOT_TOKEN}" && -n "${TELEGRAM_CHAT_ID}" ]]; then
+  host="$(hostname 2>/dev/null || echo vps)"
+  caption="SC 1FORCR auto backup
+Domain: ${DOMAIN}
+Host: ${host}
+WIB: $(TZ=Asia/Jakarta date '+%F %T')
+File: $(basename "${archive}")"
+  curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+    -F "chat_id=${TELEGRAM_CHAT_ID}" \
+    -F "disable_content_type_detection=true" \
+    -F "caption=${caption}" \
+    -F "document=@${archive}" >/dev/null 2>&1 || true
+fi
+
+echo "Backup selesai: ${archive}"
+EOF
+  chmod +x /usr/local/sbin/sc-1forcr-auto-backup
+
+  cat > /usr/local/sbin/sc-1forcr-restore-backup <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "Jalankan sebagai root."
+  exit 1
+fi
+
+backup_file="${1:-}"
+if [[ -z "${backup_file}" || ! -f "${backup_file}" ]]; then
+  echo "Usage: sc-1forcr-restore-backup /path/backup.tar.gz"
+  exit 1
+fi
+
+echo "Restore dari: ${backup_file}"
+tar -xzf "${backup_file}" -C /
+
+if [[ -f /etc/sc-1forcr.env ]]; then
+  # shellcheck disable=SC1091
+  source /etc/sc-1forcr.env || true
+fi
+
+DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
+if [[ -f "${DB_PATH}" ]]; then
+  chown root:root "${DB_PATH}" >/dev/null 2>&1 || true
+  chmod 600 "${DB_PATH}" >/dev/null 2>&1 || true
+fi
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl restart nginx haproxy xray ssh dropbear >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-api sc-1forcr-sshws >/dev/null 2>&1 || true
+systemctl restart sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
+echo "Restore selesai. Cek service: systemctl status sc-1forcr-api sc-1forcr-sshws xray nginx haproxy dropbear"
+EOF
+  chmod +x /usr/local/sbin/sc-1forcr-restore-backup
+
+  cat > /etc/systemd/system/sc-1forcr-autobackup.service <<'EOF'
+[Unit]
+Description=SC 1FORCR Auto Backup and Send Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-auto-backup scheduled
+NoNewPrivileges=true
+PrivateTmp=true
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-autobackup.timer <<'EOF'
+[Unit]
+Description=Run SC 1FORCR auto backup hourly (executes at 02:00 WIB)
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+RandomizedDelaySec=30s
+Unit=sc-1forcr-autobackup.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+}
+
 write_cli_menu() {
   local menu_runtime
   menu_runtime="${APP_DIR}/menu-sc-1forcr.sh"
@@ -2740,6 +2931,9 @@ DROPBEAR_PORT=${DROPBEAR_PORT}
 DROPBEAR_ALT_PORT=${DROPBEAR_ALT_PORT}
 TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+AUTO_BACKUP_ENABLE=${AUTO_BACKUP_ENABLE}
+AUTO_BACKUP_DIR=${AUTO_BACKUP_DIR}
+AUTO_BACKUP_KEEP_DAYS=${AUTO_BACKUP_KEEP_DAYS}
 EOF
   chmod 600 /etc/sc-1forcr.env
 
@@ -3740,74 +3934,34 @@ service_menu() {
 }
 
 backup_restore_menu() {
-  local bdir ts db_backup cfg_zivpn cfg_udphc
-  bdir="/root/backup-sc-1forcr"
-  ts="$(date +%Y%m%d-%H%M%S)"
-  db_backup="${bdir}/accounts-${ts}.db"
-  cfg_zivpn="${bdir}/zivpn-config-${ts}.json"
-  cfg_udphc="${bdir}/udphc-config-${ts}.json"
-
-  mkdir -p "${bdir}"
-
+  local full_file
   echo "0) Kembali"
-  echo "1) Backup config ZIVPN ke /root/config.json.zivpn"
-  echo "2) Restore config ZIVPN dari /root/config.json.zivpn"
-  echo "3) Backup akun (SSH/VMESS/VLESS/TROJAN) + config ZIVPN + config UDPHC"
-  echo "4) Restore akun + config dari backup terbaru"
-  prompt_input b "Pilih [0-4]: " || return
+  echo "1) FULL BACKUP (semua config + akun) & kirim ke Telegram"
+  echo "2) Restore FULL BACKUP (.tar.gz) dari path file"
+  prompt_input b "Pilih [0-2]: " || return
   clear
   case "$b" in
     0)
       return
       ;;
     1)
-      cp -f /etc/zivpn/config.json /root/config.json.zivpn
-      echo "Backup selesai: /root/config.json.zivpn"
+      if [[ -x /usr/local/sbin/sc-1forcr-auto-backup ]]; then
+        /usr/local/sbin/sc-1forcr-auto-backup manual
+      else
+        echo "Script auto backup belum tersedia."
+      fi
       ;;
     2)
-      cp -f /root/config.json.zivpn /etc/zivpn/config.json
-      systemctl restart "${ZIVPN_SERVICE}" || true
-      echo "Restore selesai."
-      ;;
-    3)
-      if [[ -f "${DB_PATH}" ]]; then
-        sqlite3 "${DB_PATH}" ".backup '${db_backup}'"
-        cp -f "${db_backup}" "${bdir}/accounts-latest.db"
+      prompt_input full_file "Path file backup (.tar.gz): " || return
+      if [[ -z "${full_file}" || ! -f "${full_file}" ]]; then
+        echo "File backup tidak ditemukan."
+        return
       fi
-      if [[ -f /etc/zivpn/config.json ]]; then
-        cp -f /etc/zivpn/config.json "${cfg_zivpn}"
-        cp -f /etc/zivpn/config.json "${bdir}/zivpn-config-latest.json"
+      if [[ -x /usr/local/sbin/sc-1forcr-restore-backup ]]; then
+        /usr/local/sbin/sc-1forcr-restore-backup "${full_file}"
+      else
+        echo "Script restore backup belum tersedia."
       fi
-      if [[ -f /root/udp/config.json ]]; then
-        cp -f /root/udp/config.json "${cfg_udphc}"
-        cp -f /root/udp/config.json "${bdir}/udphc-config-latest.json"
-      fi
-      echo "Backup selesai di: ${bdir}"
-      ls -lh "${bdir}" | sed -n '1,12p'
-      ;;
-    4)
-      if [[ -f "${bdir}/accounts-latest.db" ]]; then
-        systemctl stop sc-1forcr-api >/dev/null 2>&1 || true
-        cp -f "${bdir}/accounts-latest.db" "${DB_PATH}"
-        chown root:root "${DB_PATH}" >/dev/null 2>&1 || true
-        chmod 600 "${DB_PATH}" >/dev/null 2>&1 || true
-        systemctl start sc-1forcr-api >/dev/null 2>&1 || true
-      fi
-      if [[ -f "${bdir}/zivpn-config-latest.json" ]]; then
-        cp -f "${bdir}/zivpn-config-latest.json" /etc/zivpn/config.json
-      fi
-      if [[ -f "${bdir}/udphc-config-latest.json" ]]; then
-        mkdir -p /root/udp
-        cp -f "${bdir}/udphc-config-latest.json" /root/udp/config.json
-      fi
-      systemctl restart xray >/dev/null 2>&1 || true
-      systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
-      if systemctl list-unit-files | grep -q '^sc-1forcr-udpcustom\.service'; then
-        systemctl restart sc-1forcr-udpcustom >/dev/null 2>&1 || true
-      elif systemctl list-unit-files | grep -q '^udp-custom\.service'; then
-        systemctl restart udp-custom >/dev/null 2>&1 || true
-      fi
-      echo "Restore dari backup terbaru selesai."
       ;;
     *)
       echo "Pilihan tidak valid."
@@ -4652,18 +4806,31 @@ show_udpcustom_online() {
 }
 
 update_script_from_repo() {
-  local url tmp active_backend
+  local url tmp active_backend alt_url downloaded_ok
   url="${UPDATE_SCRIPT_URL:-}"
   if [[ -z "${url}" ]]; then
     echo "UPDATE_SCRIPT_URL belum diisi di /etc/sc-1forcr.env"
     echo "Contoh:"
-    echo "UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/<user>/<repo>/main/scripts/setup-autoscript-compat.sh"
+    echo "UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/<user>/<repo>/main/setup-autoscript-compat.sh"
     return
   fi
 
   tmp="/tmp/setup-autoscript-compat.sh"
+  downloaded_ok=0
   echo "Download update script dari: ${url}"
-  if ! curl -fsSL "${url}" -o "${tmp}"; then
+  if curl -fsSL "${url}" -o "${tmp}"; then
+    downloaded_ok=1
+  else
+    # Fallback path otomatis untuk repo yang menyimpan file di /scripts/.
+    alt_url="$(echo "${url}" | sed 's|/main/setup-autoscript-compat\.sh$|/main/scripts/setup-autoscript-compat.sh|')"
+    if [[ "${alt_url}" != "${url}" ]]; then
+      echo "URL utama gagal, coba fallback: ${alt_url}"
+      if curl -fsSL "${alt_url}" -o "${tmp}"; then
+        downloaded_ok=1
+      fi
+    fi
+  fi
+  if [[ "${downloaded_ok}" != "1" ]]; then
     echo "Gagal download update script."
     return
   fi
@@ -5001,6 +5168,10 @@ systemctl stop sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-autoreboot.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-autoreboot.service >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-autobackup.service >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-autobackup.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udpcustom >/dev/null 2>&1 || true
@@ -5013,6 +5184,8 @@ rm -f /etc/systemd/system/sc-1forcr-iplimit.service
 rm -f /etc/systemd/system/sc-1forcr-iplimit.timer
 rm -f /etc/systemd/system/sc-1forcr-autoreboot.service
 rm -f /etc/systemd/system/sc-1forcr-autoreboot.timer
+rm -f /etc/systemd/system/sc-1forcr-autobackup.service
+rm -f /etc/systemd/system/sc-1forcr-autobackup.timer
 rm -f /etc/systemd/system/sc-1forcr-udp-bootfix.service
 rm -f /etc/systemd/system/sc-1forcr-udpcustom.service
 rm -f /etc/systemd/system/potato-compat-api.service
@@ -5028,6 +5201,8 @@ rm -f /usr/local/sbin/menu
 rm -f /usr/local/sbin/uninstall-sc-1forcr
 rm -f /usr/local/sbin/uninstall-potato-compat
 rm -f /usr/local/sbin/sc-1forcr-safe-reboot
+rm -f /usr/local/sbin/sc-1forcr-auto-backup
+rm -f /usr/local/sbin/sc-1forcr-restore-backup
 rm -f /usr/local/sbin/sc-1forcr-udp-bootfix
 
 echo "Uninstall SC 1FORCR selesai."
@@ -5163,6 +5338,7 @@ main() {
   setup_services
   setup_udp_bootfix_service
   setup_auto_reboot_timer
+  setup_auto_backup_timer
   show_install_progress 90 "Sedikit lagi, finishing konfigurasi..."
 
   write_cli_menu
@@ -5178,7 +5354,6 @@ SELESAI - SC 1FORCR NEXUS TERPASANG
 Script Version : ${SCRIPT_VERSION}
 Domain         : ${DOMAIN}
 Email LE       : ${EMAIL:-without-email}
-DB Path        : ${DB_PATH}
 API Token      : ${API_AUTH_TOKEN}
 API Base       : https://${DOMAIN}/vps
 Summary DB key : tabel servers kolom key = token di atas
@@ -5205,6 +5380,9 @@ Catatan:
 - vnStat dan speedtest-cli otomatis terpasang untuk monitoring trafik + tes speed VPS.
 - Auto reboot aktif setiap hari jam 03:00 via systemd timer sc-1forcr-autoreboot.timer.
 - Reboot hanya menjalankan sync + reboot (tanpa ubah konfigurasi layanan).
+- Auto backup full config dikirim ke Telegram setiap jam 02:00 WIB via sc-1forcr-autobackup.timer.
+- Backup manual: /usr/local/sbin/sc-1forcr-auto-backup manual
+- Restore full backup: /usr/local/sbin/sc-1forcr-restore-backup /path/file.tar.gz
 - UDP boot-fix aktif via systemd sc-1forcr-udp-bootfix.service (re-apply backend/rule saat startup).
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
 - Update sekali klik dari menu: isi UPDATE_SCRIPT_URL lalu gunakan Tools -> Update Script
