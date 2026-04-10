@@ -2744,7 +2744,7 @@ EOF
   chmod 600 /etc/sc-1forcr.env
 
   mkdir -p "${APP_DIR}"
-  cat > "${menu_runtime}" <<'EOF'
+  cat > "${menu_runtime}" <<'MENU_SCRIPT_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -4960,7 +4960,7 @@ while true; do
   echo
   read -rp "Enter untuk lanjut..." _ || true
 done
-EOF
+MENU_SCRIPT_EOF
 
   chmod +x "${menu_runtime}"
 
