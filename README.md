@@ -2768,6 +2768,8 @@ add_if_exists() {
 
 add_if_exists "etc/sc-1forcr.env"
 add_if_exists "etc/sc-1forcr-version"
+add_if_exists "etc/sc-1forcr/banner.html"
+add_if_exists "etc/sc-1forcr/banner.txt"
 add_if_exists "opt/sc-1forcr/.env"
 add_if_exists "opt/sc-1forcr/VERSION"
 add_if_exists "opt/sc-1forcr/menu-sc-1forcr.sh"
@@ -3932,85 +3934,24 @@ service_menu() {
 }
 
 backup_restore_menu() {
-  local bdir ts db_backup cfg_zivpn cfg_udphc full_file
-  bdir="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
-  ts="$(date +%Y%m%d-%H%M%S)"
-  db_backup="${bdir}/accounts-${ts}.db"
-  cfg_zivpn="${bdir}/zivpn-config-${ts}.json"
-  cfg_udphc="${bdir}/udphc-config-${ts}.json"
-
-  mkdir -p "${bdir}"
-
+  local full_file
   echo "0) Kembali"
-  echo "1) Backup config ZIVPN ke /root/config.json.zivpn"
-  echo "2) Restore config ZIVPN dari /root/config.json.zivpn"
-  echo "3) Backup akun (SSH/VMESS/VLESS/TROJAN) + config ZIVPN + config UDPHC"
-  echo "4) Restore akun + config dari backup terbaru"
-  echo "5) Full backup sekarang + kirim ke Telegram"
-  echo "6) Restore full backup (.tar.gz) dari path file"
-  prompt_input b "Pilih [0-6]: " || return
+  echo "1) FULL BACKUP (semua config + akun) & kirim ke Telegram"
+  echo "2) Restore FULL BACKUP (.tar.gz) dari path file"
+  prompt_input b "Pilih [0-2]: " || return
   clear
   case "$b" in
     0)
       return
       ;;
     1)
-      cp -f /etc/zivpn/config.json /root/config.json.zivpn
-      echo "Backup selesai: /root/config.json.zivpn"
-      ;;
-    2)
-      cp -f /root/config.json.zivpn /etc/zivpn/config.json
-      systemctl restart "${ZIVPN_SERVICE}" || true
-      echo "Restore selesai."
-      ;;
-    3)
-      if [[ -f "${DB_PATH}" ]]; then
-        sqlite3 "${DB_PATH}" ".backup '${db_backup}'"
-        cp -f "${db_backup}" "${bdir}/accounts-latest.db"
-      fi
-      if [[ -f /etc/zivpn/config.json ]]; then
-        cp -f /etc/zivpn/config.json "${cfg_zivpn}"
-        cp -f /etc/zivpn/config.json "${bdir}/zivpn-config-latest.json"
-      fi
-      if [[ -f /root/udp/config.json ]]; then
-        cp -f /root/udp/config.json "${cfg_udphc}"
-        cp -f /root/udp/config.json "${bdir}/udphc-config-latest.json"
-      fi
-      echo "Backup selesai di: ${bdir}"
-      ls -lh "${bdir}" | sed -n '1,12p'
-      ;;
-    4)
-      if [[ -f "${bdir}/accounts-latest.db" ]]; then
-        systemctl stop sc-1forcr-api >/dev/null 2>&1 || true
-        cp -f "${bdir}/accounts-latest.db" "${DB_PATH}"
-        chown root:root "${DB_PATH}" >/dev/null 2>&1 || true
-        chmod 600 "${DB_PATH}" >/dev/null 2>&1 || true
-        systemctl start sc-1forcr-api >/dev/null 2>&1 || true
-      fi
-      if [[ -f "${bdir}/zivpn-config-latest.json" ]]; then
-        cp -f "${bdir}/zivpn-config-latest.json" /etc/zivpn/config.json
-      fi
-      if [[ -f "${bdir}/udphc-config-latest.json" ]]; then
-        mkdir -p /root/udp
-        cp -f "${bdir}/udphc-config-latest.json" /root/udp/config.json
-      fi
-      systemctl restart xray >/dev/null 2>&1 || true
-      systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
-      if systemctl list-unit-files | grep -q '^sc-1forcr-udpcustom\.service'; then
-        systemctl restart sc-1forcr-udpcustom >/dev/null 2>&1 || true
-      elif systemctl list-unit-files | grep -q '^udp-custom\.service'; then
-        systemctl restart udp-custom >/dev/null 2>&1 || true
-      fi
-      echo "Restore dari backup terbaru selesai."
-      ;;
-    5)
       if [[ -x /usr/local/sbin/sc-1forcr-auto-backup ]]; then
         /usr/local/sbin/sc-1forcr-auto-backup manual
       else
         echo "Script auto backup belum tersedia."
       fi
       ;;
-    6)
+    2)
       prompt_input full_file "Path file backup (.tar.gz): " || return
       if [[ -z "${full_file}" || ! -f "${full_file}" ]]; then
         echo "File backup tidak ditemukan."
