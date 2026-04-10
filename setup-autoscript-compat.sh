@@ -2007,15 +2007,29 @@ function extractIp(raw) {
   return v;
 }
 
+function extractPort(raw) {
+  const s = String(raw || '').trim();
+  if (!s) return '';
+  const m = s.match(/:([0-9]{1,5})$/);
+  return m ? m[1] : '';
+}
+
+function isLoopbackIp(ip) {
+  const v = String(ip || '').trim().toLowerCase();
+  return v === '127.0.0.1' || v === '::1' || v === 'localhost';
+}
+
 function parseSshAndUdpUsage() {
   const ipMap = new Map();
   const sessionMap = new Map();
+  const dropbearPorts = new Set(['109', '143']);
+  const dropbearActiveClientPorts = new Set();
 
-  // SSH/Dropbear realtime: established sockets + sshd PID owner -> username.
+  // SSH realtime (native sshd): established sockets + sshd PID owner -> username.
   const pidIpMap = new Map();
   let ssOut = '';
   try {
-    ssOut = execFileSync('ss', ['-Htnp', 'state', 'established'], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
+    ssOut = execFileSync('ss', ['-Htnp', 'state', 'established'], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
   } catch (_) {}
   for (const lineRaw of String(ssOut || '').split('\n')) {
     const line = String(lineRaw || '').trim();
@@ -2023,14 +2037,29 @@ function parseSshAndUdpUsage() {
     const cols = line.split(/\s+/);
     const local = String(cols[3] || '');
     const remote = String(cols[4] || '');
-    const lport = (local.match(/:([0-9]+)$/) || [])[1] || '';
-    if (lport !== '22' && lport !== '109' && lport !== '143') continue;
-    const ip = extractIp(remote);
-    if (!ip) continue;
-    const pids = Array.from(line.matchAll(/pid=(\d+)/g)).map((m) => Number(m[1])).filter((n) => Number.isInteger(n) && n > 0);
-    for (const pid of new Set(pids)) {
-      if (!pidIpMap.has(pid)) pidIpMap.set(pid, new Set());
-      pidIpMap.get(pid).add(ip);
+
+    const lport = extractPort(local);
+    const rport = extractPort(remote);
+    const lip = extractIp(local);
+    const rip = extractIp(remote);
+
+    // Keep traditional sshd mapping for direct SSH sessions.
+    if (lport === '22') {
+      const ip = rip;
+      if (ip) {
+        const pids = Array.from(line.matchAll(/pid=(\d+)/g)).map((m) => Number(m[1])).filter((n) => Number.isInteger(n) && n > 0);
+        for (const pid of new Set(pids)) {
+          if (!pidIpMap.has(pid)) pidIpMap.set(pid, new Set());
+          pidIpMap.get(pid).add(ip);
+        }
+      }
+    }
+
+    // For HC/ssh-mux path, count unique active client-side ports to dropbear.
+    if (dropbearPorts.has(lport) && isLoopbackIp(rip) && rport) {
+      dropbearActiveClientPorts.add(rport);
+    } else if (dropbearPorts.has(rport) && isLoopbackIp(lip) && lport) {
+      dropbearActiveClientPorts.add(lport);
     }
   }
 
@@ -2056,6 +2085,30 @@ function parseSshAndUdpUsage() {
     }
   }
 
+  // Dropbear auth sessions (HC/WS friendly):
+  // map "password auth succeeded" -> active client port on localhost tunnel.
+  let dropbearLog = '';
+  try {
+    dropbearLog = execFileSync(
+      'journalctl',
+      ['-u', 'dropbear', '--since', '-20 min', '-n', '10000', '--no-pager'],
+      { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }
+    );
+  } catch (_) {}
+  for (const lineRaw of String(dropbearLog || '').split('\n')) {
+    const line = String(lineRaw || '').trim();
+    if (!line || !/Password auth succeeded for /i.test(line)) continue;
+    const m = line.match(/Password auth succeeded for '([^']+)' from (.+):([0-9]{1,5})\s*$/i);
+    if (!m) continue;
+    const user = String(m[1] || '').trim().toLowerCase();
+    const src = String(m[2] || '').replace(/\s+/g, '').trim();
+    const clientPort = String(m[3] || '').trim();
+    if (!user || !clientPort) continue;
+    if (!dropbearActiveClientPorts.has(clientPort)) continue;
+    addSessionKeyToUserMap(sessionMap, user, `dropbear-port:${clientPort}`);
+    addIpToUserMap(ipMap, user, extractIp(src));
+  }
+
   // Fallback: who entries (TTY login).
   let out = '';
   try {
@@ -2077,8 +2130,8 @@ function parseSshAndUdpUsage() {
   try {
     jOut = execFileSync(
       'journalctl',
-      ['-u', UDPCUSTOM_SERVICE, '--since', '-20 min', '-n', '300', '--no-pager'],
-      { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 }
+      ['-u', UDPCUSTOM_SERVICE, '--since', '-20 min', '-n', '10000', '--no-pager'],
+      { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }
     );
   } catch (_) {}
   for (const lineRaw of String(jOut || '').split('\n')) {
@@ -4875,9 +4928,9 @@ show_combined_online() {
         sub(/[[:space:]].*$/, "", u);
         sub(/@.*$/, "", u);
         sub(/\[.*$/, "", u);
-      } else if ($0 ~ /^dropbear[[:space:]]+\[[^]]+\]/) {
+      } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/) {
         u=$0;
-        sub(/^dropbear[[:space:]]+\[/, "", u);
+        sub(/^dropbear[^[:space:]]*[[:space:]]+\[/, "", u);
         sub(/\].*$/, "", u);
       } else next;
       u=tolower(u);
@@ -4993,10 +5046,13 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_ssh_count tmp_status
+  local tmp_ssh_count tmp_status tmp_hc_ports tmp_ssh_hc_count tmp_ssh_merge
   tmp_ssh_count="$(mktemp)"
   tmp_status="$(mktemp)"
-  trap 'rm -f "${tmp_ssh_count:-}" "${tmp_status:-}"' RETURN
+  tmp_hc_ports="$(mktemp)"
+  tmp_ssh_hc_count="$(mktemp)"
+  tmp_ssh_merge="$(mktemp)"
+  trap 'rm -f "${tmp_ssh_count:-}" "${tmp_status:-}" "${tmp_hc_ports:-}" "${tmp_ssh_hc_count:-}" "${tmp_ssh_merge:-}"' RETURN
 
   ps -eo args= 2>/dev/null | awk '
     {
@@ -5008,9 +5064,9 @@ show_ssh_only_online() {
         sub(/[[:space:]].*$/, "", u);
         sub(/@.*$/, "", u);
         sub(/\[.*$/, "", u);
-      } else if ($0 ~ /^dropbear[[:space:]]+\[[^]]+\]/) {
+      } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/) {
         u=$0;
-        sub(/^dropbear[[:space:]]+\[/, "", u);
+        sub(/^dropbear[^[:space:]]*[[:space:]]+\[/, "", u);
         sub(/\].*$/, "", u);
       } else next;
       u=tolower(u);
@@ -5019,6 +5075,53 @@ show_ssh_only_online() {
       cnt[u]++;
     }
     END { for (u in cnt) print u, cnt[u]; }' > "${tmp_ssh_count}" || true
+
+  # HC/WS path often authenticates via dropbear with loopback source (127.0.0.1),
+  # so count active auth sessions by matching dropbear auth log with live ESTAB ports.
+  ss -Htnp state established 2>/dev/null | awk '
+    {
+      l=$4; r=$5;
+      lip=l; rip=r;
+      sub(/.*:/, "", l);
+      sub(/.*:/, "", r);
+      gsub(/^\[/, "", lip); gsub(/\]$/, "", lip); sub(/:[0-9]+$/, "", lip);
+      gsub(/^\[/, "", rip); gsub(/\]$/, "", rip); sub(/:[0-9]+$/, "", rip);
+      if ((l=="109" || l=="143") && (rip=="127.0.0.1" || rip=="::1")) print r;
+      else if ((r=="109" || r=="143") && (lip=="127.0.0.1" || lip=="::1")) print l;
+    }' | sed -E 's/.*:([0-9]+)$/\1/' | awk '/^[0-9]+$/' | sort -u > "${tmp_hc_ports}" || true
+
+  if [[ -s "${tmp_hc_ports}" ]]; then
+    journalctl -u dropbear --since "-20 min" -n 10000 --no-pager 2>/dev/null | \
+      awk '
+        NR==FNR { p[$1]=1; next }
+        {
+          line=$0;
+          if (line !~ /Password auth succeeded for /) next;
+          if (match(line, /Password auth succeeded for '\''([^'\'']+)'\'' from .*:([0-9]{1,5})[[:space:]]*$/, m)) {
+            u=tolower(m[1]); prt=m[2];
+            if (!(prt in p)) next;
+            if (u !~ /^[a-z0-9._-]+$/) next;
+            if (u=="root" || u=="priv" || u=="net") next;
+            cnt[u]++;
+          }
+        }
+        END { for (u in cnt) print u, cnt[u]; }
+      ' "${tmp_hc_ports}" - > "${tmp_ssh_hc_count}" || true
+  fi
+
+  if [[ -s "${tmp_ssh_hc_count}" ]]; then
+    awk '
+      NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
+      { b[$1]=$2+0; seen[$1]=1 }
+      END {
+        for (u in seen) {
+          x=(u in a ? a[u] : 0);
+          y=(u in b ? b[u] : 0);
+          print u, (x > y ? x : y);
+        }
+      }' "${tmp_ssh_count}" "${tmp_ssh_hc_count}" > "${tmp_ssh_merge}" || true
+    mv -f "${tmp_ssh_merge}" "${tmp_ssh_count}"
+  fi
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
@@ -5186,10 +5289,8 @@ update_script_from_repo() {
     return
   fi
 
+  # Selalu default ke ZIVPN setiap update script.
   active_backend="zivpn"
-  if systemctl is-active --quiet "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}"; then
-    active_backend="udpcustom"
-  fi
 
   echo "Menjalankan update installer..."
   DOMAIN="${DOMAIN}" \
