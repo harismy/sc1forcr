@@ -2763,7 +2763,10 @@ trap 'rm -f "${list_file}"' EXIT
 
 add_if_exists() {
   local p="$1"
-  [[ -e "/${p}" ]] && printf '%s\n' "${p}" >> "${list_file}"
+  if [[ -e "/${p}" ]]; then
+    printf '%s\n' "${p}" >> "${list_file}"
+  fi
+  return 0
 }
 
 add_if_exists "etc/sc-1forcr.env"
