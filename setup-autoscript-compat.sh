@@ -37,6 +37,8 @@ set -euo pipefail
 #   AUTO_BACKUP_ENABLE=1                         (opsional, 1=aktif timer backup harian)
 #   AUTO_BACKUP_DIR=/root/backup-sc-1forcr      (opsional)
 #   AUTO_BACKUP_KEEP_DAYS=7                      (opsional)
+#   IPLIMIT_CHECK_INTERVAL_MINUTES=10            (opsional, interval checker iplimit dalam menit)
+#   IPLIMIT_LOCK_MINUTES=15                      (opsional, durasi lock sementara dalam menit)
 #   DB_PATH=/usr/sbin/potatonc/potato.db
 #   APP_DIR=/opt/sc-1forcr
 
@@ -69,6 +71,8 @@ TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE:-1}"
 AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
 AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
+IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-10}"
+IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
   echo "setup-autoscript-compat ${SCRIPT_VERSION}"
@@ -206,22 +210,95 @@ install_xray() {
   log "Install Xray..."
   bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 }
+
+setup_default_banner_assets() {
+  log "Menyiapkan banner default 1FORCR..."
+  mkdir -p /etc/sc-1forcr
+
+  cat > /etc/sc-1forcr/banner.html <<'EOF'
+<div style="text-align:center; line-height:1.6; font-family: monospace;">
+
+<!-- ╔══════════════╗ -->
+<font color="#00ffff">╔═══════════════════════╗</font><br>
+<font color="#17e8ff">⚡ SSH PREMIUM BY 1FORCR ⚡</font><br>
+<font color="#00ffff">╚═══════════════════════╝</font><br>
+
+
+<!-- ATURAN PAKAI -->
+<font color="#ff45ba"><b>⚠️ ATURAN PEMAKAIAN ⚠️</b></font><br>
+<font color="#84ecdb">
+Jika beli akun untuk 1 pengguna <br>→ gunakan hanya untuk 1 orang.<br>
+Jika beli akun untuk 2 pengguna <br>→ gunakan untuk 2 orang saja.<br>
+</font><br>
+
+<font color="red"><b>🚫 Melanggar = Akun Expired Otomatis!</b></font><br><br>
+
+<!-- KONTAK ADMIN -->
+<font color="#00ffff">╔════ KONTAK ADMIN ════╗</font><br>
+<font color="#84ecdb">
+📞 Hubungi Admin: <br>
+<font color="#00ffff">http://wa.me/6289527159281</font><br><br>
+📢 Info Config & SSH: <br>
+<font color="#ff45ba">https://t.me/Oneforcr_info</font><br><br>
+🤖 Order via Bot: <br>
+<font color="#ff17e8">https://t.me/BOT1FORCR_STORE_bot</font>
+</font><br>
+<font color="#00ffff">╚════════════════════╝</font><br><br>
+
+<font color="#84ecdb"><i>✨ Terimakasih udah order di 1FORCR ✨</i></font><br>
+<font color="#00ffff">━━━━━━━━━━━━━━━━━━━━━━━━━</font><br>
+
+</div>
+EOF
+
+  cat > /etc/sc-1forcr/banner.txt <<'EOF'
+=================================
+      SSH PREMIUM BY 1FORCR
+=================================
+ATURAN PEMAKAIAN:
+- Jika beli akun untuk 1 pengguna, gunakan untuk 1 orang.
+- Jika beli akun untuk 2 pengguna, gunakan untuk 2 orang.
+Melanggar = akun expired otomatis.
+
+Kontak Admin:
+- WA: http://wa.me/6289527159281
+- Telegram Info: https://t.me/Oneforcr_info
+- Bot Order: https://t.me/BOT1FORCR_STORE_bot
+
+Terimakasih sudah order di 1FORCR.
+=================================
+EOF
+
+  chmod 644 /etc/sc-1forcr/banner.html /etc/sc-1forcr/banner.txt >/dev/null 2>&1 || true
+}
 setup_dropbear() {
   log "Setup Dropbear..."
 
-  local main_port alt_port
+  local main_port alt_port banner_file
   main_port="$(echo "${DROPBEAR_PORT}" | tr -cd '0-9')"
   alt_port="$(echo "${DROPBEAR_ALT_PORT}" | tr -cd '0-9')"
   [[ -z "${main_port}" ]] && main_port="109"
   [[ -z "${alt_port}" ]] && alt_port="143"
   if [[ "${main_port}" -lt 1 || "${main_port}" -gt 65535 ]]; then main_port="109"; fi
   if [[ "${alt_port}" -lt 1 || "${alt_port}" -gt 65535 ]]; then alt_port="143"; fi
+  banner_file="/etc/sc-1forcr/banner.html"
+  if [[ ! -s "${banner_file}" ]]; then
+    banner_file=""
+  fi
+
+  if [[ -n "${banner_file}" ]]; then
+    if grep -qE '^[[:space:]]*Banner[[:space:]]+' /etc/ssh/sshd_config 2>/dev/null; then
+      sed -i "s|^[[:space:]]*Banner[[:space:]].*|Banner ${banner_file}|g" /etc/ssh/sshd_config
+    else
+      echo "Banner ${banner_file}" >> /etc/ssh/sshd_config
+    fi
+  fi
 
   cat > /etc/default/dropbear <<EOF
 NO_START=0
 DROPBEAR_PORT=${main_port}
 DROPBEAR_EXTRA_ARGS="-p ${alt_port}"
-DROPBEAR_BANNER=""
+DROPBEAR_BANNER="${banner_file}"
 DROPBEAR_RECEIVE_WINDOW=65536
 EOF
 
@@ -258,14 +335,24 @@ EOF
   fi
 
   mkdir -p /etc/systemd/system/dropbear.service.d
-  cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
+  if [[ -n "${banner_file}" ]]; then
+    cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
+[Service]
+Type=simple
+ExecStart=
+ExecStart=${custom_bin} -R -E -F -p ${main_port} -p ${alt_port} -b ${banner_file}
+EOF
+  else
+    cat > /etc/systemd/system/dropbear.service.d/override.conf <<EOF
 [Service]
 Type=simple
 ExecStart=
 ExecStart=${custom_bin} -R -E -F -p ${main_port} -p ${alt_port}
 EOF
+  fi
 
   systemctl daemon-reload
+  systemctl restart ssh >/dev/null 2>&1 || true
   systemctl enable dropbear >/dev/null 2>&1 || true
   systemctl restart dropbear >/dev/null 2>&1 || true
 }
@@ -456,6 +543,10 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 }
 EOF
@@ -957,6 +1048,8 @@ UDPCUSTOM_CONFIG=/root/udp/config.json
 UDPCUSTOM_LISTEN_PORT=${UDPCUSTOM_LISTEN_PORT}
 UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
 ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}
+IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
+IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
 EOF
 
   cat > "${APP_DIR}/api.js" <<'EOF'
@@ -1963,7 +2056,9 @@ const UDPCUSTOM_CONFIG = process.env.UDPCUSTOM_CONFIG || '/root/udp/config.json'
 const UDPCUSTOM_LISTEN_PORT = Number(process.env.UDPCUSTOM_LISTEN_PORT || 5667);
 const UDPCUSTOM_SERVICE = String(process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom').trim() || 'sc-1forcr-udpcustom';
 const ACTIVE_UDP_BACKEND = String(process.env.ACTIVE_UDP_BACKEND || '').trim().toLowerCase();
-const LOCK_SECONDS = 15 * 60;
+const LOCK_MINUTES_RAW = Number(process.env.IPLIMIT_LOCK_MINUTES || 15);
+const LOCK_MINUTES = Number.isFinite(LOCK_MINUTES_RAW) && LOCK_MINUTES_RAW > 0 ? Math.floor(LOCK_MINUTES_RAW) : 15;
+const LOCK_SECONDS = LOCK_MINUTES * 60;
 
 const db = new sqlite3.Database(DB_PATH);
 
@@ -2066,6 +2161,7 @@ function parseDropbearAuthLine(lineRaw) {
 function parseSshAndUdpUsage() {
   const ipMap = new Map();
   const sessionMap = new Map();
+  const recentAuthMap = new Map();
   const dropbearPorts = getDropbearPortSet();
   const dropbearActiveClientPorts = new Set();
 
@@ -2151,6 +2247,24 @@ function parseSshAndUdpUsage() {
     addIpToUserMap(ipMap, user, extractIp(src));
   }
 
+  // Recent auth fallback (HC often rotates sessions quickly, so active socket mapping can miss).
+  let dropbearRecent = '';
+  try {
+    dropbearRecent = execFileSync(
+      'journalctl',
+      ['-u', 'dropbear', '--since', '-2 min', '-n', '10000', '--no-pager'],
+      { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }
+    );
+  } catch (_) {}
+  for (const lineRaw of String(dropbearRecent || '').split('\n')) {
+    const parsed = parseDropbearAuthLine(lineRaw);
+    if (!parsed) continue;
+    const user = parsed.username;
+    const clientPort = parsed.port;
+    if (!user || !clientPort) continue;
+    addSessionKeyToUserMap(recentAuthMap, user, `dropbear-recent:${clientPort}`);
+  }
+
   // Fallback: who entries (TTY login).
   let out = '';
   try {
@@ -2202,7 +2316,7 @@ function parseSshAndUdpUsage() {
     // Count UDP sessions by source IP (not src port) to avoid false multi-login on reconnect.
     if (ip) addSessionKeyToUserMap(sessionMap, user, `udp-ip:${ip}`);
   }
-  return { ipMap, sessionMap };
+  return { ipMap, sessionMap, recentAuthMap };
 }
 
 function parseXrayRecentIpMap() {
@@ -2420,6 +2534,7 @@ async function lockIfExceeded(nowTs) {
   const sshUsage = parseSshAndUdpUsage();
   const sshIpMap = sshUsage.ipMap;
   const sshSessionMap = sshUsage.sessionMap;
+  const sshRecentAuthMap = sshUsage.recentAuthMap || new Map();
   const xrayMap = parseXrayRecentIpMap();
   const udpcustomPort = getUdpCustomListenPort();
   let xrayChanged = false;
@@ -2432,7 +2547,8 @@ async function lockIfExceeded(nowTs) {
     const lim = Number(r.limitip || 0);
     const cntIp = sshIpMap.has(userKey) ? sshIpMap.get(userKey).size : 0;
     const cntSession = sshSessionMap.has(userKey) ? sshSessionMap.get(userKey).size : 0;
-    const cnt = Math.max(cntIp, cntSession);
+    const cntRecent = sshRecentAuthMap.has(userKey) ? sshRecentAuthMap.get(userKey).size : 0;
+    const cnt = Math.max(cntIp, cntSession, cntRecent);
     if (cnt <= lim) continue;
     const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]);
     if (exists) continue;
@@ -2536,6 +2652,12 @@ EOF
 }
 
 setup_services() {
+  local iplimit_interval_min
+  iplimit_interval_min="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES}" | tr -cd '0-9')"
+  if [[ -z "${iplimit_interval_min}" || "${iplimit_interval_min}" -lt 1 || "${iplimit_interval_min}" -gt 1440 ]]; then
+    iplimit_interval_min="10"
+  fi
+
   log "Setup service sc-1forcr-api..."
   cat > /etc/systemd/system/sc-1forcr-api.service <<EOF
 [Unit]
@@ -2574,7 +2696,7 @@ RestartSec=2
 NoNewPrivileges=true
 PrivateTmp=true
 TasksMax=256
-MemoryMax=128M
+MemoryMax=512M
 
 [Install]
 WantedBy=multi-user.target
@@ -2600,13 +2722,13 @@ NoNewPrivileges=true
 PrivateTmp=true
 EOF
 
-  cat > /etc/systemd/system/sc-1forcr-iplimit.timer <<'EOF'
+  cat > /etc/systemd/system/sc-1forcr-iplimit.timer <<EOF
 [Unit]
-Description=Run SC 1FORCR IP Limit Checker every 10 minutes
+Description=Run SC 1FORCR IP Limit Checker every ${iplimit_interval_min} minutes
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=10min
+OnUnitActiveSec=${iplimit_interval_min}min
 Unit=sc-1forcr-iplimit.service
 
 [Install]
@@ -3258,6 +3380,8 @@ TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 AUTO_BACKUP_ENABLE=${AUTO_BACKUP_ENABLE}
 AUTO_BACKUP_DIR=${AUTO_BACKUP_DIR}
 AUTO_BACKUP_KEEP_DAYS=${AUTO_BACKUP_KEEP_DAYS}
+IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
+IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
 EOF
   chmod 600 /etc/sc-1forcr.env
 
@@ -3347,6 +3471,40 @@ update_sc_env_var() {
     END { if (!done) print k "=" v }
   ' /etc/sc-1forcr.env > "${tmp}" && mv -f "${tmp}" /etc/sc-1forcr.env
   chmod 600 /etc/sc-1forcr.env
+}
+
+update_app_env_var() {
+  local key="$1" value="$2" app_env tmp
+  app_env="/opt/sc-1forcr/.env"
+  if [[ ! -f "${app_env}" ]]; then
+    app_env="/opt/potato-compat/.env"
+  fi
+  if [[ ! -f "${app_env}" ]]; then
+    return 0
+  fi
+  tmp="$(mktemp)"
+  awk -v k="${key}" -v v="${value}" '
+    BEGIN { done=0 }
+    $0 ~ ("^" k "=") { print k "=" v; done=1; next }
+    { print }
+    END { if (!done) print k "=" v }
+  ' "${app_env}" > "${tmp}" && mv -f "${tmp}" "${app_env}"
+}
+
+write_iplimit_timer_unit() {
+  local interval="$1"
+  cat > /etc/systemd/system/sc-1forcr-iplimit.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR IP Limit Checker every ${interval} minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=${interval}min
+Unit=sc-1forcr-iplimit.service
+
+[Install]
+WantedBy=timers.target
+EOF
 }
 
 pick_type() {
@@ -4056,6 +4214,60 @@ akun_menu() {
   done
 }
 
+set_iplimit_checker_config_menu() {
+  local current_interval current_lock interval_in lock_in
+  current_interval="$(echo "${IPLIMIT_CHECK_INTERVAL_MINUTES:-10}" | tr -cd '0-9')"
+  current_lock="$(echo "${IPLIMIT_LOCK_MINUTES:-15}" | tr -cd '0-9')"
+  [[ -z "${current_interval}" ]] && current_interval="10"
+  [[ -z "${current_lock}" ]] && current_lock="15"
+
+  echo "=== SETTING IP LIMIT CHECKER ==="
+  echo "Interval checker saat ini : ${current_interval} menit"
+  echo "Durasi unlock (lock tmp)  : ${current_lock} menit"
+  echo
+  echo "Kosongkan input untuk mempertahankan nilai lama."
+  echo "Ketik 'batal' untuk kembali."
+
+  if ! prompt_input interval_in "Interval checker (menit) [${current_interval}]: "; then
+    return
+  fi
+  [[ "${interval_in,,}" == "batal" ]] && return
+  interval_in="${interval_in:-${current_interval}}"
+  if [[ ! "${interval_in}" =~ ^[0-9]+$ || "${interval_in}" -lt 1 || "${interval_in}" -gt 1440 ]]; then
+    echo "Interval checker harus angka 1-1440 menit."
+    return
+  fi
+
+  if ! prompt_input lock_in "Durasi unlock otomatis (menit) [${current_lock}]: "; then
+    return
+  fi
+  [[ "${lock_in,,}" == "batal" ]] && return
+  lock_in="${lock_in:-${current_lock}}"
+  if [[ ! "${lock_in}" =~ ^[0-9]+$ || "${lock_in}" -lt 1 || "${lock_in}" -gt 10080 ]]; then
+    echo "Durasi unlock harus angka 1-10080 menit."
+    return
+  fi
+
+  IPLIMIT_CHECK_INTERVAL_MINUTES="${interval_in}"
+  IPLIMIT_LOCK_MINUTES="${lock_in}"
+
+  update_sc_env_var "IPLIMIT_CHECK_INTERVAL_MINUTES" "${IPLIMIT_CHECK_INTERVAL_MINUTES}"
+  update_sc_env_var "IPLIMIT_LOCK_MINUTES" "${IPLIMIT_LOCK_MINUTES}"
+  update_app_env_var "IPLIMIT_CHECK_INTERVAL_MINUTES" "${IPLIMIT_CHECK_INTERVAL_MINUTES}"
+  update_app_env_var "IPLIMIT_LOCK_MINUTES" "${IPLIMIT_LOCK_MINUTES}"
+
+  write_iplimit_timer_unit "${IPLIMIT_CHECK_INTERVAL_MINUTES}"
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+
+  echo
+  echo "Berhasil update checker limit IP:"
+  echo "- Interval checker : ${IPLIMIT_CHECK_INTERVAL_MINUTES} menit"
+  echo "- Durasi unlock    : ${IPLIMIT_LOCK_MINUTES} menit"
+}
+
 tools_menu() {
   while true; do
     clear
@@ -4067,9 +4279,10 @@ tools_menu() {
     echo "3) Setting Banner HTML"
     echo "4) Update Script"
     echo "5) Setting Notif Telegram"
+    echo "6) Setting Checker IP Limit"
     echo "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-5]: "; then
+    if ! prompt_input tm "Pilih menu [0-6]: "; then
       return
     fi
     clear
@@ -4079,6 +4292,7 @@ tools_menu() {
       3) set_html_banner_menu ;;
       4) update_script_from_repo ;;
       5) set_telegram_notif_config ;;
+      6) set_iplimit_checker_config_menu ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -4490,6 +4704,10 @@ server {
         proxy_set_header Upgrade "websocket";
         proxy_set_header Connection "Upgrade";
         proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_connect_timeout 60s;
+        proxy_buffering off;
     }
 }
 EONGINX
@@ -5092,110 +5310,37 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_a tmp_b tmp_hc_pids tmp_ssh_count tmp_status dropbear_main_port dropbear_alt_port
-  tmp_a="$(mktemp)"
-  tmp_b="$(mktemp)"
-  tmp_hc_pids="$(mktemp)"
-  tmp_ssh_count="$(mktemp)"
+  local tmp_status tmp_recent
   tmp_status="$(mktemp)"
-  dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
-  dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
-  [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
-  [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
-  trap 'rm -f "${tmp_a:-}" "${tmp_b:-}" "${tmp_hc_pids:-}" "${tmp_ssh_count:-}" "${tmp_status:-}"' RETURN
+  tmp_recent="$(mktemp)"
+  trap 'rm -f "${tmp_status:-}" "${tmp_recent:-}"' RETURN
 
-  # SC1-SSH-REALTIME-EXACT-MERGE:
-  # sengaja samakan 1:1 dengan command manual di VPS yang sudah terbukti menghasilkan data.
-  ss -Htnp state established 2>/dev/null | awk '
-    {
-      local_addr=$4;
-      remote_addr=$5;
-      if (local_addr !~ /:22$/) next;
-      ip=remote_addr;
-      gsub(/^\[/, "", ip);
-      gsub(/\]$/, "", ip);
-      sub(/:[0-9]+$/, "", ip);
-      if (ip == "") next;
-      s=$0;
-      while (match(s, /pid=[0-9]+/)) {
-        pid=substr(s, RSTART + 4, RLENGTH - 4);
-        if (pid ~ /^[0-9]+$/) print pid, ip;
-        s=substr(s, RSTART + RLENGTH);
-      }
-    }' | sort -u | while read -r pid ip; do
-      user="$(ps -o args= -p "$pid" 2>/dev/null | awk '
-        /^sshd:[[:space:]]+/ {
-          if ($0 ~ /\[priv\]/ || $0 ~ /\[preauth\]/ || $0 ~ /\[listener\]/ || $0 ~ /\[accepted\]/) next;
-          u=$0;
-          sub(/^sshd:[[:space:]]*/, "", u);
-          sub(/[[:space:]].*$/, "", u);
-          sub(/@.*$/, "", u);
-          sub(/\[.*$/, "", u);
-          u=tolower(u);
-          if (u ~ /^[a-z0-9._-]+$/ && u != "root" && u != "priv" && u != "net") print u;
-        }' | head -n1)"
-      [[ -n "$user" ]] && printf '%s %s\n' "$user" "$ip"
-    done | awk '{cnt[$1]++} END {for (u in cnt) print u, cnt[u]}' > "${tmp_a}"
+  journalctl -u dropbear --since "-2 min" -n 50000 --no-pager 2>/dev/null | awk '
+    /auth succeeded for /{
+      u=$0
+      sub(/^.*auth succeeded for /,"",u)
+      sub(/^'\''/,"",u); sub(/^"/,"",u)
+      sub(/'\''.*/,"",u); sub(/".*/,"",u)
+      sub(/[[:space:]].*$/,"",u)
+      u=tolower(u)
+      if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next
 
-  ss -Htnp state established 2>/dev/null | awk '
-    {
-      l=$4; r=$5;
-      lip=l; rip=r;
-      sub(/.*:/, "", l);
-      sub(/.*:/, "", r);
-      gsub(/^\[/, "", lip); gsub(/\]$/, "", lip); sub(/:[0-9]+$/, "", lip);
-      gsub(/^\[/, "", rip); gsub(/\]$/, "", rip); sub(/:[0-9]+$/, "", rip);
-      if (!(((l=="'"${dropbear_main_port}"'" || l=="'"${dropbear_alt_port}"'") && (rip=="127.0.0.1" || rip=="::1")) || ((r=="'"${dropbear_main_port}"'" || r=="'"${dropbear_alt_port}"'") && (lip=="127.0.0.1" || lip=="::1")))) next;
-      s=$0;
-      while (match(s, /pid=[0-9]+/)) {
-        pid=substr(s, RSTART + 4, RLENGTH - 4);
-        if (pid ~ /^[0-9]+$/) print pid;
-        s=substr(s, RSTART + RLENGTH);
-      }
-    }' | sort -u > "${tmp_hc_pids}" || true
+      pid=$0
+      if (match(pid, /\[[0-9]+\]/)) pid=substr(pid, RSTART+1, RLENGTH-2)
+      else next
 
-  if [[ -s "${tmp_hc_pids}" ]]; then
-    journalctl -u dropbear -n 50000 --no-pager 2>/dev/null | \
-      awk '
-        NR==FNR { p[$1]=1; next }
-        /auth succeeded for / {
-          x=$0;
-          sub(/^.*\[/, "", x);
-          sub(/\].*$/, "", x);
-          if (!(x in p)) next;
-
-          u=$0;
-          sub(/^.*auth succeeded for /, "", u);
-          sub(/^'\''/, "", u);
-          sub(/^"/, "", u);
-          sub(/'\''.*/, "", u);
-          sub(/".*/, "", u);
-          sub(/[[:space:]].*/, "", u);
-          u=tolower(u);
-          if (u !~ /^[a-z0-9._-]+$/) next;
-          if (u=="root" || u=="priv" || u=="net") next;
-          cnt[u]++;
-        }
-        END { for (u in cnt) print u, cnt[u]; }
-      ' "${tmp_hc_pids}" - > "${tmp_b}" || true
-  fi
-
-  awk '
-    NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
-    { b[$1]=$2+0; seen[$1]=1 }
-    END {
-      for (u in seen) {
-        x=(u in a ? a[u] : 0);
-        y=(u in b ? b[u] : 0);
-        print u, (x > y ? x : y);
-      }
-    }' "${tmp_a}" "${tmp_b}" > "${tmp_ssh_count}" || true
+      seen[u "|" pid]=1
+    }
+    END{
+      for (k in seen){ split(k,a,"|"); cnt[a[1]]++ }
+      for (u in cnt) print u, cnt[u]
+    }' > "${tmp_recent}"
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
-  echo "LIST USER LOGIN SSH"
-  if [[ ! -s "${tmp_ssh_count}" ]]; then
-    echo "Tidak ada user SSH online."
+  echo "LIST USER LOGIN SSH (RECENT 2 MIN)"
+  if [[ ! -s "${tmp_recent}" ]]; then
+    echo "Tidak ada aktivitas SSH HC dalam 2 menit terakhir."
     echo
     echo "Total User SSH : 0"
     echo "Total SESI SSH : 0"
@@ -5205,25 +5350,19 @@ show_ssh_only_online() {
   printf "%-24s %-12s %-10s\n" "USERNAME" "STATUS" "SSH_SESI"
   printf "%-24s %-12s %-10s\n" "------------------------" "------------" "----------"
   awk '
-    NR==FNR {
-      split($0, a, "|");
-      st[a[1]]=a[2];
-      next
-    }
+    NR==FNR { split($0,a,"|"); st[a[1]]=a[2]; next }
     {
-      u=$1;
-      n=$2 + 0;
+      u=$1; n=$2+0;
       s=(u in st ? st[u] : "AMAN");
-      out=(s == "LOCK" || s == "LOCK_TMP" ? "KENA_LOCK" : "AMAN");
+      out=(s=="LOCK" || s=="LOCK_TMP" ? "KENA_LOCK" : "AMAN");
       printf "%-24s %-12s %-10d\n", u, out, n;
-      total_user++;
-      total_sesi+=n;
+      total_user++; total_sesi+=n;
     }
     END {
       print "";
       printf "Total User SSH : %d\n", total_user + 0;
       printf "Total SESI SSH : %d\n", total_sesi + 0;
-    }' "${tmp_status}" "${tmp_ssh_count}"
+    }' "${tmp_status}" "${tmp_recent}"
 }
 
 xray_log_snapshot() {
@@ -5374,6 +5513,8 @@ update_script_from_repo() {
   UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE}" \
   DROPBEAR_PORT="${DROPBEAR_PORT}" \
   DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT}" \
+  IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES}" \
+  IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES}" \
   ACTIVE_UDP_BACKEND="${active_backend}" \
   bash "${tmp}"
 }
@@ -5441,6 +5582,48 @@ install_summary_api_1forcr() {
   sed -i 's/\r$//' "${tmp}"
   chmod +x "${tmp}"
   bash "${tmp}"
+}
+
+write_default_banner_html() {
+  local banner_file
+  banner_file="/etc/sc-1forcr/banner.html"
+  mkdir -p /etc/sc-1forcr
+  cat > "${banner_file}" <<'EOF'
+<div style="text-align:center; line-height:1.6; font-family: monospace;">
+
+<!-- ╔══════════════╗ -->
+<font color="#00ffff">╔═══════════════════════╗</font><br>
+<font color="#17e8ff">⚡ SSH PREMIUM BY 1FORCR ⚡</font><br>
+<font color="#00ffff">╚═══════════════════════╝</font><br>
+
+
+<!-- ATURAN PAKAI -->
+<font color="#ff45ba"><b>⚠️ ATURAN PEMAKAIAN ⚠️</b></font><br>
+<font color="#84ecdb">
+Jika beli akun untuk 1 pengguna <br>→ gunakan hanya untuk 1 orang.<br>
+Jika beli akun untuk 2 pengguna <br>→ gunakan untuk 2 orang saja.<br>
+</font><br>
+
+<font color="red"><b>🚫 Melanggar = Akun Expired Otomatis!</b></font><br><br>
+
+<!-- KONTAK ADMIN -->
+<font color="#00ffff">╔════ KONTAK ADMIN ════╗</font><br>
+<font color="#84ecdb">
+📞 Hubungi Admin: <br>
+<font color="#00ffff">http://wa.me/6289527159281</font><br><br>
+📢 Info Config & SSH: <br>
+<font color="#ff45ba">https://t.me/Oneforcr_info</font><br><br>
+🤖 Order via Bot: <br>
+<font color="#ff17e8">https://t.me/BOT1FORCR_STORE_bot</font>
+</font><br>
+<font color="#00ffff">╚════════════════════╝</font><br><br>
+
+<font color="#84ecdb"><i>✨ Terimakasih udah order di 1FORCR ✨</i></font><br>
+<font color="#00ffff">━━━━━━━━━━━━━━━━━━━━━━━━━</font><br>
+
+</div>
+EOF
+  chmod 644 "${banner_file}" >/dev/null 2>&1 || true
 }
 
 apply_html_banner_config() {
@@ -5514,9 +5697,10 @@ set_html_banner_menu() {
     echo "1) Set/Edit banner"
     echo "2) Lihat banner aktif"
     echo "3) Nonaktifkan banner"
+    echo "4) Pakai template default 1FORCR"
     echo "0) Kembali"
     echo
-    if ! prompt_input bm "Pilih menu [0-3]: "; then
+    if ! prompt_input bm "Pilih menu [0-4]: "; then
       return
     fi
     case "${bm}" in
@@ -5549,6 +5733,11 @@ set_html_banner_menu() {
         rm -f "${banner_file}" >/dev/null 2>&1 || true
         apply_html_banner_config ""
         ;;
+      4)
+        write_default_banner_html
+        apply_html_banner_config "${banner_file}"
+        echo "Template default 1FORCR berhasil diterapkan."
+        ;;
       0)
         return
         ;;
@@ -5568,7 +5757,7 @@ monitor_online_menu() {
     echo "===================================="
     echo "      MONITOR USER ONLINE"
     echo "===================================="
-    echo "1) SSH Realtime"
+    echo "1) SSH Recent Activity (2 min)"
     echo "2) UDP CUSTOM Realtime"
     echo "3) SSH + UDP CUSTOM realtime"
     echo "4) SSH + UDP CUSTOM Gabungan histori"
@@ -5835,6 +6024,7 @@ main() {
   install_node_if_missing
   install_go_if_missing
   install_xray
+  setup_default_banner_assets
   setup_dropbear
   init_db
   setup_nginx_and_cert
@@ -5901,7 +6091,7 @@ Catatan:
 - UDP boot-fix aktif via systemd sc-1forcr-udp-bootfix.service (re-apply backend/rule saat startup).
 - Menu VPS: jalankan perintah menu atau menu-sc-1forcr
 - Update sekali klik dari menu: isi UPDATE_SCRIPT_URL lalu gunakan Tools -> Update Script
-- Auto lock IP limit: timer systemd sc-1forcr-iplimit.timer (cek tiap 10 menit, lock sementara 15 menit)
+- Auto lock IP limit: timer systemd sc-1forcr-iplimit.timer (cek tiap ${IPLIMIT_CHECK_INTERVAL_MINUTES} menit, lock sementara ${IPLIMIT_LOCK_MINUTES} menit)
 EOF
 
   open_menu_after_install
