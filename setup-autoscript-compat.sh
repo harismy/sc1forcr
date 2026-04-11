@@ -2281,9 +2281,11 @@ function parseSshAndUdpUsage() {
     const parsed = parseDropbearAuthLine(lineRaw);
     if (!parsed) continue;
     const user = parsed.username;
+    const srcIp = extractIp(parsed.source);
     const clientPort = parsed.port;
     if (!user || !clientPort) continue;
-    addSessionKeyToUserMap(recentAuthMap, user, `dropbear-recent:${clientPort}`);
+    const recentKey = srcIp ? `dropbear-recent-ip:${srcIp}` : `dropbear-recent-port:${clientPort}`;
+    addSessionKeyToUserMap(recentAuthMap, user, recentKey);
     if (dropbearActiveClientPorts.has(clientPort)) {
       addPortToUserMap(wsClientPortMap, user, clientPort);
     }
@@ -2692,10 +2694,10 @@ async function lockIfExceeded(nowTs) {
     // - ipMap/sessionMap untuk SSH normal
     // - wsClientPortMap untuk jalur HC/WS (satu koneksi = satu client port)
     const cntActive = Math.max(cntIp, cntSession, cntWsPorts);
-    // proc dipakai sebagai fallback kuantitatif ringan (cap) agar kasus 2 HP tetap terdeteksi.
-    // recent-auth tetap hanya indikator biner untuk hindari re-lock loop karena reconnect spam.
+    // proc/recent dipakai sebagai fallback kuantitatif ringan (cap) agar kasus 2 HP tetap terdeteksi.
+    // recent sudah dedup berdasarkan source IP, jadi tidak overcount karena port reconnect.
     const cntProcHint = Math.min(Math.max(cntProc, 0), 3);
-    const cntRecentHint = cntRecent > 0 ? 1 : 0;
+    const cntRecentHint = Math.min(Math.max(cntRecent, 0), 3);
     const cnt = Math.max(cntActive, cntProcHint, cntRecentHint);
     if (IPLIMIT_DEBUG) {
       console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
