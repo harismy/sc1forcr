@@ -2581,9 +2581,25 @@ function disconnectSshWsByClientPorts(ports) {
   const list = Array.from(new Set((ports || []).map((v) => String(v || '').trim()).filter((v) => /^[0-9]{1,5}$/.test(v))));
   for (const p of list) {
     safeExec('ss', ['-K', `sport = :${p}`]);
+    safeExec('ss', ['-K', `dport = :${p}`]);
     safeExec('ss', ['-K', `src 127.0.0.1 sport = :${p}`]);
+    safeExec('ss', ['-K', `src 127.0.0.1 dport = :${p}`]);
     safeExec('ss', ['-K', `src ::1 sport = :${p}`]);
+    safeExec('ss', ['-K', `src ::1 dport = :${p}`]);
   }
+}
+
+function extractClientPortsFromSessionKeys(keys) {
+  const out = new Set();
+  if (!keys || typeof keys[Symbol.iterator] !== 'function') return out;
+  for (const raw of keys) {
+    const s = String(raw || '').trim().toLowerCase();
+    if (!s) continue;
+    const m = s.match(/(?:^|:)([0-9]{1,5})$/);
+    if (!m) continue;
+    out.add(m[1]);
+  }
+  return out;
 }
 
 async function ensureTables() {
@@ -2682,7 +2698,10 @@ async function lockIfExceeded(nowTs) {
     safeExec('pkill', ['-KILL', '-u', user]);
     safeExec('pkill', ['-KILL', '-f', `sshd: ${user}`]);
     safeExec('pkill', ['-KILL', '-f', `dropbear.*\\[${user}\\]`]);
-    disconnectSshWsByClientPorts(Array.from(sshWsClientPortMap.get(userKey) || []));
+    const activeWsPorts = Array.from(sshWsClientPortMap.get(userKey) || []);
+    const recentAuthPorts = Array.from(extractClientPortsFromSessionKeys(sshRecentAuthMap.get(userKey) || new Set()));
+    const sessionPorts = Array.from(extractClientPortsFromSessionKeys(sshSessionMap.get(userKey) || new Set()));
+    disconnectSshWsByClientPorts(Array.from(new Set([...activeWsPorts, ...recentAuthPorts, ...sessionPorts])));
     safeExec('passwd', ['-l', user]);
 
     // Untuk UDPHC: drop semua src IP aktif user ini selama masa lock.
