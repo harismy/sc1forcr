@@ -2055,6 +2055,8 @@ const ZIVPN_SERVICE = process.env.ZIVPN_SERVICE || 'zivpn';
 const UDPCUSTOM_CONFIG = process.env.UDPCUSTOM_CONFIG || '/root/udp/config.json';
 const UDPCUSTOM_LISTEN_PORT = Number(process.env.UDPCUSTOM_LISTEN_PORT || 5667);
 const UDPCUSTOM_SERVICE = String(process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom').trim() || 'sc-1forcr-udpcustom';
+const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
+const DROPBEAR_ALT_PORT = String(process.env.DROPBEAR_ALT_PORT || '143').trim();
 const ACTIVE_UDP_BACKEND = String(process.env.ACTIVE_UDP_BACKEND || '').trim().toLowerCase();
 const LOCK_MINUTES_RAW = Number(process.env.IPLIMIT_LOCK_MINUTES || 15);
 const LOCK_MINUTES = Number.isFinite(LOCK_MINUTES_RAW) && LOCK_MINUTES_RAW > 0 ? Math.floor(LOCK_MINUTES_RAW) : 15;
@@ -2080,9 +2082,11 @@ function get(sql, params = []) {
     db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row)));
   });
 }
-function safeExec(cmd, args) {
+function safeExec(cmd, args, input) {
   try {
-    execFileSync(cmd, args, { stdio: 'ignore' });
+    const opts = { stdio: ['pipe', 'ignore', 'ignore'] };
+    if (typeof input === 'string') opts.input = input;
+    execFileSync(cmd, args, opts);
     return true;
   } catch (_) {
     return false;
@@ -2538,7 +2542,12 @@ async function unlockExpired(nowTs) {
       for (const item of ipRows) {
         removeUdpDropRule(String(item?.ip || ''), udpcustomPort);
       }
-      safeExec('passwd', ['-u', u]);
+      const sshRow = await get("SELECT password FROM account_sshs WHERE LOWER(username)=LOWER(?)", [u]).catch(() => null);
+      const pass = String(sshRow?.password || '').trim();
+      const unlocked = safeExec('passwd', ['-u', u]) || safeExec('usermod', ['-U', u]);
+      if (!unlocked && pass) {
+        safeExec('chpasswd', [], `${u}:${pass}\n`);
+      }
       await run("UPDATE account_sshs SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
       if (Number(row.zivpn_removed || 0) === 1) {
         if (addZivpnUser(u)) zivpnChanged = true;
@@ -2586,6 +2595,8 @@ async function lockIfExceeded(nowTs) {
 
     // Putuskan sesi aktif SSH user yang baru di-lock.
     safeExec('pkill', ['-KILL', '-u', user]);
+    safeExec('pkill', ['-KILL', '-f', `sshd: ${user}`]);
+    safeExec('pkill', ['-KILL', '-f', `dropbear.*\\[${user}\\]`]);
     safeExec('passwd', ['-l', user]);
 
     // Untuk UDPHC: drop semua src IP aktif user ini selama masa lock.
@@ -5341,10 +5352,12 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_status tmp_recent
+  local tmp_status tmp_recent tmp_proc tmp_merge
   tmp_status="$(mktemp)"
   tmp_recent="$(mktemp)"
-  trap 'rm -f "${tmp_status:-}" "${tmp_recent:-}"' RETURN
+  tmp_proc="$(mktemp)"
+  tmp_merge="$(mktemp)"
+  trap 'rm -f "${tmp_status:-}" "${tmp_recent:-}" "${tmp_proc:-}" "${tmp_merge:-}"' RETURN
 
   journalctl -u dropbear --since "-2 min" -n 50000 --no-pager 2>/dev/null | awk '
     /auth succeeded for /{
@@ -5366,6 +5379,42 @@ show_ssh_only_online() {
       for (k in seen){ split(k,a,"|"); cnt[a[1]]++ }
       for (u in cnt) print u, cnt[u]
     }' > "${tmp_recent}"
+
+  # Fallback agar tetap kebaca saat tidak ada auth baru dalam 2 menit.
+  ps -eo args= 2>/dev/null | awk '
+    {
+      u="";
+      if ($0 ~ /^sshd:[[:space:]]+/) {
+        if ($0 ~ /\[priv\]/ || $0 ~ /\[preauth\]/ || $0 ~ /\[listener\]/) next;
+        u=$0;
+        sub(/^sshd:[[:space:]]*/, "", u);
+        sub(/[[:space:]].*$/, "", u);
+        sub(/@.*$/, "", u);
+        sub(/\[.*$/, "", u);
+      } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
+        u=$0;
+        sub(/^.*dropbear[^[:space:]]*[[:space:]]+\[/, "", u);
+        sub(/\].*$/, "", u);
+      } else next;
+      u=tolower(u);
+      if (u !~ /^[a-z0-9._-]+$/) next;
+      if (u == "root" || u == "priv" || u == "net") next;
+      cnt[u]++;
+    }
+    END { for (u in cnt) print u, cnt[u]; }' > "${tmp_proc}"
+
+  awk '
+    NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
+    { b[$1]=$2+0; seen[$1]=1; }
+    END {
+      for (u in seen) {
+        x=(u in a ? a[u] : 0);
+        y=(u in b ? b[u] : 0);
+        n=(x > y ? x : y);
+        if (n > 0) print u, n;
+      }
+    }' "${tmp_recent}" "${tmp_proc}" > "${tmp_merge}"
+  mv -f "${tmp_merge}" "${tmp_recent}"
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
