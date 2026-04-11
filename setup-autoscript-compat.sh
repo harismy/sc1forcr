@@ -2150,10 +2150,10 @@ function isLoopbackIp(ip) {
 }
 
 function getDropbearPortSet() {
-  const ports = [DROPBEAR_PORT, DROPBEAR_ALT_PORT]
+  const ports = [DROPBEAR_PORT, DROPBEAR_ALT_PORT, '22']
     .map((v) => String(v || '').trim())
     .filter((v) => /^[0-9]{1,5}$/.test(v));
-  if (ports.length === 0) return new Set(['109', '143']);
+  if (ports.length === 0) return new Set(['109', '143', '22']);
   return new Set(ports);
 }
 
@@ -2332,41 +2332,8 @@ function parseSshAndUdpUsage() {
     addSessionKeyToUserMap(procSessionMap, user, `proc-pid:${pid}`);
   }
 
-  // UDP Custom realtime (short window) from journal.
-  let jOut = '';
-  try {
-    jOut = execFileSync(
-      'journalctl',
-      ['-u', UDPCUSTOM_SERVICE, '--since', '-20 min', '-n', '10000', '--no-pager'],
-      { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }
-    );
-  } catch (_) {}
-  for (const lineRaw of String(jOut || '').split('\n')) {
-    const line = String(lineRaw || '');
-    let user = '';
-    let src = '';
-    let m = line.match(/\[src:([^\]]+)\]\s+\[user:([^\]]+)\]\s+Client connected/i);
-    if (m) {
-      src = m[1];
-      user = m[2];
-    } else {
-      m = line.match(/user[=: ]([^\s,]+).*src[=: ]([^\s,]+)/i);
-      if (m) {
-        user = m[1];
-        src = m[2];
-      } else {
-        m = line.match(/src[=: ]([^\s,]+).*user[=: ]([^\s,]+)/i);
-        if (m) {
-          src = m[1];
-          user = m[2];
-        }
-      }
-    }
-    const ip = extractIp(src);
-    addIpToUserMap(ipMap, user, ip);
-    // Count UDP sessions by source IP (not src port) to avoid false multi-login on reconnect.
-    if (ip) addSessionKeyToUserMap(sessionMap, user, `udp-ip:${ip}`);
-  }
+  // Catatan: keputusan lock akun SSH dihitung dari data SSH/Dropbear/WSS saja.
+  // Jangan campur log UDPHC di sini agar perilaku lock SSH konsisten.
   return { ipMap, sessionMap, recentAuthMap, procSessionMap, wsClientPortMap };
 }
 
