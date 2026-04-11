@@ -2635,11 +2635,21 @@ async function unlockExpired(nowTs) {
       for (const item of ipRows) {
         removeUdpDropRule(String(item?.ip || ''), udpcustomPort);
       }
-      const sshRow = await get("SELECT password FROM account_sshs WHERE LOWER(username)=LOWER(?)", [u]).catch(() => null);
+      const sshRow = await get("SELECT password, date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?)", [u]).catch(() => null);
       const pass = String(sshRow?.password || '').trim();
-      const unlocked = safeExec('passwd', ['-u', u]) || safeExec('usermod', ['-U', u]);
+      const expDate = String(sshRow?.date_exp || '').trim();
+      // Selalu sinkronkan ulang kredensial Linux dari DB saat unlock.
+      if (pass) {
+        safeExec('chpasswd', [], `${u}:${pass}\n`);
+      }
+      safeExec('usermod', ['-s', '/bin/bash', u]);
+      if (/^\d{4}-\d{2}-\d{2}$/.test(expDate)) {
+        safeExec('chage', ['-E', expDate, u]);
+      }
+      let unlocked = safeExec('passwd', ['-u', u]) || safeExec('usermod', ['-U', u]);
       if (!unlocked && pass) {
         safeExec('chpasswd', [], `${u}:${pass}\n`);
+        unlocked = safeExec('passwd', ['-u', u]) || safeExec('usermod', ['-U', u]);
       }
       await run("UPDATE account_sshs SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
       if (Number(row.zivpn_removed || 0) === 1) {
