@@ -2694,12 +2694,32 @@ async function lockIfExceeded(nowTs) {
     const user = String(r.username || '').trim();
     const pass = String(r.password || '').trim();
     const userKey = user.toLowerCase();
+    const passKey = pass.toLowerCase();
+    const keyCandidates = passKey && passKey !== userKey ? [userKey, passKey] : [userKey];
+    const setMaxSize = (m) => {
+      let max = 0;
+      for (const k of keyCandidates) {
+        if (m.has(k)) {
+          const n = m.get(k).size;
+          if (n > max) max = n;
+        }
+      }
+      return max;
+    };
+    const setUnionValues = (m) => {
+      const out = new Set();
+      for (const k of keyCandidates) {
+        if (!m.has(k)) continue;
+        for (const v of m.get(k)) out.add(v);
+      }
+      return out;
+    };
     const lim = Number(r.limitip || 0);
-    const cntIp = sshIpMap.has(userKey) ? sshIpMap.get(userKey).size : 0;
-    const cntSession = sshSessionMap.has(userKey) ? sshSessionMap.get(userKey).size : 0;
-    const cntWsPorts = sshWsClientPortMap.has(userKey) ? sshWsClientPortMap.get(userKey).size : 0;
-    const cntRecent = sshRecentAuthMap.has(userKey) ? sshRecentAuthMap.get(userKey).size : 0;
-    const cntProc = sshProcSessionMap.has(userKey) ? sshProcSessionMap.get(userKey).size : 0;
+    const cntIp = setMaxSize(sshIpMap);
+    const cntSession = setMaxSize(sshSessionMap);
+    const cntWsPorts = setMaxSize(sshWsClientPortMap);
+    const cntRecent = setMaxSize(sshRecentAuthMap);
+    const cntProc = setMaxSize(sshProcSessionMap);
     // Sumber realtime utama:
     // - ipMap/sessionMap untuk SSH normal
     // - wsClientPortMap untuk jalur HC/WS (satu koneksi = satu client port)
@@ -2717,14 +2737,14 @@ async function lockIfExceeded(nowTs) {
     safeExec('pkill', ['-KILL', '-u', user]);
     safeExec('pkill', ['-KILL', '-f', `sshd: ${user}`]);
     safeExec('pkill', ['-KILL', '-f', `dropbear.*\\[${user}\\]`]);
-    const activeWsPorts = Array.from(sshWsClientPortMap.get(userKey) || []);
-    const recentAuthPorts = Array.from(extractClientPortsFromSessionKeys(sshRecentAuthMap.get(userKey) || new Set()));
-    const sessionPorts = Array.from(extractClientPortsFromSessionKeys(sshSessionMap.get(userKey) || new Set()));
+    const activeWsPorts = Array.from(setUnionValues(sshWsClientPortMap));
+    const recentAuthPorts = Array.from(extractClientPortsFromSessionKeys(setUnionValues(sshRecentAuthMap)));
+    const sessionPorts = Array.from(extractClientPortsFromSessionKeys(setUnionValues(sshSessionMap)));
     disconnectSshWsByClientPorts(Array.from(new Set([...activeWsPorts, ...recentAuthPorts, ...sessionPorts])));
     safeExec('passwd', ['-l', user]);
 
     // Untuk UDPHC: drop semua src IP aktif user ini selama masa lock.
-    const lockIps = Array.from(sshIpMap.get(userKey) || []);
+    const lockIps = Array.from(setUnionValues(sshIpMap));
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     for (const ip of lockIps) {
       if (addUdpDropRule(ip, udpcustomPort)) {
