@@ -2697,9 +2697,13 @@ async function lockIfExceeded(nowTs) {
     const lim = Number(r.limitip || 0);
     const cntIp = sshIpMap.has(userKey) ? sshIpMap.get(userKey).size : 0;
     const cntSession = sshSessionMap.has(userKey) ? sshSessionMap.get(userKey).size : 0;
+    const cntWsPorts = sshWsClientPortMap.has(userKey) ? sshWsClientPortMap.get(userKey).size : 0;
     const cntRecent = sshRecentAuthMap.has(userKey) ? sshRecentAuthMap.get(userKey).size : 0;
     const cntProc = sshProcSessionMap.has(userKey) ? sshProcSessionMap.get(userKey).size : 0;
-    const cntActive = Math.max(cntIp, cntSession);
+    // Sumber realtime utama:
+    // - ipMap/sessionMap untuk SSH normal
+    // - wsClientPortMap untuk jalur HC/WS (satu koneksi = satu client port)
+    const cntActive = Math.max(cntIp, cntSession, cntWsPorts);
     // Fallback process/recent sering overcount saat reconnect beruntun.
     // Gunakan sebagai indikator biner (ada sesi=1), bukan jumlah sesi.
     const cntProcHint = cntProc > 0 ? 1 : 0;
