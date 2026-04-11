@@ -2066,6 +2066,7 @@ const LOCK_MINUTES_RAW = Number(process.env.IPLIMIT_LOCK_MINUTES || 15);
 const LOCK_MINUTES = Number.isFinite(LOCK_MINUTES_RAW) && LOCK_MINUTES_RAW > 0 ? Math.floor(LOCK_MINUTES_RAW) : 15;
 const LOCK_SECONDS = LOCK_MINUTES * 60;
 const RECENT_AUTH_WINDOW_MINUTES = Math.max(5, CHECK_INTERVAL_MINUTES * 3);
+const IPLIMIT_DEBUG = String(process.env.IPLIMIT_DEBUG || '1').trim() === '1';
 
 const db = new sqlite3.Database(DB_PATH);
 
@@ -2696,6 +2697,9 @@ async function lockIfExceeded(nowTs) {
     const cntProcHint = Math.min(Math.max(cntProc, 0), 3);
     const cntRecentHint = cntRecent > 0 ? 1 : 0;
     const cnt = Math.max(cntActive, cntProcHint, cntRecentHint);
+    if (IPLIMIT_DEBUG) {
+      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
+    }
     if (cnt <= lim) continue;
     const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]);
     if (exists) continue;
