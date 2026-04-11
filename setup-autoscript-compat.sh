@@ -2704,11 +2704,11 @@ async function lockIfExceeded(nowTs) {
     // - ipMap/sessionMap untuk SSH normal
     // - wsClientPortMap untuk jalur HC/WS (satu koneksi = satu client port)
     const cntActive = Math.max(cntIp, cntSession, cntWsPorts);
-    // Fallback process/recent sering overcount saat reconnect beruntun.
-    // Gunakan sebagai indikator biner (ada sesi=1), bukan jumlah sesi.
-    const cntProcHint = cntProc > 0 ? 1 : 0;
+    // proc dipakai sebagai fallback kuantitatif ringan (cap) agar kasus 2 HP tetap terdeteksi.
+    // recent-auth tetap hanya indikator biner untuk hindari re-lock loop karena reconnect spam.
+    const cntProcHint = Math.min(Math.max(cntProc, 0), 3);
     const cntRecentHint = cntRecent > 0 ? 1 : 0;
-    const cnt = cntActive > 0 ? cntActive : Math.max(cntProcHint, cntRecentHint);
+    const cnt = Math.max(cntActive, cntProcHint, cntRecentHint);
     if (cnt <= lim) continue;
     const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]);
     if (exists) continue;
