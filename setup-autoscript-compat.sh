@@ -2689,7 +2689,9 @@ async function lockIfExceeded(nowTs) {
     const cntSession = sshSessionMap.has(userKey) ? sshSessionMap.get(userKey).size : 0;
     const cntRecent = sshRecentAuthMap.has(userKey) ? sshRecentAuthMap.get(userKey).size : 0;
     const cntProc = sshProcSessionMap.has(userKey) ? sshProcSessionMap.get(userKey).size : 0;
-    const cnt = Math.max(cntIp, cntSession, cntRecent, cntProc);
+    const cntActive = Math.max(cntIp, cntSession, cntProc);
+    // Recent-auth hanya sebagai fallback ketika sesi aktif tidak terbaca (hindari re-lock loop).
+    const cnt = cntActive > 0 ? cntActive : cntRecent;
     if (cnt <= lim) continue;
     const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]);
     if (exists) continue;
