@@ -2419,6 +2419,45 @@ function addZivpnUser(username) {
   }
 }
 
+function removeUdpcustomUser(secret) {
+  try {
+    const key = String(secret || '').trim();
+    if (!key) return false;
+    if (!fs.existsSync(UDPCUSTOM_CONFIG)) return false;
+    const root = JSON.parse(fs.readFileSync(UDPCUSTOM_CONFIG, 'utf8'));
+    if (!root.auth || typeof root.auth !== 'object') return false;
+    if (!Array.isArray(root.auth.config)) return false;
+    const before = root.auth.config.length;
+    root.auth.config = root.auth.config.filter((v) => String(v || '').trim() !== key);
+    const changed = root.auth.config.length !== before;
+    if (changed) fs.writeFileSync(UDPCUSTOM_CONFIG, JSON.stringify(root, null, 2));
+    return changed;
+  } catch (_) {
+    return false;
+  }
+}
+
+function addUdpcustomUser(secret) {
+  try {
+    const key = String(secret || '').trim();
+    if (!key) return false;
+    let root = { auth: { mode: 'passwords', config: [] } };
+    if (fs.existsSync(UDPCUSTOM_CONFIG)) root = JSON.parse(fs.readFileSync(UDPCUSTOM_CONFIG, 'utf8'));
+    if (!root.auth || typeof root.auth !== 'object') root.auth = {};
+    if (!Array.isArray(root.auth.config)) root.auth.config = [];
+    root.auth.mode = 'passwords';
+    const set = new Set(root.auth.config.map((v) => String(v || '').trim()).filter(Boolean));
+    const before = set.size;
+    set.add(key);
+    const changed = set.size !== before;
+    root.auth.config = Array.from(set);
+    if (changed) fs.writeFileSync(UDPCUSTOM_CONFIG, JSON.stringify(root, null, 2));
+    return changed;
+  } catch (_) {
+    return false;
+  }
+}
+
 function restartService(service) {
   if (!service) return;
   if (!safeExec('systemctl', ['restart', service])) safeExec('service', [service, 'restart']);
@@ -2430,6 +2469,16 @@ function shouldRestartZivpn() {
   }
   if (ACTIVE_UDP_BACKEND === 'zivpn') return true;
   return safeExec('systemctl', ['is-active', '--quiet', ZIVPN_SERVICE]);
+}
+
+function shouldRestartUdpcustom() {
+  if (ACTIVE_UDP_BACKEND === 'zivpn') {
+    return false;
+  }
+  if (ACTIVE_UDP_BACKEND === 'udpcustom' || ACTIVE_UDP_BACKEND === 'udp-custom' || ACTIVE_UDP_BACKEND === 'udphc') {
+    return true;
+  }
+  return safeExec('systemctl', ['is-active', '--quiet', UDPCUSTOM_SERVICE]);
 }
 
 function getUdpCustomListenPort() {
@@ -2534,11 +2583,12 @@ async function ensureTables() {
 
 async function unlockExpired(nowTs) {
   const rows = await all("SELECT account_type, username, zivpn_removed FROM temp_ip_locks WHERE locked_until <= ?", [nowTs]);
-  if (rows.length === 0) return { xrayChanged: false, zivpnChanged: false };
+  if (rows.length === 0) return { xrayChanged: false, zivpnChanged: false, udpcustomChanged: false };
 
   const udpcustomPort = getUdpCustomListenPort();
   let xrayChanged = false;
   let zivpnChanged = false;
+  let udpcustomChanged = false;
   for (const row of rows) {
     const t = String(row.account_type || '');
     const u = String(row.username || '');
@@ -2557,6 +2607,11 @@ async function unlockExpired(nowTs) {
       if (Number(row.zivpn_removed || 0) === 1) {
         if (addZivpnUser(u)) zivpnChanged = true;
       }
+      if (pass) {
+        if (addUdpcustomUser(pass)) udpcustomChanged = true;
+      } else if (addUdpcustomUser(u)) {
+        udpcustomChanged = true;
+      }
     } else if (t === 'vmess') {
       await run("UPDATE account_vmesses SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
       xrayChanged = true;
@@ -2570,7 +2625,7 @@ async function unlockExpired(nowTs) {
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
   }
-  return { xrayChanged, zivpnChanged };
+  return { xrayChanged, zivpnChanged, udpcustomChanged };
 }
 
 async function lockIfExceeded(nowTs) {
@@ -2583,10 +2638,12 @@ async function lockIfExceeded(nowTs) {
   const udpcustomPort = getUdpCustomListenPort();
   let xrayChanged = false;
   let zivpnChanged = false;
+  let udpcustomChanged = false;
 
-  const sshRows = await all("SELECT username, limitip FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(limitip,0) AS INTEGER) > 0");
+  const sshRows = await all("SELECT username, password, limitip FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(limitip,0) AS INTEGER) > 0");
   for (const r of sshRows) {
     const user = String(r.username || '').trim();
+    const pass = String(r.password || '').trim();
     const userKey = user.toLowerCase();
     const lim = Number(r.limitip || 0);
     const cntIp = sshIpMap.has(userKey) ? sshIpMap.get(userKey).size : 0;
@@ -2615,6 +2672,12 @@ async function lockIfExceeded(nowTs) {
 
     const removed = removeZivpnUser(user) ? 1 : 0;
     if (removed) zivpnChanged = true;
+    let udphcSecretChanged = false;
+    if (pass) {
+      if (removeUdpcustomUser(pass)) udphcSecretChanged = true;
+    }
+    if (removeUdpcustomUser(user)) udphcSecretChanged = true;
+    if (udphcSecretChanged) udpcustomChanged = true;
     await run("UPDATE account_sshs SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
     await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES('ssh', ?, ?, ?)", [user, nowTs + LOCK_SECONDS, removed]).catch(() => {});
   }
@@ -2639,7 +2702,7 @@ async function lockIfExceeded(nowTs) {
       xrayChanged = true;
     }
   }
-  return { xrayChanged, zivpnChanged };
+  return { xrayChanged, zivpnChanged, udpcustomChanged };
 }
 
 async function rebuildXrayFromDb() {
@@ -2686,6 +2749,9 @@ async function main() {
   if (u.xrayChanged || l.xrayChanged) await rebuildXrayFromDb();
   if ((u.zivpnChanged || l.zivpnChanged) && shouldRestartZivpn()) {
     restartService(ZIVPN_SERVICE);
+  }
+  if ((u.udpcustomChanged || l.udpcustomChanged) && shouldRestartUdpcustom()) {
+    restartService(UDPCUSTOM_SERVICE);
   }
   db.close();
 }
