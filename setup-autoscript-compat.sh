@@ -2058,9 +2058,14 @@ const UDPCUSTOM_SERVICE = String(process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udp
 const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
 const DROPBEAR_ALT_PORT = String(process.env.DROPBEAR_ALT_PORT || '143').trim();
 const ACTIVE_UDP_BACKEND = String(process.env.ACTIVE_UDP_BACKEND || '').trim().toLowerCase();
+const CHECK_INTERVAL_MINUTES_RAW = Number(process.env.IPLIMIT_CHECK_INTERVAL_MINUTES || 10);
+const CHECK_INTERVAL_MINUTES = Number.isFinite(CHECK_INTERVAL_MINUTES_RAW) && CHECK_INTERVAL_MINUTES_RAW > 0
+  ? Math.floor(CHECK_INTERVAL_MINUTES_RAW)
+  : 10;
 const LOCK_MINUTES_RAW = Number(process.env.IPLIMIT_LOCK_MINUTES || 15);
 const LOCK_MINUTES = Number.isFinite(LOCK_MINUTES_RAW) && LOCK_MINUTES_RAW > 0 ? Math.floor(LOCK_MINUTES_RAW) : 15;
 const LOCK_SECONDS = LOCK_MINUTES * 60;
+const RECENT_AUTH_WINDOW_MINUTES = Math.max(5, CHECK_INTERVAL_MINUTES * 3);
 
 const db = new sqlite3.Database(DB_PATH);
 
@@ -2257,7 +2262,7 @@ function parseSshAndUdpUsage() {
   try {
     dropbearRecent = execFileSync(
       'journalctl',
-      ['-u', 'dropbear', '--since', '-2 min', '-n', '10000', '--no-pager'],
+      ['-u', 'dropbear', '--since', `-${RECENT_AUTH_WINDOW_MINUTES} min`, '-n', '20000', '--no-pager'],
       { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }
     );
   } catch (_) {}
@@ -2769,8 +2774,11 @@ EOF
 Description=Run SC 1FORCR IP Limit Checker every ${iplimit_interval_min} minutes
 
 [Timer]
-OnBootSec=2min
+OnBootSec=15s
 OnUnitActiveSec=${iplimit_interval_min}min
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
 Unit=sc-1forcr-iplimit.service
 
 [Install]
@@ -3540,8 +3548,11 @@ write_iplimit_timer_unit() {
 Description=Run SC 1FORCR IP Limit Checker every ${interval} minutes
 
 [Timer]
-OnBootSec=2min
+OnBootSec=15s
 OnUnitActiveSec=${interval}min
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
 Unit=sc-1forcr-iplimit.service
 
 [Install]
@@ -5416,7 +5427,7 @@ show_ssh_only_online() {
     }' "${tmp_recent}" "${tmp_proc}" > "${tmp_merge}"
   mv -f "${tmp_merge}" "${tmp_recent}"
 
-  sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
+  sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
   echo "LIST USER LOGIN SSH (RECENT 2 MIN)"
   if [[ ! -s "${tmp_recent}" ]]; then
@@ -5427,15 +5438,23 @@ show_ssh_only_online() {
     return
   fi
 
-  printf "%-24s %-12s %-10s\n" "USERNAME" "STATUS" "SSH_SESI"
-  printf "%-24s %-12s %-10s\n" "------------------------" "------------" "----------"
+  printf "%-24s %-12s %-10s %-10s\n" "USERNAME" "STATUS" "SSH_SESI" "LIMIT_IP"
+  printf "%-24s %-12s %-10s %-10s\n" "------------------------" "------------" "----------" "----------"
   awk '
-    NR==FNR { split($0,a,"|"); st[a[1]]=a[2]; next }
+    NR==FNR {
+      split($0,a,"|");
+      st[a[1]]=a[2];
+      lim[a[1]]=(a[3] ~ /^[0-9]+$/ ? a[3] + 0 : 0);
+      next
+    }
     {
       u=$1; n=$2+0;
       s=(u in st ? st[u] : "AMAN");
-      out=(s=="LOCK" || s=="LOCK_TMP" ? "KENA_LOCK" : "AMAN");
-      printf "%-24s %-12s %-10d\n", u, out, n;
+      l=(u in lim ? lim[u] : 0);
+      if (s=="LOCK" || s=="LOCK_TMP") out="KENA_LOCK";
+      else if (l > 0 && n > l) out="MULTI_LOGIN";
+      else out="AMAN";
+      printf "%-24s %-12s %-10d %-10d\n", u, out, n, l;
       total_user++; total_sesi+=n;
     }
     END {
