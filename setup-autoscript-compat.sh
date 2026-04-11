@@ -2162,6 +2162,7 @@ function parseSshAndUdpUsage() {
   const ipMap = new Map();
   const sessionMap = new Map();
   const recentAuthMap = new Map();
+  const procSessionMap = new Map();
   const dropbearPorts = getDropbearPortSet();
   const dropbearActiveClientPorts = new Set();
 
@@ -2281,6 +2282,34 @@ function parseSshAndUdpUsage() {
     addSessionKeyToUserMap(sessionMap, user, `who:${host || 'local'}`);
   }
 
+  // Fallback HC: hitung sesi dari process list (tetap terbaca meski 1 IP/Wi-Fi).
+  let psAll = '';
+  try {
+    psAll = execFileSync('ps', ['-eo', 'pid=,args='], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+  } catch (_) {}
+  for (const lineRaw of String(psAll || '').split('\n')) {
+    const mm = String(lineRaw || '').match(/^\s*(\d+)\s+(.*)$/);
+    if (!mm) continue;
+    const pid = Number(mm[1]);
+    const args = String(mm[2] || '').trim();
+    if (!args) continue;
+    let user = '';
+    if (/^sshd:\s+/i.test(args)) {
+      if (/\[(priv|preauth|listener)\]/i.test(args)) continue;
+      user = args.replace(/^sshd:\s*/i, '').split(/\s+/)[0] || '';
+      user = user.replace(/@.*$/, '').replace(/\[.*$/, '');
+    } else if (/^dropbear[^\s]*\s+\[[^\]]+\]/i.test(args) || /\/dropbear-[^\s]+\s+\[[^\]]+\]/i.test(args)) {
+      const m = args.match(/\[([^\]]+)\]/);
+      user = String(m?.[1] || '').trim();
+    } else {
+      continue;
+    }
+    user = user.toLowerCase();
+    if (!/^[a-z0-9._-]+$/.test(user)) continue;
+    if (user === 'root' || user === 'priv' || user === 'net') continue;
+    addSessionKeyToUserMap(procSessionMap, user, `proc-pid:${pid}`);
+  }
+
   // UDP Custom realtime (short window) from journal.
   let jOut = '';
   try {
@@ -2316,7 +2345,7 @@ function parseSshAndUdpUsage() {
     // Count UDP sessions by source IP (not src port) to avoid false multi-login on reconnect.
     if (ip) addSessionKeyToUserMap(sessionMap, user, `udp-ip:${ip}`);
   }
-  return { ipMap, sessionMap, recentAuthMap };
+  return { ipMap, sessionMap, recentAuthMap, procSessionMap };
 }
 
 function parseXrayRecentIpMap() {
@@ -2535,6 +2564,7 @@ async function lockIfExceeded(nowTs) {
   const sshIpMap = sshUsage.ipMap;
   const sshSessionMap = sshUsage.sessionMap;
   const sshRecentAuthMap = sshUsage.recentAuthMap || new Map();
+  const sshProcSessionMap = sshUsage.procSessionMap || new Map();
   const xrayMap = parseXrayRecentIpMap();
   const udpcustomPort = getUdpCustomListenPort();
   let xrayChanged = false;
@@ -2548,7 +2578,8 @@ async function lockIfExceeded(nowTs) {
     const cntIp = sshIpMap.has(userKey) ? sshIpMap.get(userKey).size : 0;
     const cntSession = sshSessionMap.has(userKey) ? sshSessionMap.get(userKey).size : 0;
     const cntRecent = sshRecentAuthMap.has(userKey) ? sshRecentAuthMap.get(userKey).size : 0;
-    const cnt = Math.max(cntIp, cntSession, cntRecent);
+    const cntProc = sshProcSessionMap.has(userKey) ? sshProcSessionMap.get(userKey).size : 0;
+    const cnt = Math.max(cntIp, cntSession, cntRecent, cntProc);
     if (cnt <= lim) continue;
     const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]);
     if (exists) continue;
