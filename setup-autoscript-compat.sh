@@ -2065,7 +2065,7 @@ const CHECK_INTERVAL_MINUTES = Number.isFinite(CHECK_INTERVAL_MINUTES_RAW) && CH
 const LOCK_MINUTES_RAW = Number(process.env.IPLIMIT_LOCK_MINUTES || 15);
 const LOCK_MINUTES = Number.isFinite(LOCK_MINUTES_RAW) && LOCK_MINUTES_RAW > 0 ? Math.floor(LOCK_MINUTES_RAW) : 15;
 const LOCK_SECONDS = LOCK_MINUTES * 60;
-const RECENT_AUTH_WINDOW_MINUTES = Math.max(5, CHECK_INTERVAL_MINUTES * 3);
+const RECENT_AUTH_WINDOW_MINUTES = Math.max(2, CHECK_INTERVAL_MINUTES);
 const IPLIMIT_DEBUG = String(process.env.IPLIMIT_DEBUG || '1').trim() === '1';
 
 const db = new sqlite3.Database(DB_PATH);
@@ -2216,9 +2216,9 @@ function parseSshAndUdpUsage() {
     }
 
     // For HC/ssh-mux path, count unique active client-side ports to dropbear.
-    if (dropbearPorts.has(lport) && isLoopbackIp(rip) && rport) {
+    if (dropbearPorts.has(lport) && rport) {
       dropbearActiveClientPorts.add(rport);
-    } else if (dropbearPorts.has(rport) && isLoopbackIp(lip) && lport) {
+    } else if (dropbearPorts.has(rport) && lport) {
       dropbearActiveClientPorts.add(lport);
     }
   }
@@ -2284,7 +2284,7 @@ function parseSshAndUdpUsage() {
     const srcIp = extractIp(parsed.source);
     const clientPort = parsed.port;
     if (!user || !clientPort) continue;
-    const recentKey = srcIp ? `dropbear-recent-ip:${srcIp}` : `dropbear-recent-port:${clientPort}`;
+    const recentKey = srcIp ? `dropbear-recent-ipport:${srcIp}:${clientPort}` : `dropbear-recent-port:${clientPort}`;
     addSessionKeyToUserMap(recentAuthMap, user, recentKey);
     if (dropbearActiveClientPorts.has(clientPort)) {
       addPortToUserMap(wsClientPortMap, user, clientPort);
