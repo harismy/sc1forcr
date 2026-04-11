@@ -1161,7 +1161,7 @@ async function syncSshBackendsFromDb() {
   if (sshBackendSyncBusy) return;
   sshBackendSyncBusy = true;
   try {
-    const rows = await all("SELECT username, password FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
+    const rows = await all("SELECT username, password FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' ORDER BY LOWER(username)");
     const zivpnUsers = [];
     const udphcSecrets = [];
     const zivpnSeen = new Set();
@@ -1184,20 +1184,34 @@ async function syncSshBackendsFromDb() {
       let z = { auth: { mode: 'passwords', config: [] } };
       if (fs.existsSync(ZIVPN_CONFIG)) z = JSON.parse(fs.readFileSync(ZIVPN_CONFIG, 'utf8'));
       if (!z.auth || typeof z.auth !== 'object') z.auth = {};
-      z.auth.mode = 'passwords';
-      z.auth.config = zivpnUsers;
-      fs.writeFileSync(ZIVPN_CONFIG, JSON.stringify(z, null, 2));
-      scheduleZivpnReload(1500);
+      const prev = Array.isArray(z.auth.config)
+        ? Array.from(new Set(z.auth.config.map((v) => String(v || '').trim().toLowerCase()).filter(Boolean))).sort()
+        : [];
+      const next = Array.from(new Set(zivpnUsers.map((v) => String(v || '').trim().toLowerCase()).filter(Boolean))).sort();
+      const changed = z.auth.mode !== 'passwords' || JSON.stringify(prev) !== JSON.stringify(next);
+      if (changed) {
+        z.auth.mode = 'passwords';
+        z.auth.config = next;
+        fs.writeFileSync(ZIVPN_CONFIG, JSON.stringify(z, null, 2));
+        scheduleZivpnReload(1500);
+      }
     } catch (_) {}
 
     try {
       let u = { auth: { mode: 'passwords', config: [] } };
       if (fs.existsSync(UDPCUSTOM_CONFIG)) u = JSON.parse(fs.readFileSync(UDPCUSTOM_CONFIG, 'utf8'));
       if (!u.auth || typeof u.auth !== 'object') u.auth = {};
-      u.auth.mode = 'passwords';
-      u.auth.config = udphcSecrets;
-      fs.writeFileSync(UDPCUSTOM_CONFIG, JSON.stringify(u, null, 2));
-      scheduleUdpcustomReload(1200);
+      const prev = Array.isArray(u.auth.config)
+        ? Array.from(new Set(u.auth.config.map((v) => String(v || '').trim()).filter(Boolean))).sort()
+        : [];
+      const next = Array.from(new Set(udphcSecrets.map((v) => String(v || '').trim()).filter(Boolean))).sort();
+      const changed = u.auth.mode !== 'passwords' || JSON.stringify(prev) !== JSON.stringify(next);
+      if (changed) {
+        u.auth.mode = 'passwords';
+        u.auth.config = next;
+        fs.writeFileSync(UDPCUSTOM_CONFIG, JSON.stringify(u, null, 2));
+        scheduleUdpcustomReload(1200);
+      }
     } catch (_) {}
   } catch (_) {
     // no-op: keep API running even if background sync fails
