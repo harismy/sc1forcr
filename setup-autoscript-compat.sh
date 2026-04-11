@@ -2121,6 +2121,14 @@ function addSessionKeyToUserMap(map, username, key) {
   map.get(u).add(k);
 }
 
+function addPortToUserMap(map, username, port) {
+  const u = String(username || '').trim().toLowerCase();
+  const p = String(port || '').trim();
+  if (!u || !/^[0-9]{1,5}$/.test(p) || u === 'root') return;
+  if (!map.has(u)) map.set(u, new Set());
+  map.get(u).add(p);
+}
+
 function extractIp(raw) {
   let v = String(raw || '').trim();
   if (!v) return '';
@@ -2172,6 +2180,7 @@ function parseSshAndUdpUsage() {
   const sessionMap = new Map();
   const recentAuthMap = new Map();
   const procSessionMap = new Map();
+  const wsClientPortMap = new Map();
   const dropbearPorts = getDropbearPortSet();
   const dropbearActiveClientPorts = new Set();
 
@@ -2255,6 +2264,7 @@ function parseSshAndUdpUsage() {
     if (!dropbearActiveClientPorts.has(clientPort)) continue;
     addSessionKeyToUserMap(sessionMap, user, `dropbear-port:${clientPort}`);
     addIpToUserMap(ipMap, user, extractIp(src));
+    addPortToUserMap(wsClientPortMap, user, clientPort);
   }
 
   // Recent auth fallback (HC often rotates sessions quickly, so active socket mapping can miss).
@@ -2273,6 +2283,9 @@ function parseSshAndUdpUsage() {
     const clientPort = parsed.port;
     if (!user || !clientPort) continue;
     addSessionKeyToUserMap(recentAuthMap, user, `dropbear-recent:${clientPort}`);
+    if (dropbearActiveClientPorts.has(clientPort)) {
+      addPortToUserMap(wsClientPortMap, user, clientPort);
+    }
   }
 
   // Fallback: who entries (TTY login).
@@ -2354,7 +2367,7 @@ function parseSshAndUdpUsage() {
     // Count UDP sessions by source IP (not src port) to avoid false multi-login on reconnect.
     if (ip) addSessionKeyToUserMap(sessionMap, user, `udp-ip:${ip}`);
   }
-  return { ipMap, sessionMap, recentAuthMap, procSessionMap };
+  return { ipMap, sessionMap, recentAuthMap, procSessionMap, wsClientPortMap };
 }
 
 function parseXrayRecentIpMap() {
@@ -2564,6 +2577,15 @@ function removeUdpDropRule(ip, port) {
   }
 }
 
+function disconnectSshWsByClientPorts(ports) {
+  const list = Array.from(new Set((ports || []).map((v) => String(v || '').trim()).filter((v) => /^[0-9]{1,5}$/.test(v))));
+  for (const p of list) {
+    safeExec('ss', ['-K', `sport = :${p}`]);
+    safeExec('ss', ['-K', `src 127.0.0.1 sport = :${p}`]);
+    safeExec('ss', ['-K', `src ::1 sport = :${p}`]);
+  }
+}
+
 async function ensureTables() {
   await run(`CREATE TABLE IF NOT EXISTS temp_ip_locks (
     account_type TEXT NOT NULL,
@@ -2634,6 +2656,7 @@ async function lockIfExceeded(nowTs) {
   const sshSessionMap = sshUsage.sessionMap;
   const sshRecentAuthMap = sshUsage.recentAuthMap || new Map();
   const sshProcSessionMap = sshUsage.procSessionMap || new Map();
+  const sshWsClientPortMap = sshUsage.wsClientPortMap || new Map();
   const xrayMap = parseXrayRecentIpMap();
   const udpcustomPort = getUdpCustomListenPort();
   let xrayChanged = false;
@@ -2659,6 +2682,7 @@ async function lockIfExceeded(nowTs) {
     safeExec('pkill', ['-KILL', '-u', user]);
     safeExec('pkill', ['-KILL', '-f', `sshd: ${user}`]);
     safeExec('pkill', ['-KILL', '-f', `dropbear.*\\[${user}\\]`]);
+    disconnectSshWsByClientPorts(Array.from(sshWsClientPortMap.get(userKey) || []));
     safeExec('passwd', ['-l', user]);
 
     // Untuk UDPHC: drop semua src IP aktif user ini selama masa lock.
