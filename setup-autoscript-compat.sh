@@ -39,11 +39,12 @@ set -euo pipefail
 #   AUTO_BACKUP_KEEP_DAYS=7                      (opsional)
 #   IPLIMIT_CHECK_INTERVAL_MINUTES=10            (opsional, interval checker iplimit dalam menit)
 #   IPLIMIT_LOCK_MINUTES=15                      (opsional, durasi lock sementara dalam menit)
+#   IPLIMIT_AUTO_TUNE=1                          (opsional, 1=otomatis tuning berbasis RAM/vCPU)
 #   IPLIMIT_DEBUG=0                              (opsional, 0=hemat log, 1=debug detail)
-#   DROPBEAR_LOG_MAX_LINES=12000                 (opsional, batas scan log dropbear umum)
-#   DROPBEAR_RECENT_LOG_MAX_LINES=5000           (opsional, batas scan log dropbear recent)
-#   UDPHC_LOG_LINES_HISTORY=1200                 (opsional, batas scan log UDPHC mode history)
-#   UDPHC_LOG_LINES_REALTIME=400                 (opsional, batas scan log UDPHC realtime)
+#   DROPBEAR_LOG_MAX_LINES=auto                  (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
+#   DROPBEAR_RECENT_LOG_MAX_LINES=auto           (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
+#   UDPHC_LOG_LINES_HISTORY=auto                 (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
+#   UDPHC_LOG_LINES_REALTIME=auto                (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   XRAY_BLOCK_TCP_PORTS=80,443                  (opsional, port TCP yang diblok saat lock tmp xray)
 #   DB_PATH=/usr/sbin/potatonc/potato.db
 #   APP_DIR=/opt/sc-1forcr
@@ -79,11 +80,12 @@ AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
 AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-10}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
-IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-0}"
-DROPBEAR_LOG_MAX_LINES="${DROPBEAR_LOG_MAX_LINES:-12000}"
-DROPBEAR_RECENT_LOG_MAX_LINES="${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}"
-UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-1200}"
-UDPHC_LOG_LINES_REALTIME="${UDPHC_LOG_LINES_REALTIME:-400}"
+IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
+IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-}"
+DROPBEAR_LOG_MAX_LINES="${DROPBEAR_LOG_MAX_LINES:-}"
+DROPBEAR_RECENT_LOG_MAX_LINES="${DROPBEAR_RECENT_LOG_MAX_LINES:-}"
+UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-}"
+UDPHC_LOG_LINES_REALTIME="${UDPHC_LOG_LINES_REALTIME:-}"
 XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
 SSH_HC_AUTH_LOOKBACK_HOURS="${SSH_HC_AUTH_LOOKBACK_HOURS:-24}"
 
@@ -116,6 +118,97 @@ fi
 log() {
   echo "[autoscript-compat] $*"
 }
+
+normalize_bool_01() {
+  local raw
+  raw="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${raw}" in
+    1|true|yes|on) echo "1" ;;
+    *) echo "0" ;;
+  esac
+}
+
+get_total_ram_mib() {
+  local kib
+  kib="$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null || true)"
+  if [[ -z "${kib}" || ! "${kib}" =~ ^[0-9]+$ ]]; then
+    echo "1024"
+    return
+  fi
+  echo "$((kib / 1024))"
+}
+
+get_cpu_cores() {
+  local cores
+  cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+  if [[ -z "${cores}" || ! "${cores}" =~ ^[0-9]+$ || "${cores}" -lt 1 ]]; then
+    echo "1"
+    return
+  fi
+  echo "${cores}"
+}
+
+auto_tune_iplimit_vars() {
+  local profile_debug profile_dropbear profile_recent profile_udphc_hist profile_udphc_rt profile_users
+  profile_debug="0"
+  profile_dropbear="12000"
+  profile_recent="5000"
+  profile_udphc_hist="1200"
+  profile_udphc_rt="400"
+  profile_users="80-100"
+
+  if [[ "$(normalize_bool_01 "${IPLIMIT_AUTO_TUNE}")" == "1" ]]; then
+    local ram_mib ram_gb cores tier
+    ram_mib="$(get_total_ram_mib)"
+    cores="$(get_cpu_cores)"
+    ram_gb=$((ram_mib / 1024))
+    (( ram_gb < 1 )) && ram_gb=1
+
+    # Tier konservatif: ambil bottleneck antara RAM dan vCPU.
+    tier="${ram_gb}"
+    (( cores < tier )) && tier="${cores}"
+    (( tier < 1 )) && tier=1
+
+    if (( tier >= 8 )); then
+      profile_dropbear="36000"
+      profile_recent="14000"
+      profile_udphc_hist="3200"
+      profile_udphc_rt="1000"
+      profile_users="220-300"
+    elif (( tier >= 4 )); then
+      profile_dropbear="22000"
+      profile_recent="9000"
+      profile_udphc_hist="2200"
+      profile_udphc_rt="700"
+      profile_users="150-220"
+    elif (( tier >= 2 )); then
+      profile_dropbear="16000"
+      profile_recent="6500"
+      profile_udphc_hist="1600"
+      profile_udphc_rt="500"
+      profile_users="100-150"
+    fi
+    log "IPLIMIT auto-tune aktif: RAM=${ram_gb}GB vCPU=${cores} tier=${tier} target_user~${profile_users}"
+  fi
+
+  [[ -z "${IPLIMIT_DEBUG}" ]] && IPLIMIT_DEBUG="${profile_debug}"
+  [[ -z "${DROPBEAR_LOG_MAX_LINES}" ]] && DROPBEAR_LOG_MAX_LINES="${profile_dropbear}"
+  [[ -z "${DROPBEAR_RECENT_LOG_MAX_LINES}" ]] && DROPBEAR_RECENT_LOG_MAX_LINES="${profile_recent}"
+  [[ -z "${UDPHC_LOG_LINES_HISTORY}" ]] && UDPHC_LOG_LINES_HISTORY="${profile_udphc_hist}"
+  [[ -z "${UDPHC_LOG_LINES_REALTIME}" ]] && UDPHC_LOG_LINES_REALTIME="${profile_udphc_rt}"
+
+  IPLIMIT_DEBUG="$(normalize_bool_01 "${IPLIMIT_DEBUG}")"
+  DROPBEAR_LOG_MAX_LINES="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9')"
+  DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
+  UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
+  UDPHC_LOG_LINES_REALTIME="$(echo "${UDPHC_LOG_LINES_REALTIME:-400}" | tr -cd '0-9')"
+  [[ -z "${DROPBEAR_LOG_MAX_LINES}" || "${DROPBEAR_LOG_MAX_LINES}" -lt 2000 ]] && DROPBEAR_LOG_MAX_LINES="12000"
+  [[ -z "${DROPBEAR_RECENT_LOG_MAX_LINES}" || "${DROPBEAR_RECENT_LOG_MAX_LINES}" -lt 500 ]] && DROPBEAR_RECENT_LOG_MAX_LINES="5000"
+  [[ -z "${UDPHC_LOG_LINES_HISTORY}" || "${UDPHC_LOG_LINES_HISTORY}" -lt 200 ]] && UDPHC_LOG_LINES_HISTORY="1200"
+  [[ -z "${UDPHC_LOG_LINES_REALTIME}" || "${UDPHC_LOG_LINES_REALTIME}" -lt 100 ]] && UDPHC_LOG_LINES_REALTIME="400"
+}
+
+auto_tune_iplimit_vars
 
 check_supported_os() {
   local id ver major
@@ -1063,6 +1156,7 @@ UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
 ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
+IPLIMIT_AUTO_TUNE=${IPLIMIT_AUTO_TUNE}
 IPLIMIT_DEBUG=${IPLIMIT_DEBUG}
 DROPBEAR_LOG_MAX_LINES=${DROPBEAR_LOG_MAX_LINES}
 DROPBEAR_RECENT_LOG_MAX_LINES=${DROPBEAR_RECENT_LOG_MAX_LINES}
@@ -3668,6 +3762,7 @@ AUTO_BACKUP_DIR=${AUTO_BACKUP_DIR}
 AUTO_BACKUP_KEEP_DAYS=${AUTO_BACKUP_KEEP_DAYS}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
+IPLIMIT_AUTO_TUNE=${IPLIMIT_AUTO_TUNE}
 IPLIMIT_DEBUG=${IPLIMIT_DEBUG}
 DROPBEAR_LOG_MAX_LINES=${DROPBEAR_LOG_MAX_LINES}
 DROPBEAR_RECENT_LOG_MAX_LINES=${DROPBEAR_RECENT_LOG_MAX_LINES}
@@ -5163,6 +5258,46 @@ get_hc_auth_lookback_hours() {
   echo "${h}"
 }
 
+menu_bool_01() {
+  local raw
+  raw="$(echo "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${raw}" in
+    1|true|yes|on) echo "1" ;;
+    *) echo "0" ;;
+  esac
+}
+
+get_server_capacity_profile() {
+  local ram_kib ram_mb ram_gb cores tier est
+  ram_kib="$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null || true)"
+  if [[ -z "${ram_kib}" || ! "${ram_kib}" =~ ^[0-9]+$ ]]; then
+    ram_mb="1024"
+  else
+    ram_mb="$((ram_kib / 1024))"
+  fi
+  (( ram_mb < 256 )) && ram_mb=1024
+  ram_gb="$((ram_mb / 1024))"
+  (( ram_gb < 1 )) && ram_gb=1
+
+  cores="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+  [[ -z "${cores}" || ! "${cores}" =~ ^[0-9]+$ || "${cores}" -lt 1 ]] && cores=1
+
+  tier="${ram_gb}"
+  (( cores < tier )) && tier="${cores}"
+  (( tier < 1 )) && tier=1
+
+  est="80-100"
+  if (( tier >= 8 )); then
+    est="220-300"
+  elif (( tier >= 4 )); then
+    est="150-220"
+  elif (( tier >= 2 )); then
+    est="100-150"
+  fi
+
+  echo "${ram_gb}|${cores}|${tier}|${est}"
+}
+
 bytes_human() {
   local bytes="${1:-0}"
   if [[ -z "${bytes}" || ! "${bytes}" =~ ^[0-9]+$ ]]; then
@@ -5222,6 +5357,7 @@ draw_dashboard() {
   local ssh_on xray_on ws_on loadblc_on zivpn_on udphc_on
   local c_ssh c_vmess c_vless c_trojan
   local health
+  local cap_ram_gb cap_cores cap_tier cap_est cap_mode
   local line
 
   # Color definitions
@@ -5269,6 +5405,12 @@ draw_dashboard() {
   c_trojan="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_trojans;" 2>/dev/null || echo 0)"
 
   read_vnstat_stats
+  IFS='|' read -r cap_ram_gb cap_cores cap_tier cap_est <<< "$(get_server_capacity_profile)"
+  if [[ "$(menu_bool_01 "${IPLIMIT_AUTO_TUNE:-1}")" == "1" ]]; then
+    cap_mode="AUTO"
+  else
+    cap_mode="MANUAL"
+  fi
 
   # Helper for separator (without right border)
   hr() {
@@ -5285,6 +5427,11 @@ draw_dashboard() {
   printf "│   OS      : ${os_name}${NC}                              \n"
   printf "│   RAM     : ${ram_mb:-"-"}  │ SWAP : ${swap_mb:-"-"}${NC}                         \n"
   printf "│   UPTIME  : ${uptime_h}h ${uptime_m}m${NC}                                           \n"
+  printf "|   Spesifikasi server anda: ${cap_ram_gb} GB RAM / ${cap_cores} vCPU${NC}                    \n"
+  printf "|   Auto tuning SC      : ${cap_mode} (tier ${cap_tier})${NC}                               \n"
+  printf "|   Estimasi akun SSH   : sekitar ${cap_est} user${NC}                              \n"
+  printf "|   Script menyesuaikan limit scan log agar tidak terlalu berat di server.${NC}      \n"
+  printf "|   Auto tunning ini memprediksi estimasi akun dengan mengabaikan Bandwidth server, jika BW unlimited maka tidak perlu di pikirkan. ${NC}      \n"
   hr
   printf "│ ${CYAN}${BOLD}■ LOCATION & ISP${NC}${BOLD}${NC}                                    \n"
   printf "│   IP      : ${ip}${NC}                                                \n"
@@ -6966,3 +7113,5 @@ EOF
 }
 
 main "$@"
+
+
