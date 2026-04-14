@@ -75,6 +75,7 @@ AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-10}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
+SSH_HC_AUTH_LOOKBACK_HOURS="${SSH_HC_AUTH_LOOKBACK_HOURS:-24}"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
   echo "setup-autoscript-compat ${SCRIPT_VERSION}"
@@ -1053,6 +1054,7 @@ ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
 XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
+SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 EOF
 
   cat > "${APP_DIR}/api.js" <<'EOF'
@@ -3608,6 +3610,7 @@ AUTO_BACKUP_KEEP_DAYS=${AUTO_BACKUP_KEEP_DAYS}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
 XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
+SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 EOF
   chmod 600 /etc/sc-1forcr.env
 
@@ -5079,6 +5082,15 @@ onoff_word() {
   fi
 }
 
+get_hc_auth_lookback_hours() {
+  local h
+  h="$(echo "${SSH_HC_AUTH_LOOKBACK_HOURS:-24}" | tr -cd '0-9')"
+  [[ -z "${h}" ]] && h="24"
+  if [[ "${h}" -lt 1 ]]; then h="1"; fi
+  if [[ "${h}" -gt 168 ]]; then h="168"; fi
+  echo "${h}"
+}
+
 bytes_human() {
   local bytes="${1:-0}"
   if [[ -z "${bytes}" || ! "${bytes}" =~ ^[0-9]+$ ]]; then
@@ -5252,10 +5264,11 @@ draw_dashboard() {
   printf " ─────────────────────────────────────────────────\n"
 }
 show_combined_online() {
-  local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port
+  local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h
   mode="${1:-realtime}"
   udp_ttl="180"
   udpcustom="$(detect_udpcustom_service)"
+  hc_auth_lookback_h="$(get_hc_auth_lookback_hours)"
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
   [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
@@ -5480,7 +5493,7 @@ show_combined_online() {
     END { for (k in act) print k; }' > "${tmp_db_ports}" || true
 
   if [[ -s "${tmp_db_ports}" ]]; then
-    journalctl -u dropbear --since "-20 min" -n 50000 --no-pager 2>/dev/null | awk '
+    journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n 50000 --no-pager 2>/dev/null | awk '
       NR==FNR { ap[$1]=1; next }
       /auth succeeded for /{
         u=$0;
@@ -5646,7 +5659,7 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_status tmp_ss_pid_ip tmp_pid_user tmp_pair tmp_ip_count tmp_db_ports tmp_db_recent tmp_db_recent_loose tmp_merge
+  local tmp_status tmp_ss_pid_ip tmp_pid_user tmp_pair tmp_ip_count tmp_db_ports tmp_db_recent tmp_db_recent_loose tmp_merge hc_auth_lookback_h
   local dropbear_main_port dropbear_alt_port
   tmp_status="$(mktemp)"
   tmp_ss_pid_ip="$(mktemp)"
@@ -5661,6 +5674,7 @@ show_ssh_only_online() {
 
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
+  hc_auth_lookback_h="$(get_hc_auth_lookback_hours)"
   [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
   [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
 
@@ -5747,7 +5761,7 @@ show_ssh_only_online() {
     END { for (k in act) print k; }' > "${tmp_db_ports}" || true
 
   if [[ -s "${tmp_db_ports}" ]]; then
-    journalctl -u dropbear --since "-20 min" -n 50000 --no-pager 2>/dev/null | awk '
+    journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n 50000 --no-pager 2>/dev/null | awk '
       NR==FNR { ap[$1]=1; next }
       /auth succeeded for /{
         u=$0;
