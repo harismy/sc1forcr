@@ -5433,8 +5433,7 @@ draw_dashboard() {
   printf "│   Estimasi akun          : sekitar ${cap_est} user${NC}                              \n"
   printf "│ \n"
   printf "│   ${CYAN}${BOLD}Script menyesuaikan limit scan log agar${NC}\n" 
-  printf "│   ${CYAN}${BOLD}tidak terlalu berat di server.${NC}      \n\n"
-  printf "│ \n"
+  printf "│   ${CYAN}${BOLD}tidak terlalu berat di server.${NC}      \n"
   printf "│ \n"
   printf "│   ${CYAN}${BOLD}Auto tunning ini memprediksi estimasi akun${NC}      \n"
   printf "│   ${CYAN}${BOLD}dengan mengabaikan Bandwidth server.${NC}      \n"
@@ -5469,7 +5468,7 @@ draw_dashboard() {
 
   printf "│   XRAY    : ${xray_color}   │ SSH-WS : ${ws_color}    │ LOADBLC : ${lb_color}   \n"
   printf "│   ZIVPN   : ${zivpn_color}   │ UDPHC  : ${udphc_color}   │ SSH     : ${ssh_color}   \n"
-  printf "│   HEALTH  : ${health_display}${NC} \n"
+  printf "│   HEALTH  : ${health_display}${NC}   │ \n"
   hr
 
   # Account Summary
