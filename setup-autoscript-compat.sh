@@ -39,6 +39,11 @@ set -euo pipefail
 #   AUTO_BACKUP_KEEP_DAYS=7                      (opsional)
 #   IPLIMIT_CHECK_INTERVAL_MINUTES=10            (opsional, interval checker iplimit dalam menit)
 #   IPLIMIT_LOCK_MINUTES=15                      (opsional, durasi lock sementara dalam menit)
+#   IPLIMIT_DEBUG=0                              (opsional, 0=hemat log, 1=debug detail)
+#   DROPBEAR_LOG_MAX_LINES=12000                 (opsional, batas scan log dropbear umum)
+#   DROPBEAR_RECENT_LOG_MAX_LINES=5000           (opsional, batas scan log dropbear recent)
+#   UDPHC_LOG_LINES_HISTORY=1200                 (opsional, batas scan log UDPHC mode history)
+#   UDPHC_LOG_LINES_REALTIME=400                 (opsional, batas scan log UDPHC realtime)
 #   XRAY_BLOCK_TCP_PORTS=80,443                  (opsional, port TCP yang diblok saat lock tmp xray)
 #   DB_PATH=/usr/sbin/potatonc/potato.db
 #   APP_DIR=/opt/sc-1forcr
@@ -74,6 +79,11 @@ AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
 AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-10}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
+IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-0}"
+DROPBEAR_LOG_MAX_LINES="${DROPBEAR_LOG_MAX_LINES:-12000}"
+DROPBEAR_RECENT_LOG_MAX_LINES="${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}"
+UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-1200}"
+UDPHC_LOG_LINES_REALTIME="${UDPHC_LOG_LINES_REALTIME:-400}"
 XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
 SSH_HC_AUTH_LOOKBACK_HOURS="${SSH_HC_AUTH_LOOKBACK_HOURS:-24}"
 
@@ -1053,6 +1063,11 @@ UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
 ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
+IPLIMIT_DEBUG=${IPLIMIT_DEBUG}
+DROPBEAR_LOG_MAX_LINES=${DROPBEAR_LOG_MAX_LINES}
+DROPBEAR_RECENT_LOG_MAX_LINES=${DROPBEAR_RECENT_LOG_MAX_LINES}
+UDPHC_LOG_LINES_HISTORY=${UDPHC_LOG_LINES_HISTORY}
+UDPHC_LOG_LINES_REALTIME=${UDPHC_LOG_LINES_REALTIME}
 XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 EOF
@@ -2075,7 +2090,15 @@ const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443'
   .map((v) => Number(String(v || '').trim()))
   .filter((n) => Number.isInteger(n) && n >= 1 && n <= 65535);
 const RECENT_AUTH_WINDOW_MINUTES = Math.max(2, CHECK_INTERVAL_MINUTES);
-const IPLIMIT_DEBUG = String(process.env.IPLIMIT_DEBUG || '1').trim() === '1';
+const DROPBEAR_LOG_MAX_LINES_RAW = Number(process.env.DROPBEAR_LOG_MAX_LINES || 12000);
+const DROPBEAR_LOG_MAX_LINES = Number.isFinite(DROPBEAR_LOG_MAX_LINES_RAW) && DROPBEAR_LOG_MAX_LINES_RAW >= 2000
+  ? Math.min(Math.floor(DROPBEAR_LOG_MAX_LINES_RAW), 80000)
+  : 12000;
+const DROPBEAR_RECENT_LOG_MAX_LINES_RAW = Number(process.env.DROPBEAR_RECENT_LOG_MAX_LINES || 5000);
+const DROPBEAR_RECENT_LOG_MAX_LINES = Number.isFinite(DROPBEAR_RECENT_LOG_MAX_LINES_RAW) && DROPBEAR_RECENT_LOG_MAX_LINES_RAW >= 500
+  ? Math.min(Math.floor(DROPBEAR_RECENT_LOG_MAX_LINES_RAW), 30000)
+  : 5000;
+const IPLIMIT_DEBUG = String(process.env.IPLIMIT_DEBUG || '0').trim() === '1';
 
 const db = new sqlite3.Database(DB_PATH);
 
@@ -2272,7 +2295,7 @@ function parseSshAndUdpUsage() {
   try {
     dropbearLog = execFileSync(
       'journalctl',
-      ['-u', 'dropbear', '-n', '50000', '--no-pager'],
+      ['-u', 'dropbear', '-n', String(DROPBEAR_LOG_MAX_LINES), '--no-pager'],
       { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 }
     );
   } catch (_) {}
@@ -2294,7 +2317,7 @@ function parseSshAndUdpUsage() {
   try {
     dropbearRecent = execFileSync(
       'journalctl',
-      ['-u', 'dropbear', '--since', `-${RECENT_AUTH_WINDOW_MINUTES} min`, '-n', '20000', '--no-pager'],
+      ['-u', 'dropbear', '--since', `-${RECENT_AUTH_WINDOW_MINUTES} min`, '-n', String(DROPBEAR_RECENT_LOG_MAX_LINES), '--no-pager'],
       { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }
     );
   } catch (_) {}
@@ -3645,6 +3668,11 @@ AUTO_BACKUP_DIR=${AUTO_BACKUP_DIR}
 AUTO_BACKUP_KEEP_DAYS=${AUTO_BACKUP_KEEP_DAYS}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
+IPLIMIT_DEBUG=${IPLIMIT_DEBUG}
+DROPBEAR_LOG_MAX_LINES=${DROPBEAR_LOG_MAX_LINES}
+DROPBEAR_RECENT_LOG_MAX_LINES=${DROPBEAR_RECENT_LOG_MAX_LINES}
+UDPHC_LOG_LINES_HISTORY=${UDPHC_LOG_LINES_HISTORY}
+UDPHC_LOG_LINES_REALTIME=${UDPHC_LOG_LINES_REALTIME}
 XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 EOF
@@ -3665,6 +3693,14 @@ API_BASE="http://127.0.0.1:${API_PORT}/vps"
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-6000:6999}"
+DROPBEAR_LOG_MAX_LINES="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9')"
+DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
+UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
+UDPHC_LOG_LINES_REALTIME="$(echo "${UDPHC_LOG_LINES_REALTIME:-400}" | tr -cd '0-9')"
+[[ -z "${DROPBEAR_LOG_MAX_LINES}" || "${DROPBEAR_LOG_MAX_LINES}" -lt 2000 ]] && DROPBEAR_LOG_MAX_LINES="12000"
+[[ -z "${DROPBEAR_RECENT_LOG_MAX_LINES}" || "${DROPBEAR_RECENT_LOG_MAX_LINES}" -lt 500 ]] && DROPBEAR_RECENT_LOG_MAX_LINES="5000"
+[[ -z "${UDPHC_LOG_LINES_HISTORY}" || "${UDPHC_LOG_LINES_HISTORY}" -lt 200 ]] && UDPHC_LOG_LINES_HISTORY="1200"
+[[ -z "${UDPHC_LOG_LINES_REALTIME}" || "${UDPHC_LOG_LINES_REALTIME}" -lt 100 ]] && UDPHC_LOG_LINES_REALTIME="400"
 
 api_call() {
   local method="$1" path="$2" data="${3:-}"
@@ -5388,10 +5424,10 @@ show_combined_online() {
   : > "${tmp_udp_count}"
   if [[ "${mode}" == "history" ]]; then
     udp_ttl="3600"
-    journalctl -u "${udpcustom}" -n 2400 -o short-unix --no-pager 2>/dev/null
+    journalctl -u "${udpcustom}" -n "${UDPHC_LOG_LINES_HISTORY}" -o short-unix --no-pager 2>/dev/null
   else
     udp_ttl="180"
-    journalctl -u "${udpcustom}" --since "-8 min" -n 800 -o short-unix --no-pager 2>/dev/null
+    journalctl -u "${udpcustom}" --since "-8 min" -n "${UDPHC_LOG_LINES_REALTIME}" -o short-unix --no-pager 2>/dev/null
   fi | awk -v ttl="${udp_ttl}" '
     function norm_user(v) {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
@@ -5529,7 +5565,7 @@ show_combined_online() {
     END { for (k in act) print k; }' > "${tmp_db_ports}" || true
 
   if [[ -s "${tmp_db_ports}" ]]; then
-    journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n 50000 --no-pager 2>/dev/null | awk '
+    journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${DROPBEAR_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
       NR==FNR { ap[$1]=1; next }
       function norm_ip(v) {
         gsub(/[[:space:]]/, "", v);
@@ -5614,7 +5650,7 @@ show_combined_online() {
 
   # Fallback longgar untuk HTTP Custom:
   # jika mapping port aktif miss, tetap hitung auth sukses 2 menit terakhir.
-  journalctl -u dropbear --since "-2 min" -n 20000 --no-pager 2>/dev/null | awk '
+  journalctl -u dropbear --since "-2 min" -n "${DROPBEAR_RECENT_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
     function norm_ip(v) {
       gsub(/[[:space:]]/, "", v);
       gsub(/^\[/, "", v);
@@ -5882,7 +5918,7 @@ show_ssh_only_online() {
     END { for (k in act) print k; }' > "${tmp_db_ports}" || true
 
   if [[ -s "${tmp_db_ports}" ]]; then
-    journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n 50000 --no-pager 2>/dev/null | awk '
+    journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n "${DROPBEAR_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
       NR==FNR { ap[$1]=1; next }
       function norm_ip(v) {
         gsub(/[[:space:]]/, "", v);
@@ -5967,7 +6003,7 @@ show_ssh_only_online() {
 
   # Fallback longgar untuk HTTP Custom:
   # jika mapping port aktif miss, tetap hitung auth sukses 2 menit terakhir.
-  journalctl -u dropbear --since "-2 min" -n 20000 --no-pager 2>/dev/null | awk '
+  journalctl -u dropbear --since "-2 min" -n "${DROPBEAR_RECENT_LOG_MAX_LINES}" --no-pager 2>/dev/null | awk '
     function norm_ip(v) {
       gsub(/[[:space:]]/, "", v);
       gsub(/^\[/, "", v);
