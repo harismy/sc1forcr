@@ -5460,10 +5460,12 @@ show_combined_online() {
   : > "${tmp_db_ports}"
   : > "${tmp_db_recent}"
   ss -Htnp state established 2>/dev/null | awk '
-    function p(v,   s,m) {
+    function p(v,   s,n,a,port) {
       s=v;
       gsub(/^\[/, "", s); gsub(/\]$/, "", s);
-      if (match(s, /:([0-9]{1,5})$/, m)) return m[1];
+      n=split(s, a, ":");
+      port=a[n];
+      if (port ~ /^[0-9]{1,5}$/) return port;
       return "";
     }
     {
@@ -5489,9 +5491,10 @@ show_combined_online() {
         if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
 
         src=$0;
-        if (match(src, / from (.+?)(:([0-9]{1,5}))?[[:space:]]*$/, m)) {
-          port=m[3];
-        } else next;
+        sub(/^.* from /, "", src);
+        gsub(/[[:space:]]+$/, "", src);
+        port=src;
+        sub(/^.*:/, "", port);
         if (port !~ /^[0-9]{1,5}$/) next;
         if (!(port in ap)) next;
         cnt[u]++;
@@ -5682,10 +5685,12 @@ show_ssh_only_online() {
   : > "${tmp_db_ports}"
   : > "${tmp_db_recent}"
   ss -Htnp state established 2>/dev/null | awk '
-    function p(v,   s,m) {
+    function p(v,   s,n,a,port) {
       s=v;
       gsub(/^\[/, "", s); gsub(/\]$/, "", s);
-      if (match(s, /:([0-9]{1,5})$/, m)) return m[1];
+      n=split(s, a, ":");
+      port=a[n];
+      if (port ~ /^[0-9]{1,5}$/) return port;
       return "";
     }
     {
@@ -5711,10 +5716,11 @@ show_ssh_only_online() {
         if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
 
         src=$0;
-        if (match(src, / from (.+?)(:([0-9]{1,5}))?[[:space:]]*$/, m)) {
-          ip=m[1];
-          port=m[3];
-        } else next;
+        sub(/^.* from /, "", src);
+        gsub(/[[:space:]]+$/, "", src);
+        ip=src;
+        port=src;
+        sub(/^.*:/, "", port);
         gsub(/[[:space:]]/, "", ip);
         gsub(/^\[/, "", ip); gsub(/\]$/, "", ip);
         sub(/:[0-9]+$/, "", ip);
