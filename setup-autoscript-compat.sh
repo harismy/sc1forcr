@@ -5313,7 +5313,7 @@ show_combined_online() {
           sub(/[[:space:]].*$/, "", u);
           sub(/@.*$/, "", u);
           sub(/\[.*$/, "", u);
-        } else if ($0 ~ /^dropbear/) {
+        } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
           u=$0;
           if (u !~ /\[[^]]+\]/) next;
           sub(/^.*\[/, "", u);
@@ -5658,7 +5658,7 @@ show_ssh_only_online() {
           sub(/[[:space:]].*$/, "", u);
           sub(/@.*$/, "", u);
           sub(/\[.*$/, "", u);
-        } else if ($0 ~ /^dropbear/) {
+        } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
           u=$0;
           if (u !~ /\[[^]]+\]/) next;
           sub(/^.*\[/, "", u);
