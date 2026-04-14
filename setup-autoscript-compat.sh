@@ -5252,7 +5252,7 @@ draw_dashboard() {
   printf " ─────────────────────────────────────────────────\n"
 }
 show_combined_online() {
-  local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_udp_pair tmp_udp_count udpcustom udp_ttl dropbear_main_port dropbear_alt_port
+  local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent udpcustom udp_ttl dropbear_main_port dropbear_alt_port
   mode="${1:-realtime}"
   udp_ttl="180"
   udpcustom="$(detect_udpcustom_service)"
@@ -5269,9 +5269,12 @@ show_combined_online() {
   tmp_ssh_count="$(mktemp)"
   tmp_ssh_proc_count="$(mktemp)"
   tmp_ssh_count_merged="$(mktemp)"
+  tmp_ssh_count_logs="$(mktemp)"
   tmp_udp_pair="$(mktemp)"
   tmp_udp_count="$(mktemp)"
-  trap 'rm -f "${tmp_count:-}" "${tmp_status:-}" "${tmp_ssh_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_ssh_pair:-}" "${tmp_ssh_count:-}" "${tmp_ssh_proc_count:-}" "${tmp_ssh_count_merged:-}" "${tmp_udp_pair:-}" "${tmp_udp_count:-}"' RETURN
+  tmp_db_ports="$(mktemp)"
+  tmp_db_recent="$(mktemp)"
+  trap 'rm -f "${tmp_count:-}" "${tmp_status:-}" "${tmp_ssh_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_ssh_pair:-}" "${tmp_ssh_count:-}" "${tmp_ssh_proc_count:-}" "${tmp_ssh_count_merged:-}" "${tmp_ssh_count_logs:-}" "${tmp_udp_pair:-}" "${tmp_udp_count:-}" "${tmp_db_ports:-}" "${tmp_db_recent:-}"' RETURN
 
   # SSH realtime: map pid->user dan pid->remote_ip, lalu pisahkan dari pasangan user+ip UDPHC aktif.
   : > "${tmp_ssh_pair}"
@@ -5451,6 +5454,65 @@ show_combined_online() {
       }
     }' "${tmp_ssh_count}" "${tmp_ssh_proc_count}" > "${tmp_ssh_count_merged}" || true
   mv -f "${tmp_ssh_count_merged}" "${tmp_ssh_count}"
+
+  # Fallback tambahan untuk jalur SSH-WS/HTTP Custom:
+  # pakai log auth dropbear yang port-nya masih aktif di socket.
+  : > "${tmp_db_ports}"
+  : > "${tmp_db_recent}"
+  ss -Htnp state established 2>/dev/null | awk '
+    function p(v,   s,m) {
+      s=v;
+      gsub(/^\[/, "", s); gsub(/\]$/, "", s);
+      if (match(s, /:([0-9]{1,5})$/, m)) return m[1];
+      return "";
+    }
+    {
+      lp=p($4); rp=p($5);
+      if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
+        if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;
+      } else if (rp == "'"${dropbear_main_port}"'" || rp == "'"${dropbear_alt_port}"'") {
+        if (lp ~ /^[0-9]{1,5}$/) act[lp]=1;
+      }
+    }
+    END { for (k in act) print k; }' > "${tmp_db_ports}" || true
+
+  if [[ -s "${tmp_db_ports}" ]]; then
+    journalctl -u dropbear --since "-20 min" -n 50000 --no-pager 2>/dev/null | awk '
+      NR==FNR { ap[$1]=1; next }
+      /auth succeeded for /{
+        u=$0;
+        sub(/^.*auth succeeded for /,"",u);
+        sub(/^'\''/,"",u); sub(/^"/,"",u);
+        sub(/'\''.*/,"",u); sub(/".*/,"",u);
+        sub(/[[:space:]].*$/,"",u);
+        u=tolower(u);
+        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+
+        src=$0;
+        if (match(src, / from (.+?)(:([0-9]{1,5}))?[[:space:]]*$/, m)) {
+          port=m[3];
+        } else next;
+        if (port !~ /^[0-9]{1,5}$/) next;
+        if (!(port in ap)) next;
+        cnt[u]++;
+      }
+      END{
+        for (u in cnt) print u, cnt[u];
+      }' "${tmp_db_ports}" - > "${tmp_db_recent}" || true
+
+    awk '
+      NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
+      { b[$1]=$2+0; seen[$1]=1; }
+      END {
+        for (u in seen) {
+          x=(u in a ? a[u] : 0);
+          y=(u in b ? b[u] : 0);
+          n=(x > y ? x : y);
+          if (n > 0) print u, n;
+        }
+      }' "${tmp_ssh_count}" "${tmp_db_recent}" > "${tmp_ssh_count_logs}" || true
+    mv -f "${tmp_ssh_count_logs}" "${tmp_ssh_count}"
+  fi
 
   awk '
     NR==FNR {
