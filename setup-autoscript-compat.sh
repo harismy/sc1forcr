@@ -5431,8 +5431,12 @@ draw_dashboard() {
   printf "│   Spesifikasi server anda: ${cap_ram_gb} GB RAM / ${cap_cores} vCPU${NC}                    \n"
   printf "│   Auto tuning SC         : ${cap_mode} (tier ${cap_tier})${NC}                               \n"
   printf "│   Estimasi akun          : sekitar ${cap_est} user${NC}                              \n"
-  printf "│   Script menyesuaikan limit scan log agar tidak terlalu berat di server.${NC}      \n"
-  printf "│   Auto tunning ini memprediksi estimasi akun dengan mengabaikan Bandwidth server.${NC}      \n"
+  printf "│ \n"
+  printf "│   Script menyesuaikan limit scan log agar${NC}\n" 
+  printf "│   tidak terlalu berat di server.${NC}      \n\n"
+  printf "│ \n"
+  printf "│   Auto tunning ini memprediksi estimasi akun${NC}      \n"
+  printf "│   dengan mengabaikan Bandwidth server.${NC}      \n"
   printf "│   Jika BW unlimited maka tidak perlu di pikirkan. ${NC}      \n"
   hr
   printf "│ ${CYAN}${BOLD}■ LOCATION & ISP${NC}${BOLD}${NC}                                    \n"
@@ -5462,9 +5466,9 @@ draw_dashboard() {
   local udphc_color="${GREEN}ON${NC}"; [[ "$udphc_on" != "ON" ]] && udphc_color="${RED}OFF${NC}"
   local ssh_color="${GREEN}ON${NC}";   [[ "$ssh_on" != "ON" ]] && ssh_color="${RED}OFF${NC}"
 
-  printf "│   XRAY    : ${xray_color}   │ SSH-WS : ${ws_color}   │ LOADBLC : ${lb_color}   \n"
+  printf "│   XRAY    : ${xray_color}    │ SSH-WS : ${ws_color}      │ LOADBLC : ${lb_color}   \n"
   printf "│   ZIVPN   : ${zivpn_color}   │ UDPHC  : ${udphc_color}   │ SSH    : ${ssh_color}   \n"
-  printf "│ HEALTH : ${health_display}${NC} \n"
+  printf "│   HEALTH  : ${health_display}${NC} \n"
   hr
 
   # Account Summary
