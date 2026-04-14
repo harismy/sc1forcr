@@ -39,6 +39,7 @@ set -euo pipefail
 #   AUTO_BACKUP_KEEP_DAYS=7                      (opsional)
 #   IPLIMIT_CHECK_INTERVAL_MINUTES=10            (opsional, interval checker iplimit dalam menit)
 #   IPLIMIT_LOCK_MINUTES=15                      (opsional, durasi lock sementara dalam menit)
+#   XRAY_BLOCK_TCP_PORTS=80,443                  (opsional, port TCP yang diblok saat lock tmp xray)
 #   DB_PATH=/usr/sbin/potatonc/potato.db
 #   APP_DIR=/opt/sc-1forcr
 
@@ -73,6 +74,7 @@ AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
 AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-10}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
+XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
   echo "setup-autoscript-compat ${SCRIPT_VERSION}"
@@ -1050,6 +1052,7 @@ UDPCUSTOM_SERVICE=${UDPCUSTOM_SERVICE_NAME}
 ACTIVE_UDP_BACKEND=${ACTIVE_UDP_BACKEND}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
+XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
 EOF
 
   cat > "${APP_DIR}/api.js" <<'EOF'
@@ -2065,6 +2068,10 @@ const CHECK_INTERVAL_MINUTES = Number.isFinite(CHECK_INTERVAL_MINUTES_RAW) && CH
 const LOCK_MINUTES_RAW = Number(process.env.IPLIMIT_LOCK_MINUTES || 15);
 const LOCK_MINUTES = Number.isFinite(LOCK_MINUTES_RAW) && LOCK_MINUTES_RAW > 0 ? Math.floor(LOCK_MINUTES_RAW) : 15;
 const LOCK_SECONDS = LOCK_MINUTES * 60;
+const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443')
+  .split(',')
+  .map((v) => Number(String(v || '').trim()))
+  .filter((n) => Number.isInteger(n) && n >= 1 && n <= 65535);
 const RECENT_AUTH_WINDOW_MINUTES = Math.max(2, CHECK_INTERVAL_MINUTES);
 const IPLIMIT_DEBUG = String(process.env.IPLIMIT_DEBUG || '1').trim() === '1';
 
@@ -2483,9 +2490,9 @@ function isIpv6(ip) {
   return String(ip || '').includes(':');
 }
 
-function nftDropSnippet(ip, port) {
+function nftDropSnippet(ip, proto, port) {
   const fam = isIpv6(ip) ? 'ip6' : 'ip';
-  return `${fam} saddr ${ip} udp dport ${port} drop`;
+  return `${fam} saddr ${ip} ${proto} dport ${port} drop`;
 }
 
 function detectNftInputChain() {
@@ -2498,24 +2505,28 @@ function detectNftInputChain() {
   return null;
 }
 
-function addNftUdpDropRule(ip, port) {
+function addNftDropRule(ip, proto, port) {
   const chain = detectNftInputChain();
   if (!chain) return false;
   const src = String(ip || '').trim();
+  const p = String(proto || '').trim().toLowerCase();
   const dport = String(port);
+  if (!src || (p !== 'tcp' && p !== 'udp')) return false;
   const fam = isIpv6(src) ? 'ip6' : 'ip';
   const chainDump = readExec('nft', ['list', 'chain', ...chain]);
-  if (chainDump.includes(nftDropSnippet(src, dport))) return true;
-  return safeExec('nft', ['add', 'rule', ...chain, fam, 'saddr', src, 'udp', 'dport', dport, 'drop']);
+  if (chainDump.includes(nftDropSnippet(src, p, dport))) return true;
+  return safeExec('nft', ['add', 'rule', ...chain, fam, 'saddr', src, p, 'dport', dport, 'drop']);
 }
 
-function removeNftUdpDropRule(ip, port) {
+function removeNftDropRule(ip, proto, port) {
   const chain = detectNftInputChain();
   if (!chain) return;
   const src = String(ip || '').trim();
+  const p = String(proto || '').trim().toLowerCase();
   const dport = String(port);
+  if (!src || (p !== 'tcp' && p !== 'udp')) return;
   const fam = isIpv6(src) ? 'ip6' : 'ip';
-  while (safeExec('nft', ['delete', 'rule', ...chain, fam, 'saddr', src, 'udp', 'dport', dport, 'drop'])) {}
+  while (safeExec('nft', ['delete', 'rule', ...chain, fam, 'saddr', src, p, 'dport', dport, 'drop'])) {}
 }
 
 function addUdpDropRule(ip, port) {
@@ -2528,7 +2539,7 @@ function addUdpDropRule(ip, port) {
     return safeExec(cmd, ['-I', ...rule]);
   }
   if (safeExec('nft', ['list', 'ruleset'])) {
-    return addNftUdpDropRule(src, port);
+    return addNftDropRule(src, 'udp', port);
   }
   return false;
 }
@@ -2543,7 +2554,36 @@ function removeUdpDropRule(ip, port) {
     return;
   }
   if (safeExec('nft', ['list', 'ruleset'])) {
-    removeNftUdpDropRule(src, port);
+    removeNftDropRule(src, 'udp', port);
+  }
+}
+
+function addTcpDropRule(ip, port) {
+  const src = String(ip || '').trim();
+  if (!src) return false;
+  if (safeExec('iptables', ['-L'])) {
+    const cmd = isIpv6(src) ? 'ip6tables' : 'iptables';
+    const rule = ['INPUT', '-p', 'tcp', '-s', src, '--dport', String(port), '-j', 'DROP'];
+    if (safeExec(cmd, ['-C', ...rule])) return true;
+    return safeExec(cmd, ['-I', ...rule]);
+  }
+  if (safeExec('nft', ['list', 'ruleset'])) {
+    return addNftDropRule(src, 'tcp', port);
+  }
+  return false;
+}
+
+function removeTcpDropRule(ip, port) {
+  const src = String(ip || '').trim();
+  if (!src) return;
+  if (safeExec('iptables', ['-L'])) {
+    const cmd = isIpv6(src) ? 'ip6tables' : 'iptables';
+    const rule = ['INPUT', '-p', 'tcp', '-s', src, '--dport', String(port), '-j', 'DROP'];
+    while (safeExec(cmd, ['-D', ...rule])) {}
+    return;
+  }
+  if (safeExec('nft', ['list', 'ruleset'])) {
+    removeNftDropRule(src, 'tcp', port);
   }
 }
 
@@ -2591,20 +2631,28 @@ async function ensureTables() {
 
 async function unlockExpired(nowTs) {
   const rows = await all("SELECT account_type, username, zivpn_removed FROM temp_ip_locks WHERE locked_until <= ?", [nowTs]);
-  if (rows.length === 0) return { xrayChanged: false, zivpnChanged: false, udpcustomChanged: false };
+  if (rows.length === 0) return { zivpnChanged: false, udpcustomChanged: false };
 
   const udpcustomPort = getUdpCustomListenPort();
-  let xrayChanged = false;
   let zivpnChanged = false;
   let udpcustomChanged = false;
   for (const row of rows) {
     const t = String(row.account_type || '');
     const u = String(row.username || '');
+    const ipRows = await all("SELECT ip FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => []);
     if (t === 'ssh') {
-      const ipRows = await all("SELECT ip FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [u]).catch(() => []);
       for (const item of ipRows) {
         removeUdpDropRule(String(item?.ip || ''), udpcustomPort);
       }
+    } else if (t === 'vmess' || t === 'vless' || t === 'trojan') {
+      for (const item of ipRows) {
+        const ip = String(item?.ip || '');
+        for (const p of XRAY_BLOCK_TCP_PORTS) {
+          removeTcpDropRule(ip, p);
+        }
+      }
+    }
+    if (t === 'ssh') {
       const sshRow = await get("SELECT password, date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?)", [u]).catch(() => null);
       const pass = String(sshRow?.password || '').trim();
       const expDate = String(sshRow?.date_exp || '').trim();
@@ -2632,18 +2680,15 @@ async function unlockExpired(nowTs) {
       }
     } else if (t === 'vmess') {
       await run("UPDATE account_vmesses SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
-      xrayChanged = true;
     } else if (t === 'vless') {
       await run("UPDATE account_vlesses SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
-      xrayChanged = true;
     } else if (t === 'trojan') {
       await run("UPDATE account_trojans SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
-      xrayChanged = true;
     }
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
   }
-  return { xrayChanged, zivpnChanged, udpcustomChanged };
+  return { zivpnChanged, udpcustomChanged };
 }
 
 async function lockIfExceeded(nowTs) {
@@ -2655,7 +2700,6 @@ async function lockIfExceeded(nowTs) {
   const sshWsClientPortMap = sshUsage.wsClientPortMap || new Map();
   const xrayMap = parseXrayRecentIpMap();
   const udpcustomPort = getUdpCustomListenPort();
-  let xrayChanged = false;
   let zivpnChanged = false;
   let udpcustomChanged = false;
 
@@ -2752,12 +2796,24 @@ async function lockIfExceeded(nowTs) {
       if (cnt <= lim) continue;
       const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type=? AND username=?", [item.type, user]);
       if (exists) continue;
+      const lockIps = Array.from((xrayMap.has(userKey) ? xrayMap.get(userKey) : new Set()));
+      await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
+      for (const ipRaw of lockIps) {
+        const ip = String(ipRaw || '').trim();
+        if (!ip) continue;
+        let blocked = false;
+        for (const p of XRAY_BLOCK_TCP_PORTS) {
+          if (addTcpDropRule(ip, p)) blocked = true;
+        }
+        if (blocked) {
+          await run("INSERT OR IGNORE INTO temp_ip_lock_ips(account_type, username, ip) VALUES(?, ?, ?)", [item.type, user, ip]).catch(() => {});
+        }
+      }
       await run(`UPDATE ${item.table} SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
       await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES(?, ?, ?, 0)", [item.type, user, nowTs + LOCK_SECONDS]).catch(() => {});
-      xrayChanged = true;
     }
   }
-  return { xrayChanged, zivpnChanged, udpcustomChanged };
+  return { zivpnChanged, udpcustomChanged };
 }
 
 async function rebuildXrayFromDb() {
@@ -2800,8 +2856,6 @@ async function main() {
   await ensureTables();
   const u = await unlockExpired(now);
   const l = await lockIfExceeded(now);
-
-  if (u.xrayChanged || l.xrayChanged) await rebuildXrayFromDb();
   if ((u.zivpnChanged || l.zivpnChanged) && shouldRestartZivpn()) {
     restartService(ZIVPN_SERVICE);
   }
@@ -3553,6 +3607,7 @@ AUTO_BACKUP_DIR=${AUTO_BACKUP_DIR}
 AUTO_BACKUP_KEEP_DAYS=${AUTO_BACKUP_KEEP_DAYS}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
+XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
 EOF
   chmod 600 /etc/sc-1forcr.env
 
@@ -5484,35 +5539,82 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_status tmp_recent tmp_proc tmp_merge
+  local tmp_status tmp_ss_pid_ip tmp_pid_user tmp_pair tmp_ip_count tmp_proc tmp_merge
+  local dropbear_main_port dropbear_alt_port
   tmp_status="$(mktemp)"
-  tmp_recent="$(mktemp)"
+  tmp_ss_pid_ip="$(mktemp)"
+  tmp_pid_user="$(mktemp)"
+  tmp_pair="$(mktemp)"
+  tmp_ip_count="$(mktemp)"
   tmp_proc="$(mktemp)"
   tmp_merge="$(mktemp)"
-  trap 'rm -f "${tmp_status:-}" "${tmp_recent:-}" "${tmp_proc:-}" "${tmp_merge:-}"' RETURN
+  trap 'rm -f "${tmp_status:-}" "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}" "${tmp_ip_count:-}" "${tmp_proc:-}" "${tmp_merge:-}"' RETURN
 
-  journalctl -u dropbear --since "-2 min" -n 50000 --no-pager 2>/dev/null | awk '
-    /auth succeeded for /{
-      u=$0
-      sub(/^.*auth succeeded for /,"",u)
-      sub(/^'\''/,"",u); sub(/^"/,"",u)
-      sub(/'\''.*/,"",u); sub(/".*/,"",u)
-      sub(/[[:space:]].*$/,"",u)
-      u=tolower(u)
-      if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next
+  dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
+  dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
+  [[ -z "${dropbear_main_port}" ]] && dropbear_main_port="109"
+  [[ -z "${dropbear_alt_port}" ]] && dropbear_alt_port="143"
 
-      pid=$0
-      if (match(pid, /\[[0-9]+\]/)) pid=substr(pid, RSTART+1, RLENGTH-2)
-      else next
+  # Sumber utama realtime: socket established (SSH + Dropbear), map PID -> user, lalu hitung unik user+ip.
+  : > "${tmp_pair}"
+  : > "${tmp_ip_count}"
+  ss -Htnp state established 2>/dev/null | awk '
+    {
+      l=$4;
+      r=$5;
+      if (l ~ /:22$/ || l ~ /:'"${dropbear_main_port}"'$/ || l ~ /:'"${dropbear_alt_port}"'$/) {
+        ip=r;
+        gsub(/^\[/, "", ip);
+        gsub(/\]$/, "", ip);
+        sub(/:[0-9]+$/, "", ip);
+        if (ip == "") next;
+        s=$0;
+        while (match(s, /pid=[0-9]+/)) {
+          pid=substr(s, RSTART + 4, RLENGTH - 4);
+          if (pid ~ /^[0-9]+$/) print pid, ip;
+          s=substr(s, RSTART + RLENGTH);
+        }
+      }
+    }' | sort -u > "${tmp_ss_pid_ip}" || true
 
-      seen[u "|" pid]=1
-    }
-    END{
-      for (k in seen){ split(k,a,"|"); cnt[a[1]]++ }
-      for (u in cnt) print u, cnt[u]
-    }' > "${tmp_recent}"
+  if [[ -s "${tmp_ss_pid_ip}" ]]; then
+    local pid_csv
+    pid_csv="$(awk '{print $1}' "${tmp_ss_pid_ip}" | sort -u | paste -sd, -)"
+    ps -o pid=,args= -p "${pid_csv}" 2>/dev/null | awk '
+      {
+        pid=$1;
+        $1="";
+        sub(/^[[:space:]]+/, "", $0);
+        u="";
+        if ($0 ~ /^sshd:/) {
+          u=$0;
+          sub(/^sshd:[[:space:]]*/, "", u);
+          sub(/[[:space:]].*$/, "", u);
+          sub(/@.*$/, "", u);
+          sub(/\[.*$/, "", u);
+        } else if ($0 ~ /^dropbear/) {
+          u=$0;
+          if (u !~ /\[[^]]+\]/) next;
+          sub(/^.*\[/, "", u);
+          sub(/\].*$/, "", u);
+        } else next;
+        u=tolower(u);
+        if (u !~ /^[a-z0-9._-]+$/) next;
+        if (u == "root" || u == "priv" || u == "net") next;
+        print pid, u;
+      }' > "${tmp_pid_user}" || true
 
-  # Fallback agar tetap kebaca saat tidak ada auth baru dalam 2 menit.
+    awk '
+      NR==FNR { u[$1]=$2; next }
+      {
+        pid=$1; ip=$2; user=(pid in u ? u[pid] : "");
+        if (user != "" && ip != "") print user, ip;
+      }' "${tmp_pid_user}" "${tmp_ss_pid_ip}" | sort -u > "${tmp_pair}" || true
+  fi
+
+  awk '{ if ($1 ~ /^[a-z0-9._-]+$/ && $2 != "") cnt[$1]++ } END { for (u in cnt) print u, cnt[u]; }' "${tmp_pair}" > "${tmp_ip_count}" || true
+
+  # Fallback untuk jalur SSH-WS/HC tertentu: hitung dari process list bila mapping socket->user tidak terbaca.
   ps -eo args= 2>/dev/null | awk '
     {
       u="";
@@ -5545,22 +5647,22 @@ show_ssh_only_online() {
         n=(x > y ? x : y);
         if (n > 0) print u, n;
       }
-    }' "${tmp_recent}" "${tmp_proc}" > "${tmp_merge}"
-  mv -f "${tmp_merge}" "${tmp_recent}"
+    }' "${tmp_ip_count}" "${tmp_proc}" > "${tmp_merge}"
+  mv -f "${tmp_merge}" "${tmp_ip_count}"
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
-  echo "LIST USER LOGIN SSH (RECENT 2 MIN)"
-  if [[ ! -s "${tmp_recent}" ]]; then
-    echo "Tidak ada aktivitas SSH HC dalam 2 menit terakhir."
+  echo "LIST USER LOGIN SSH (REALTIME)"
+  if [[ ! -s "${tmp_ip_count}" ]]; then
+    echo "Tidak ada user SSH yang sedang online."
     echo
     echo "Total User SSH : 0"
-    echo "Total SESI SSH : 0"
+    echo "Total HP SSH   : 0"
     return
   fi
 
-  printf "%-24s %-12s %-10s %-10s\n" "USERNAME" "STATUS" "SSH_SESI" "LIMIT_IP"
-  printf "%-24s %-12s %-10s %-10s\n" "------------------------" "------------" "----------" "----------"
+  printf "%-24s %-12s %-10s %-13s\n" "USERNAME" "STATUS" "LIMIT_IP" "TERKONEKSI_HP"
+  printf "%-24s %-12s %-10s %-13s\n" "------------------------" "------------" "----------" "-------------"
   awk '
     NR==FNR {
       split($0,a,"|");
@@ -5575,14 +5677,14 @@ show_ssh_only_online() {
       if (s=="LOCK" || s=="LOCK_TMP") out="KENA_LOCK";
       else if (l > 0 && n > l) out="MULTI_LOGIN";
       else out="AMAN";
-      printf "%-24s %-12s %-10d %-10d\n", u, out, n, l;
-      total_user++; total_sesi+=n;
+      printf "%-24s %-12s %-10d %-13d\n", u, out, l, n;
+      total_user++; total_hp+=n;
     }
     END {
       print "";
       printf "Total User SSH : %d\n", total_user + 0;
-      printf "Total SESI SSH : %d\n", total_sesi + 0;
-    }' "${tmp_status}" "${tmp_recent}"
+      printf "Total HP SSH   : %d\n", total_hp + 0;
+    }' "${tmp_status}" "${tmp_ip_count}"
 }
 
 xray_log_snapshot() {
@@ -5592,6 +5694,13 @@ xray_log_snapshot() {
     return
   fi
   tail -n 25000 /var/log/xray/access.log | awk '
+    function norm_ip(v) {
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
+      gsub(/^\[/, "", v);
+      gsub(/\]$/, "", v);
+      sub(/:[0-9]+$/, "", v);
+      return v;
+    }
     {
       email=""; src="";
       if (match($0, /"email":"[^"]+"/)) {
@@ -5609,16 +5718,22 @@ xray_log_snapshot() {
       if (email == "") next;
       gsub(/[[:space:]]/, "", email);
       email=tolower(email);
+      if (email !~ /^[a-z0-9._-]+$/) next;
 
-      ip=src;
-      sub(/:[0-9]+$/, "", ip);
-
+      ip=norm_ip(src);
+      if (ip == "") next;
+      key=email "|" ip;
+      uniq[key]=1;
+      lastip[email]=ip;
       seen[email]=1;
-      if (ip != "") lastip[email]=ip;
     }
     END {
+      for (k in uniq) {
+        split(k, a, /\|/);
+        cnt[a[1]]++;
+      }
       for (u in seen) {
-        printf "%s|%s\n", u, lastip[u];
+        printf "%s|%d|%s\n", u, (u in cnt ? cnt[u] : 0), (u in lastip ? lastip[u] : "-");
       }
     }' > "${dst}"
 }
@@ -5630,28 +5745,51 @@ show_xray_online_by_table() {
   t_seen="$(mktemp)"
   trap 'rm -f "${t_users:-}" "${t_seen:-}"' RETURN
 
-  sqlite3 "${DB_PATH}" "SELECT LOWER(username) FROM ${table} WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' ORDER BY LOWER(username);" > "${t_users}" 2>/dev/null || true
+  sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM ${table} ORDER BY LOWER(username);" > "${t_users}" 2>/dev/null || true
   if [[ ! -s "${t_users}" ]]; then
     echo "=== ${label} ONLINE ==="
-    echo "Tidak ada akun ${label} aktif di DB."
+    echo "Tidak ada akun ${label} di DB."
     return
   fi
 
   xray_log_snapshot "${t_seen}"
 
-  echo "=== ${label} ONLINE (berdasarkan log xray terbaru) ==="
+  echo "=== ${label} USER LOGIN (berdasarkan log xray terbaru) ==="
+  if [[ ! -s "${t_seen}" ]]; then
+    echo "Tidak ada aktivitas terbaru."
+    echo
+    echo "Total User ${label} : 0"
+    echo "Total IP ${label}   : 0"
+    return
+  fi
+
+  printf "%-24s %-12s %-10s %-13s %-22s\n" "USERNAME" "STATUS" "LIMIT_IP" "TERKONEKSI_IP" "LAST_IP"
+  printf "%-24s %-12s %-10s %-13s %-22s\n" "------------------------" "------------" "----------" "-------------" "----------------------"
   awk -F'|' '
-    NR==FNR { ip[$1]=$2; next }
+    NR==FNR {
+      db_status[$1]=$2;
+      db_limit[$1]=($3 ~ /^[0-9]+$/ ? $3 + 0 : 0);
+      next
+    }
     {
       u=$1;
-      if (u in ip) {
-        seen=1;
-        printf "%-20s %s\n", u, (ip[u] == "" ? "-" : ip[u]);
-      }
+      c=($2 ~ /^[0-9]+$/ ? $2 + 0 : 0);
+      lip=$3;
+      if (!(u in db_status)) next;
+      s=db_status[u];
+      l=(u in db_limit ? db_limit[u] : 0);
+      if (s=="LOCK" || s=="LOCK_TMP") out="KENA_LOCK";
+      else if (l > 0 && c > l) out="MULTI_LOGIN";
+      else out="AMAN";
+      printf "%-24s %-12s %-10d %-13d %-22s\n", u, out, l, c, (lip=="" ? "-" : lip);
+      total_user++;
+      total_ip+=c;
     }
     END {
-      if (!seen) print "Tidak ada aktivitas terbaru.";
-    }' "${t_seen}" "${t_users}" | sort
+      print "";
+      printf "Total User : %d\n", total_user + 0;
+      printf "Total IP   : %d\n", total_ip + 0;
+    }' "${t_users}" "${t_seen}"
 }
 
 show_udpcustom_online() {
@@ -5683,6 +5821,8 @@ show_udpcustom_online() {
 
 update_script_from_repo() {
   local url tmp active_backend alt_url downloaded_ok
+  local banner_html banner_txt had_banner_html had_banner_txt
+  local update_note ts_now new_ver
   url="${UPDATE_SCRIPT_URL:-}"
   if [[ -z "${url}" ]]; then
     echo "UPDATE_SCRIPT_URL belum diisi di /etc/sc-1forcr.env"
@@ -5692,6 +5832,10 @@ update_script_from_repo() {
   fi
 
   tmp="/tmp/setup-autoscript-compat.sh"
+  banner_html="/tmp/sc-1forcr-banner.html.bak"
+  banner_txt="/tmp/sc-1forcr-banner.txt.bak"
+  had_banner_html="0"
+  had_banner_txt="0"
   downloaded_ok=0
   echo "Download update script dari: ${url}"
   if curl -fsSL "${url}" -o "${tmp}"; then
@@ -5708,35 +5852,107 @@ update_script_from_repo() {
   fi
   if [[ "${downloaded_ok}" != "1" ]]; then
     echo "Gagal download update script."
+    telegram_notify "Update SC 1FORCR GAGAL
+Domain: ${DOMAIN}
+Alasan: gagal download script update
+Time: $(date '+%F %T')"
     return
   fi
   chmod +x "${tmp}"
   if ! bash -n "${tmp}"; then
     echo "Update script gagal validasi syntax (bash -n)."
+    telegram_notify "Update SC 1FORCR GAGAL
+Domain: ${DOMAIN}
+Alasan: validasi syntax script gagal
+Time: $(date '+%F %T')"
     return
   fi
 
-  # Selalu default ke ZIVPN setiap update script.
-  active_backend="zivpn"
+  active_backend="$(echo "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "${active_backend}" != "zivpn" && "${active_backend}" != "udpcustom" && "${active_backend}" != "udp-custom" && "${active_backend}" != "udphc" ]]; then
+    active_backend="zivpn"
+  fi
+  if [[ "${active_backend}" == "udp-custom" || "${active_backend}" == "udphc" ]]; then
+    active_backend="udpcustom"
+  fi
+
+  # Backup banner custom agar tidak tertimpa saat proses update installer.
+  rm -f "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
+  if [[ -s /etc/sc-1forcr/banner.html ]]; then
+    cp -f /etc/sc-1forcr/banner.html "${banner_html}" >/dev/null 2>&1 || true
+    [[ -s "${banner_html}" ]] && had_banner_html="1"
+  fi
+  if [[ -s /etc/sc-1forcr/banner.txt ]]; then
+    cp -f /etc/sc-1forcr/banner.txt "${banner_txt}" >/dev/null 2>&1 || true
+    [[ -s "${banner_txt}" ]] && had_banner_txt="1"
+  fi
 
   echo "Menjalankan update installer..."
-  DOMAIN="${DOMAIN}" \
-  EMAIL="${EMAIL:-}" \
-  API_AUTH_TOKEN="${AUTH_TOKEN}" \
-  UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL}" \
-  DB_PATH="${DB_PATH}" \
-  APP_DIR="/opt/sc-1forcr" \
-  ZIVPN_SERVICE_NAME="${ZIVPN_SERVICE}" \
-  UDPCUSTOM_SERVICE_NAME="${UDPCUSTOM_SERVICE}" \
-  ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE}" \
-  UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE}" \
-  UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE}" \
-  DROPBEAR_PORT="${DROPBEAR_PORT}" \
-  DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT}" \
-  IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES}" \
-  IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES}" \
-  ACTIVE_UDP_BACKEND="${active_backend}" \
-  bash "${tmp}"
+  if ! DOMAIN="${DOMAIN}" \
+    EMAIL="${EMAIL:-}" \
+    API_AUTH_TOKEN="${AUTH_TOKEN}" \
+    UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL}" \
+    DB_PATH="${DB_PATH}" \
+    APP_DIR="/opt/sc-1forcr" \
+    ZIVPN_SERVICE_NAME="${ZIVPN_SERVICE}" \
+    UDPCUSTOM_SERVICE_NAME="${UDPCUSTOM_SERVICE}" \
+    ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE}" \
+    UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE}" \
+    UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE}" \
+    DROPBEAR_PORT="${DROPBEAR_PORT}" \
+    DROPBEAR_ALT_PORT="${DROPBEAR_ALT_PORT}" \
+    IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES}" \
+    IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES}" \
+    XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS}" \
+    TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
+    TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}" \
+    AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE}" \
+    AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR}" \
+    AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS}" \
+    ACTIVE_UDP_BACKEND="${active_backend}" \
+    bash "${tmp}"; then
+    echo "Update script gagal dijalankan."
+    telegram_notify "Update SC 1FORCR GAGAL
+Domain: ${DOMAIN}
+Alasan: installer update exit non-zero
+Time: $(date '+%F %T')"
+    rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
+    return
+  fi
+
+  # Restore banner lama (jika sebelumnya ada), atau tetap nonaktif bila sebelumnya memang tidak ada.
+  if [[ "${had_banner_html}" == "1" && -s "${banner_html}" ]]; then
+    mkdir -p /etc/sc-1forcr
+    cp -f "${banner_html}" /etc/sc-1forcr/banner.html >/dev/null 2>&1 || true
+    chmod 644 /etc/sc-1forcr/banner.html >/dev/null 2>&1 || true
+    apply_html_banner_config "/etc/sc-1forcr/banner.html"
+  elif [[ "${had_banner_html}" != "1" ]]; then
+    rm -f /etc/sc-1forcr/banner.html >/dev/null 2>&1 || true
+    apply_html_banner_config ""
+  fi
+  if [[ "${had_banner_txt}" == "1" && -s "${banner_txt}" ]]; then
+    mkdir -p /etc/sc-1forcr
+    cp -f "${banner_txt}" /etc/sc-1forcr/banner.txt >/dev/null 2>&1 || true
+    chmod 644 /etc/sc-1forcr/banner.txt >/dev/null 2>&1 || true
+  elif [[ "${had_banner_txt}" != "1" ]]; then
+    rm -f /etc/sc-1forcr/banner.txt >/dev/null 2>&1 || true
+  fi
+
+  ts_now="$(date '+%F %T')"
+  new_ver="-"
+  if [[ -f /etc/sc-1forcr-version ]]; then
+    new_ver="$(awk -F= '/^SCRIPT_VERSION=/{print $2}' /etc/sc-1forcr-version | head -n1)"
+    [[ -z "${new_ver}" ]] && new_ver="-"
+  fi
+  update_note="Update SC 1FORCR BERHASIL
+Domain: ${DOMAIN}
+Version: ${new_ver}
+Time: ${ts_now}
+Checker IP Limit: ${IPLIMIT_CHECK_INTERVAL_MINUTES}m/${IPLIMIT_LOCK_MINUTES}m
+Auto Backup: ${AUTO_BACKUP_ENABLE}"
+  telegram_notify "${update_note}"
+
+  rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
 }
 
 show_sc_key_info() {
@@ -5977,7 +6193,7 @@ monitor_online_menu() {
     echo "===================================="
     echo "      MONITOR USER ONLINE"
     echo "===================================="
-    echo "1) SSH Recent Activity (2 min)"
+    echo "1) Lihat User Login SSH (Realtime)"
     echo "2) UDP CUSTOM Realtime"
     echo "3) SSH + UDP CUSTOM realtime"
     echo "4) SSH + UDP CUSTOM Gabungan histori"
