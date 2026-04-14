@@ -5507,13 +5507,24 @@ show_combined_online() {
         src=$0;
         sub(/^.* from /, "", src);
         gsub(/[[:space:]]+$/, "", src);
+        ip=src;
         port=src;
+        gsub(/[[:space:]]/, "", ip);
+        gsub(/^\[/, "", ip);
+        gsub(/\]/, "", ip);
+        sub(/:[0-9]+$/, "", ip);
         sub(/^.*:/, "", port);
+        if (ip == "") next;
         if (port !~ /^[0-9]{1,5}$/) next;
         if (!(port in ap)) next;
-        cnt[u]++;
+        k=u "|" ip;
+        seen[k]=1;
       }
       END{
+        for (k in seen) {
+          split(k, a, /\|/);
+          cnt[a[1]]++;
+        }
         for (u in cnt) print u, cnt[u];
       }' "${tmp_db_ports}" - > "${tmp_db_recent}" || true
 
@@ -5778,11 +5789,13 @@ show_ssh_only_online() {
         port=src;
         sub(/^.*:/, "", port);
         gsub(/[[:space:]]/, "", ip);
-        gsub(/^\[/, "", ip); gsub(/\]$/, "", ip);
+        gsub(/^\[/, "", ip);
+        gsub(/\]/, "", ip);
         sub(/:[0-9]+$/, "", ip);
+        if (ip == "") next;
         if (port !~ /^[0-9]{1,5}$/) next;
         if (!(port in ap)) next;
-        k=u "|" ip "|" port;
+        k=u "|" ip;
         seen[k]=1;
       }
       END{
