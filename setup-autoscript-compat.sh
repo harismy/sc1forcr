@@ -5549,12 +5549,11 @@ show_combined_online() {
       port=src;
       sub(/^.*:/, "", port);
       if (port !~ /^[0-9]{1,5}$/) next;
-      seen[u "|" port]=1;
+      seen[u]=1;
     }
     END{
       for (k in seen) {
-        split(k,a,"|");
-        cnt[a[1]]++;
+        cnt[k]=1;
       }
       for (u in cnt) print u, cnt[u];
     }' > "${tmp_db_recent_loose}" || true
@@ -5826,12 +5825,11 @@ show_ssh_only_online() {
       port=src;
       sub(/^.*:/, "", port);
       if (port !~ /^[0-9]{1,5}$/) next;
-      seen[u "|" port]=1;
+      seen[u]=1;
     }
     END{
       for (k in seen) {
-        split(k,a,"|");
-        cnt[a[1]]++;
+        cnt[k]=1;
       }
       for (u in cnt) print u, cnt[u];
     }' > "${tmp_db_recent_loose}" || true
