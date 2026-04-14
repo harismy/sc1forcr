@@ -5539,14 +5539,17 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_status tmp_ss_pid_ip tmp_pid_user tmp_pair tmp_ip_count
+  local tmp_status tmp_ss_pid_ip tmp_pid_user tmp_pair tmp_ip_count tmp_db_ports tmp_db_recent tmp_merge
   local dropbear_main_port dropbear_alt_port
   tmp_status="$(mktemp)"
   tmp_ss_pid_ip="$(mktemp)"
   tmp_pid_user="$(mktemp)"
   tmp_pair="$(mktemp)"
   tmp_ip_count="$(mktemp)"
-  trap 'rm -f "${tmp_status:-}" "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}" "${tmp_ip_count:-}"' RETURN
+  tmp_db_ports="$(mktemp)"
+  tmp_db_recent="$(mktemp)"
+  tmp_merge="$(mktemp)"
+  trap 'rm -f "${tmp_status:-}" "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}" "${tmp_ip_count:-}" "${tmp_db_ports:-}" "${tmp_db_recent:-}" "${tmp_merge:-}"' RETURN
 
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
@@ -5611,6 +5614,74 @@ show_ssh_only_online() {
   fi
 
   awk '{ if ($1 ~ /^[a-z0-9._-]+$/ && $2 != "") cnt[$1]++ } END { for (u in cnt) print u, cnt[u]; }' "${tmp_pair}" > "${tmp_ip_count}" || true
+
+  # Tambahan untuk jalur SSH-WS/HC:
+  # Ambil user dari log auth dropbear, tapi hanya untuk client-port yang masih aktif saat ini.
+  : > "${tmp_db_ports}"
+  : > "${tmp_db_recent}"
+  ss -Htnp state established 2>/dev/null | awk '
+    function p(v,   s,m) {
+      s=v;
+      gsub(/^\[/, "", s); gsub(/\]$/, "", s);
+      if (match(s, /:([0-9]{1,5})$/, m)) return m[1];
+      return "";
+    }
+    {
+      lp=p($4); rp=p($5);
+      if (lp == "'"${dropbear_main_port}"'" || lp == "'"${dropbear_alt_port}"'") {
+        if (rp ~ /^[0-9]{1,5}$/) act[rp]=1;
+      } else if (rp == "'"${dropbear_main_port}"'" || rp == "'"${dropbear_alt_port}"'") {
+        if (lp ~ /^[0-9]{1,5}$/) act[lp]=1;
+      }
+    }
+    END { for (k in act) print k; }' > "${tmp_db_ports}" || true
+
+  if [[ -s "${tmp_db_ports}" ]]; then
+    journalctl -u dropbear --since "-20 min" -n 50000 --no-pager 2>/dev/null | awk '
+      NR==FNR { ap[$1]=1; next }
+      /auth succeeded for /{
+        u=$0;
+        sub(/^.*auth succeeded for /,"",u);
+        sub(/^'\''/,"",u); sub(/^"/,"",u);
+        sub(/'\''.*/,"",u); sub(/".*/,"",u);
+        sub(/[[:space:]].*$/,"",u);
+        u=tolower(u);
+        if (u !~ /^[a-z0-9._-]+$/ || u=="root" || u=="priv" || u=="net") next;
+
+        src=$0;
+        if (match(src, / from (.+?)(:([0-9]{1,5}))?[[:space:]]*$/, m)) {
+          ip=m[1];
+          port=m[3];
+        } else next;
+        gsub(/[[:space:]]/, "", ip);
+        gsub(/^\[/, "", ip); gsub(/\]$/, "", ip);
+        sub(/:[0-9]+$/, "", ip);
+        if (port !~ /^[0-9]{1,5}$/) next;
+        if (!(port in ap)) next;
+        k=u "|" ip "|" port;
+        seen[k]=1;
+      }
+      END{
+        for (k in seen) {
+          split(k,a,"|");
+          cnt[a[1]]++;
+        }
+        for (u in cnt) print u, cnt[u];
+      }' "${tmp_db_ports}" - > "${tmp_db_recent}" || true
+
+    awk '
+      NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
+      { b[$1]=$2+0; seen[$1]=1; }
+      END {
+        for (u in seen) {
+          x=(u in a ? a[u] : 0);
+          y=(u in b ? b[u] : 0);
+          n=(x > y ? x : y);
+          if (n > 0) print u, n;
+        }
+      }' "${tmp_ip_count}" "${tmp_db_recent}" > "${tmp_merge}" || true
+    mv -f "${tmp_merge}" "${tmp_ip_count}"
+  fi
 
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
