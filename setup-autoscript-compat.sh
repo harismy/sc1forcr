@@ -2309,7 +2309,9 @@ function parseSshAndUdpUsage() {
       const pid = String(auth.pid || '').trim();
       if (!user || !clientPort) continue;
       if (srcIp) {
-        const recentKey = `dropbear-recent-ip:${srcIp}`;
+        const recentKey = isLoopbackIp(srcIp)
+          ? `dropbear-recent-port:${clientPort}`
+          : `dropbear-recent-ip:${srcIp}`;
         if (pid) {
           recentAuthByPid.set(pid, { user, recentKey, clientPort });
         } else {
