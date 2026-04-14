@@ -5536,6 +5536,14 @@ show_combined_online() {
         sub(/:[0-9]+$/, "", v);
         return v;
       }
+      function is_loopback_ip(v,   t) {
+        t=tolower(v);
+        return (t=="127.0.0.1" || t=="::1" || t=="localhost");
+      }
+      function sess_key(u, ip, port) {
+        if (is_loopback_ip(ip) && port ~ /^[0-9]{1,5}$/) return u "|port:" port;
+        return u "|ip:" ip;
+      }
       function parse_pid(line,   p) {
         if (match(line, /\[[0-9]+\]/)) {
           p=substr(line, RSTART+1, RLENGTH-2);
@@ -5563,7 +5571,7 @@ show_combined_online() {
         if (ip == "") next;
         if (port !~ /^[0-9]{1,5}$/) next;
         if (!(port in ap)) next;
-        k=u "|" ip;
+        k=sess_key(u, ip, port);
         if (pid != "") {
           auth_by_pid[pid]=k;
         } else {
@@ -5612,6 +5620,14 @@ show_combined_online() {
       sub(/:[0-9]+$/, "", v);
       return v;
     }
+    function is_loopback_ip(v,   t) {
+      t=tolower(v);
+      return (t=="127.0.0.1" || t=="::1" || t=="localhost");
+    }
+    function sess_key(u, ip, port) {
+      if (is_loopback_ip(ip) && port ~ /^[0-9]{1,5}$/) return u "|port:" port;
+      return u "|ip:" ip;
+    }
     function parse_pid(line,   p) {
       if (match(line, /\[[0-9]+\]/)) {
         p=substr(line, RSTART+1, RLENGTH-2);
@@ -5637,7 +5653,7 @@ show_combined_online() {
       sub(/^.*:/, "", port);
       if (ip == "") next;
       if (port !~ /^[0-9]{1,5}$/) next;
-      k=u "|" ip;
+      k=sess_key(u, ip, port);
       if (pid != "") {
         auth_by_pid[pid]=k;
       } else {
@@ -5873,6 +5889,14 @@ show_ssh_only_online() {
         sub(/:[0-9]+$/, "", v);
         return v;
       }
+      function is_loopback_ip(v,   t) {
+        t=tolower(v);
+        return (t=="127.0.0.1" || t=="::1" || t=="localhost");
+      }
+      function sess_key(u, ip, port) {
+        if (is_loopback_ip(ip) && port ~ /^[0-9]{1,5}$/) return u "|port:" port;
+        return u "|ip:" ip;
+      }
       function parse_pid(line,   p) {
         if (match(line, /\[[0-9]+\]/)) {
           p=substr(line, RSTART+1, RLENGTH-2);
@@ -5900,7 +5924,7 @@ show_ssh_only_online() {
         if (ip == "") next;
         if (port !~ /^[0-9]{1,5}$/) next;
         if (!(port in ap)) next;
-        k=u "|" ip;
+        k=sess_key(u, ip, port);
         if (pid != "") {
           auth_by_pid[pid]=k;
         } else {
@@ -5949,6 +5973,14 @@ show_ssh_only_online() {
       sub(/:[0-9]+$/, "", v);
       return v;
     }
+    function is_loopback_ip(v,   t) {
+      t=tolower(v);
+      return (t=="127.0.0.1" || t=="::1" || t=="localhost");
+    }
+    function sess_key(u, ip, port) {
+      if (is_loopback_ip(ip) && port ~ /^[0-9]{1,5}$/) return u "|port:" port;
+      return u "|ip:" ip;
+    }
     function parse_pid(line,   p) {
       if (match(line, /\[[0-9]+\]/)) {
         p=substr(line, RSTART+1, RLENGTH-2);
@@ -5974,7 +6006,7 @@ show_ssh_only_online() {
       sub(/^.*:/, "", port);
       if (ip == "") next;
       if (port !~ /^[0-9]{1,5}$/) next;
-      k=u "|" ip;
+      k=sess_key(u, ip, port);
       if (pid != "") {
         auth_by_pid[pid]=k;
       } else {
