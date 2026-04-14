@@ -5539,16 +5539,14 @@ show_ssh_online_history() {
 }
 
 show_ssh_only_online() {
-  local tmp_status tmp_ss_pid_ip tmp_pid_user tmp_pair tmp_ip_count tmp_proc tmp_merge
+  local tmp_status tmp_ss_pid_ip tmp_pid_user tmp_pair tmp_ip_count
   local dropbear_main_port dropbear_alt_port
   tmp_status="$(mktemp)"
   tmp_ss_pid_ip="$(mktemp)"
   tmp_pid_user="$(mktemp)"
   tmp_pair="$(mktemp)"
   tmp_ip_count="$(mktemp)"
-  tmp_proc="$(mktemp)"
-  tmp_merge="$(mktemp)"
-  trap 'rm -f "${tmp_status:-}" "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}" "${tmp_ip_count:-}" "${tmp_proc:-}" "${tmp_merge:-}"' RETURN
+  trap 'rm -f "${tmp_status:-}" "${tmp_ss_pid_ip:-}" "${tmp_pid_user:-}" "${tmp_pair:-}" "${tmp_ip_count:-}"' RETURN
 
   dropbear_main_port="$(echo "${DROPBEAR_PORT:-109}" | tr -cd '0-9')"
   dropbear_alt_port="$(echo "${DROPBEAR_ALT_PORT:-143}" | tr -cd '0-9')"
@@ -5614,45 +5612,9 @@ show_ssh_only_online() {
 
   awk '{ if ($1 ~ /^[a-z0-9._-]+$/ && $2 != "") cnt[$1]++ } END { for (u in cnt) print u, cnt[u]; }' "${tmp_pair}" > "${tmp_ip_count}" || true
 
-  # Fallback untuk jalur SSH-WS/HC tertentu: hitung dari process list bila mapping socket->user tidak terbaca.
-  ps -eo args= 2>/dev/null | awk '
-    {
-      u="";
-      if ($0 ~ /^sshd:[[:space:]]+/) {
-        if ($0 ~ /\[priv\]/ || $0 ~ /\[preauth\]/ || $0 ~ /\[listener\]/) next;
-        u=$0;
-        sub(/^sshd:[[:space:]]*/, "", u);
-        sub(/[[:space:]].*$/, "", u);
-        sub(/@.*$/, "", u);
-        sub(/\[.*$/, "", u);
-      } else if ($0 ~ /^dropbear[^[:space:]]*[[:space:]]+\[[^]]+\]/ || $0 ~ /\/dropbear-[^[:space:]]+[[:space:]]+\[[^]]+\]/) {
-        u=$0;
-        sub(/^.*dropbear[^[:space:]]*[[:space:]]+\[/, "", u);
-        sub(/\].*$/, "", u);
-      } else next;
-      u=tolower(u);
-      if (u !~ /^[a-z0-9._-]+$/) next;
-      if (u == "root" || u == "priv" || u == "net") next;
-      cnt[u]++;
-    }
-    END { for (u in cnt) print u, cnt[u]; }' > "${tmp_proc}"
-
-  awk '
-    NR==FNR { a[$1]=$2+0; seen[$1]=1; next }
-    { b[$1]=$2+0; seen[$1]=1; }
-    END {
-      for (u in seen) {
-        x=(u in a ? a[u] : 0);
-        y=(u in b ? b[u] : 0);
-        n=(x > y ? x : y);
-        if (n > 0) print u, n;
-      }
-    }' "${tmp_ip_count}" "${tmp_proc}" > "${tmp_merge}"
-  mv -f "${tmp_merge}" "${tmp_ip_count}"
-
   sqlite3 "${DB_PATH}" "SELECT LOWER(username) || '|' || UPPER(TRIM(COALESCE(status,''))) || '|' || CAST(COALESCE(limitip,0) AS INTEGER) FROM account_sshs;" > "${tmp_status}" 2>/dev/null || true
 
-  echo "LIST USER LOGIN SSH (REALTIME)"
+  echo "LIST USER LOGIN SSH (REALTIME SOCKET)"
   if [[ ! -s "${tmp_ip_count}" ]]; then
     echo "Tidak ada user SSH yang sedang online."
     echo
