@@ -2182,7 +2182,19 @@ function parseDropbearAuthLine(lineRaw) {
   const port = String(fromMatch?.[2] || '').trim();
   if (!username || !port) return null;
 
-  return { username, source, port };
+  const pidMatch = line.match(/\[([0-9]+)\]/);
+  const pid = String(pidMatch?.[1] || '').trim();
+  return { username, source, port, pid };
+}
+
+function parseDropbearExitLine(lineRaw) {
+  const line = String(lineRaw || '').trim();
+  if (!line) return null;
+  if (!/Exit \(|Exit before auth:/i.test(line)) return null;
+  const pidMatch = line.match(/\[([0-9]+)\]/);
+  const pid = String(pidMatch?.[1] || '').trim();
+  if (!pid) return null;
+  return { pid };
 }
 
 function parseSshAndUdpUsage() {
@@ -2286,17 +2298,39 @@ function parseSshAndUdpUsage() {
       { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }
     );
   } catch (_) {}
+  const recentAuthByPid = new Map();
+  const closedRecentPid = new Set();
   for (const lineRaw of String(dropbearRecent || '').split('\n')) {
-    const parsed = parseDropbearAuthLine(lineRaw);
-    if (!parsed) continue;
-    const user = parsed.username;
-    const srcIp = extractIp(parsed.source);
-    const clientPort = parsed.port;
-    if (!user || !clientPort) continue;
-    const recentKey = srcIp ? `dropbear-recent-ipport:${srcIp}:${clientPort}` : `dropbear-recent-port:${clientPort}`;
-    addSessionKeyToUserMap(recentAuthMap, user, recentKey);
-    if (dropbearActiveClientPorts.has(clientPort)) {
-      addPortToUserMap(wsClientPortMap, user, clientPort);
+    const auth = parseDropbearAuthLine(lineRaw);
+    if (auth) {
+      const user = auth.username;
+      const srcIp = extractIp(auth.source);
+      const clientPort = auth.port;
+      const pid = String(auth.pid || '').trim();
+      if (!user || !clientPort) continue;
+      if (srcIp) {
+        const recentKey = `dropbear-recent-ip:${srcIp}`;
+        if (pid) {
+          recentAuthByPid.set(pid, { user, recentKey, clientPort });
+        } else {
+          addSessionKeyToUserMap(recentAuthMap, user, recentKey);
+        }
+      }
+      if (dropbearActiveClientPorts.has(clientPort)) {
+        addPortToUserMap(wsClientPortMap, user, clientPort);
+      }
+      continue;
+    }
+    const ex = parseDropbearExitLine(lineRaw);
+    if (ex) {
+      closedRecentPid.add(ex.pid);
+    }
+  }
+  for (const [pid, data] of recentAuthByPid.entries()) {
+    if (closedRecentPid.has(pid)) continue;
+    addSessionKeyToUserMap(recentAuthMap, data.user, data.recentKey);
+    if (dropbearActiveClientPorts.has(data.clientPort)) {
+      addPortToUserMap(wsClientPortMap, data.user, data.clientPort);
     }
   }
 
@@ -5495,7 +5529,22 @@ show_combined_online() {
   if [[ -s "${tmp_db_ports}" ]]; then
     journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n 50000 --no-pager 2>/dev/null | awk '
       NR==FNR { ap[$1]=1; next }
+      function norm_ip(v) {
+        gsub(/[[:space:]]/, "", v);
+        gsub(/^\[/, "", v);
+        gsub(/\]/, "", v);
+        sub(/:[0-9]+$/, "", v);
+        return v;
+      }
+      function parse_pid(line,   p) {
+        if (match(line, /\[[0-9]+\]/)) {
+          p=substr(line, RSTART+1, RLENGTH-2);
+          if (p ~ /^[0-9]+$/) return p;
+        }
+        return "";
+      }
       /auth succeeded for /{
+        pid=parse_pid($0);
         u=$0;
         sub(/^.*auth succeeded for /,"",u);
         sub(/^'\''/,"",u); sub(/^"/,"",u);
@@ -5509,18 +5558,29 @@ show_combined_online() {
         gsub(/[[:space:]]+$/, "", src);
         ip=src;
         port=src;
-        gsub(/[[:space:]]/, "", ip);
-        gsub(/^\[/, "", ip);
-        gsub(/\]/, "", ip);
-        sub(/:[0-9]+$/, "", ip);
+        ip=norm_ip(ip);
         sub(/^.*:/, "", port);
         if (ip == "") next;
         if (port !~ /^[0-9]{1,5}$/) next;
         if (!(port in ap)) next;
         k=u "|" ip;
-        seen[k]=1;
+        if (pid != "") {
+          auth_by_pid[pid]=k;
+        } else {
+          auth_no_pid[k]=1;
+        }
+        next;
+      }
+      /Exit \(|Exit before auth:/{
+        pid=parse_pid($0);
+        if (pid != "") closed_pid[pid]=1;
       }
       END{
+        for (pid in auth_by_pid) {
+          if (pid in closed_pid) continue;
+          seen[auth_by_pid[pid]]=1;
+        }
+        for (k in auth_no_pid) seen[k]=1;
         for (k in seen) {
           split(k, a, /\|/);
           cnt[a[1]]++;
@@ -5545,7 +5605,22 @@ show_combined_online() {
   # Fallback longgar untuk HTTP Custom:
   # jika mapping port aktif miss, tetap hitung auth sukses 2 menit terakhir.
   journalctl -u dropbear --since "-2 min" -n 20000 --no-pager 2>/dev/null | awk '
+    function norm_ip(v) {
+      gsub(/[[:space:]]/, "", v);
+      gsub(/^\[/, "", v);
+      gsub(/\]/, "", v);
+      sub(/:[0-9]+$/, "", v);
+      return v;
+    }
+    function parse_pid(line,   p) {
+      if (match(line, /\[[0-9]+\]/)) {
+        p=substr(line, RSTART+1, RLENGTH-2);
+        if (p ~ /^[0-9]+$/) return p;
+      }
+      return "";
+    }
     /auth succeeded for /{
+      pid=parse_pid($0);
       u=$0;
       sub(/^.*auth succeeded for /,"",u);
       sub(/^'\''/,"",u); sub(/^"/,"",u);
@@ -5557,14 +5632,32 @@ show_combined_online() {
       src=$0;
       sub(/^.* from /, "", src);
       gsub(/[[:space:]]+$/, "", src);
+      ip=norm_ip(src);
       port=src;
       sub(/^.*:/, "", port);
+      if (ip == "") next;
       if (port !~ /^[0-9]{1,5}$/) next;
-      seen[u]=1;
+      k=u "|" ip;
+      if (pid != "") {
+        auth_by_pid[pid]=k;
+      } else {
+        auth_no_pid[k]=1;
+      }
+      next;
+    }
+    /Exit \(|Exit before auth:/{
+      pid=parse_pid($0);
+      if (pid != "") closed_pid[pid]=1;
     }
     END{
+      for (pid in auth_by_pid) {
+        if (pid in closed_pid) continue;
+        seen[auth_by_pid[pid]]=1;
+      }
+      for (k in auth_no_pid) seen[k]=1;
       for (k in seen) {
-        cnt[k]=1;
+        split(k, a, /\|/);
+        cnt[a[1]]++;
       }
       for (u in cnt) print u, cnt[u];
     }' > "${tmp_db_recent_loose}" || true
@@ -5773,7 +5866,22 @@ show_ssh_only_online() {
   if [[ -s "${tmp_db_ports}" ]]; then
     journalctl -u dropbear --since "-${hc_auth_lookback_h} hours" -n 50000 --no-pager 2>/dev/null | awk '
       NR==FNR { ap[$1]=1; next }
+      function norm_ip(v) {
+        gsub(/[[:space:]]/, "", v);
+        gsub(/^\[/, "", v);
+        gsub(/\]/, "", v);
+        sub(/:[0-9]+$/, "", v);
+        return v;
+      }
+      function parse_pid(line,   p) {
+        if (match(line, /\[[0-9]+\]/)) {
+          p=substr(line, RSTART+1, RLENGTH-2);
+          if (p ~ /^[0-9]+$/) return p;
+        }
+        return "";
+      }
       /auth succeeded for /{
+        pid=parse_pid($0);
         u=$0;
         sub(/^.*auth succeeded for /,"",u);
         sub(/^'\''/,"",u); sub(/^"/,"",u);
@@ -5788,17 +5896,28 @@ show_ssh_only_online() {
         ip=src;
         port=src;
         sub(/^.*:/, "", port);
-        gsub(/[[:space:]]/, "", ip);
-        gsub(/^\[/, "", ip);
-        gsub(/\]/, "", ip);
-        sub(/:[0-9]+$/, "", ip);
+        ip=norm_ip(ip);
         if (ip == "") next;
         if (port !~ /^[0-9]{1,5}$/) next;
         if (!(port in ap)) next;
         k=u "|" ip;
-        seen[k]=1;
+        if (pid != "") {
+          auth_by_pid[pid]=k;
+        } else {
+          auth_no_pid[k]=1;
+        }
+        next;
+      }
+      /Exit \(|Exit before auth:/{
+        pid=parse_pid($0);
+        if (pid != "") closed_pid[pid]=1;
       }
       END{
+        for (pid in auth_by_pid) {
+          if (pid in closed_pid) continue;
+          seen[auth_by_pid[pid]]=1;
+        }
+        for (k in auth_no_pid) seen[k]=1;
         for (k in seen) {
           split(k,a,"|");
           cnt[a[1]]++;
@@ -5823,7 +5942,22 @@ show_ssh_only_online() {
   # Fallback longgar untuk HTTP Custom:
   # jika mapping port aktif miss, tetap hitung auth sukses 2 menit terakhir.
   journalctl -u dropbear --since "-2 min" -n 20000 --no-pager 2>/dev/null | awk '
+    function norm_ip(v) {
+      gsub(/[[:space:]]/, "", v);
+      gsub(/^\[/, "", v);
+      gsub(/\]/, "", v);
+      sub(/:[0-9]+$/, "", v);
+      return v;
+    }
+    function parse_pid(line,   p) {
+      if (match(line, /\[[0-9]+\]/)) {
+        p=substr(line, RSTART+1, RLENGTH-2);
+        if (p ~ /^[0-9]+$/) return p;
+      }
+      return "";
+    }
     /auth succeeded for /{
+      pid=parse_pid($0);
       u=$0;
       sub(/^.*auth succeeded for /,"",u);
       sub(/^'\''/,"",u); sub(/^"/,"",u);
@@ -5835,14 +5969,32 @@ show_ssh_only_online() {
       src=$0;
       sub(/^.* from /, "", src);
       gsub(/[[:space:]]+$/, "", src);
+      ip=norm_ip(src);
       port=src;
       sub(/^.*:/, "", port);
+      if (ip == "") next;
       if (port !~ /^[0-9]{1,5}$/) next;
-      seen[u]=1;
+      k=u "|" ip;
+      if (pid != "") {
+        auth_by_pid[pid]=k;
+      } else {
+        auth_no_pid[k]=1;
+      }
+      next;
+    }
+    /Exit \(|Exit before auth:/{
+      pid=parse_pid($0);
+      if (pid != "") closed_pid[pid]=1;
     }
     END{
+      for (pid in auth_by_pid) {
+        if (pid in closed_pid) continue;
+        seen[auth_by_pid[pid]]=1;
+      }
+      for (k in auth_no_pid) seen[k]=1;
       for (k in seen) {
-        cnt[k]=1;
+        split(k, a, /\|/);
+        cnt[a[1]]++;
       }
       for (u in cnt) print u, cnt[u];
     }' > "${tmp_db_recent_loose}" || true
