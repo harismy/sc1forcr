@@ -5425,14 +5425,15 @@ draw_dashboard() {
 
   # System & Network
   printf "│ ${CYAN}${BOLD}■ SYSTEM & NETWORK${NC}${BOLD}${NC}                                  \n"
-  printf "│   OS      : ${os_name}${NC}                              \n"
-  printf "│   RAM     : ${ram_mb:-"-"}  │ SWAP : ${swap_mb:-"-"}${NC}                         \n"
-  printf "│   UPTIME  : ${uptime_h}h ${uptime_m}m${NC}                                           \n"
-  printf "|   Spesifikasi server anda: ${cap_ram_gb} GB RAM / ${cap_cores} vCPU${NC}                    \n"
-  printf "|   Auto tuning SC      : ${cap_mode} (tier ${cap_tier})${NC}                               \n"
-  printf "|   Estimasi akun SSH   : sekitar ${cap_est} user${NC}                              \n"
-  printf "|   Script menyesuaikan limit scan log agar tidak terlalu berat di server.${NC}      \n"
-  printf "|   Auto tunning ini memprediksi estimasi akun dengan mengabaikan Bandwidth server, jika BW unlimited maka tidak perlu di pikirkan. ${NC}      \n"
+  printf "│   OS                     : ${os_name}${NC}                              \n"
+  printf "│   RAM                    : ${ram_mb:-"-"}  │ SWAP : ${swap_mb:-"-"}${NC}                         \n"
+  printf "│   UPTIME                 : ${uptime_h}h ${uptime_m}m${NC}                                           \n"
+  printf "│   Spesifikasi server anda: ${cap_ram_gb} GB RAM / ${cap_cores} vCPU${NC}                    \n"
+  printf "│   Auto tuning SC         : ${cap_mode} (tier ${cap_tier})${NC}                               \n"
+  printf "│   Estimasi akun          : sekitar ${cap_est} user${NC}                              \n"
+  printf "│   Script menyesuaikan limit scan log agar tidak terlalu berat di server.${NC}      \n"
+  printf "│   Auto tunning ini memprediksi estimasi akun dengan mengabaikan Bandwidth server.${NC}      \n"
+  printf "│   Jika BW unlimited maka tidak perlu di pikirkan. ${NC}      \n"
   hr
   printf "│ ${CYAN}${BOLD}■ LOCATION & ISP${NC}${BOLD}${NC}                                    \n"
   printf "│   IP      : ${ip}${NC}                                                \n"
