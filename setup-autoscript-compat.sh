@@ -5468,7 +5468,7 @@ draw_dashboard() {
 
   printf "│   XRAY    : ${xray_color}   │ SSH-WS : ${ws_color}    │ LOADBLC : ${lb_color}   \n"
   printf "│   ZIVPN   : ${zivpn_color}   │ UDPHC  : ${udphc_color}   │ SSH     : ${ssh_color}   \n"
-  printf "│   HEALTH  : ${health_display}${NC}   │ \n"
+  printf "│   HEALTH  : ${health_display}${NC} │ \n"
   hr
 
   # Account Summary
