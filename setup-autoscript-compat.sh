@@ -2883,11 +2883,7 @@ function disconnectXrayIpNow(ip) {
   const src = String(ip || '').trim();
   if (!src) return;
 
-  // Try to kill active sockets from/to this peer IP (best effort).
-  safeExec('ss', ['-K', 'dst', src]);
-  safeExec('ss', ['-K', 'src', src]);
-
-  // Narrow filters for common ports used by xray behind nginx/haproxy.
+  // Kill only sockets related to public ingress ports (avoid broad collateral drops).
   for (const p of XRAY_BLOCK_TCP_PORTS) {
     safeExec('ss', ['-K', 'dst', src, 'dport', '=', `:${p}`]);
     safeExec('ss', ['-K', 'dst', src, 'sport', '=', `:${p}`]);
