@@ -7312,26 +7312,22 @@ monitor_online_menu() {
     echo "      MONITOR USER ONLINE"
     echo "===================================="
     echo "1) Lihat User Login SSH (Realtime)"
-    echo "2) UDP CUSTOM Realtime"
-    echo "3) SSH + UDP CUSTOM realtime"
-    echo "4) SSH + UDP CUSTOM Gabungan histori"
-    echo "5) VMESS"
-    echo "6) VLESS"
-    echo "7) TROJAN"
+    echo "2) SSH + UDP CUSTOM realtime"
+    echo "3) VMESS"
+    echo "4) VLESS"
+    echo "5) TROJAN"
     echo "0) Kembali"
     echo
-    if ! prompt_input o "Pilih menu [0-7]: "; then
+    if ! prompt_input o "Pilih menu [0-5]: "; then
       return
     fi
     clear
     case "${o}" in
       1) show_ssh_only_online ;;
-      2) show_udpcustom_online ;;
-      3) show_ssh_online ;;
-      4) show_ssh_online_history ;;
-      5) show_xray_online_by_table "account_vmesses" "VMESS" ;;
-      6) show_xray_online_by_table "account_vlesses" "VLESS" ;;
-      7) show_xray_online_by_table "account_trojans" "TROJAN" ;;
+      2) show_ssh_online ;;
+      3) show_xray_online_by_table "account_vmesses" "VMESS" ;;
+      4) show_xray_online_by_table "account_vlesses" "VLESS" ;;
+      5) show_xray_online_by_table "account_trojans" "TROJAN" ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
