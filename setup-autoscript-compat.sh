@@ -47,6 +47,8 @@ set -euo pipefail
 #   UDPHC_LOG_LINES_REALTIME=auto                (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   XRAY_BLOCK_TCP_PORTS=80,443                  (opsional, port TCP yang diblok saat lock tmp xray)
 #   XRAY_RECENT_WINDOW_MINUTES=30                (opsional, jendela menit log xray untuk hitung multi-login)
+#   XRAY_ACTIVE_WINDOW_SECONDS=120               (opsional, jendela detik untuk IP aktif xray)
+#   XRAY_MIN_HITS_PER_IP=2                       (opsional, minimal hit/log per IP pada jendela aktif)
 #   DB_PATH=/usr/sbin/potatonc/potato.db
 #   APP_DIR=/opt/sc-1forcr
 
@@ -89,6 +91,8 @@ UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-}"
 UDPHC_LOG_LINES_REALTIME="${UDPHC_LOG_LINES_REALTIME:-}"
 XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
 XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-30}"
+XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-120}"
+XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
 SSH_HC_AUTH_LOOKBACK_HOURS="${SSH_HC_AUTH_LOOKBACK_HOURS:-24}"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
@@ -1186,6 +1190,8 @@ UDPHC_LOG_LINES_HISTORY=${UDPHC_LOG_LINES_HISTORY}
 UDPHC_LOG_LINES_REALTIME=${UDPHC_LOG_LINES_REALTIME}
 XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
 XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
+XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
+XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 EOF
 
@@ -2302,6 +2308,14 @@ const XRAY_RECENT_WINDOW_MINUTES_RAW = Number(process.env.XRAY_RECENT_WINDOW_MIN
 const XRAY_RECENT_WINDOW_MINUTES = Number.isFinite(XRAY_RECENT_WINDOW_MINUTES_RAW) && XRAY_RECENT_WINDOW_MINUTES_RAW >= 5
   ? Math.min(Math.floor(XRAY_RECENT_WINDOW_MINUTES_RAW), 1440)
   : Math.max(10, CHECK_INTERVAL_MINUTES * 3);
+const XRAY_ACTIVE_WINDOW_SECONDS_RAW = Number(process.env.XRAY_ACTIVE_WINDOW_SECONDS || 120);
+const XRAY_ACTIVE_WINDOW_SECONDS = Number.isFinite(XRAY_ACTIVE_WINDOW_SECONDS_RAW) && XRAY_ACTIVE_WINDOW_SECONDS_RAW >= 30
+  ? Math.min(Math.floor(XRAY_ACTIVE_WINDOW_SECONDS_RAW), 1800)
+  : 120;
+const XRAY_MIN_HITS_PER_IP_RAW = Number(process.env.XRAY_MIN_HITS_PER_IP || 2);
+const XRAY_MIN_HITS_PER_IP = Number.isFinite(XRAY_MIN_HITS_PER_IP_RAW) && XRAY_MIN_HITS_PER_IP_RAW >= 1
+  ? Math.min(Math.floor(XRAY_MIN_HITS_PER_IP_RAW), 20)
+  : 2;
 const XRAY_LOG_TAIL_LINES_RAW = Number(process.env.XRAY_LOG_TAIL_LINES || 8000);
 const XRAY_LOG_TAIL_LINES = Number.isFinite(XRAY_LOG_TAIL_LINES_RAW) && XRAY_LOG_TAIL_LINES_RAW >= 1000
   ? Math.min(Math.floor(XRAY_LOG_TAIL_LINES_RAW), 60000)
@@ -2635,14 +2649,21 @@ function parseXrayRecentIpMap() {
   } catch (_) {
     return map;
   }
-  const cutoffTs = Date.now() - (XRAY_RECENT_WINDOW_MINUTES * 60 * 1000);
+  const nowMs = Date.now();
+  const cutoffTs = nowMs - (XRAY_RECENT_WINDOW_MINUTES * 60 * 1000);
+  const activeCutoffTs = nowMs - (XRAY_ACTIVE_WINDOW_SECONDS * 1000);
+  const hitMap = new Map();
+  const lastSeenMap = new Map();
+  const latestIpByUser = new Map();
+  const latestTsByUser = new Map();
   const lines = String(tailOut || '').split('\n');
   for (const lineRaw of lines) {
     const line = String(lineRaw || '').trim();
     if (!line) continue;
+    let ts = 0;
     const tm = line.match(/^(\d{4})\/(\d{2})\/(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/);
     if (tm) {
-      const ts = new Date(
+      ts = new Date(
         Number(tm[1]),
         Number(tm[2]) - 1,
         Number(tm[3]),
@@ -2662,6 +2683,27 @@ function parseXrayRecentIpMap() {
     const src = String(srcJson?.[1] || srcTxt?.[1] || '').trim();
     const ip = extractIp(src);
     if (!ip) continue;
+    const key = `${email}|${ip}`;
+    hitMap.set(key, (hitMap.get(key) || 0) + 1);
+    const lastSeen = Number.isFinite(ts) && ts > 0 ? ts : nowMs;
+    lastSeenMap.set(key, lastSeen);
+    const prevTs = latestTsByUser.get(email) || 0;
+    if (lastSeen >= prevTs) {
+      latestTsByUser.set(email, lastSeen);
+      latestIpByUser.set(email, ip);
+    }
+  }
+
+  for (const [key, hits] of hitMap.entries()) {
+    const sep = key.indexOf('|');
+    if (sep <= 0) continue;
+    const email = key.slice(0, sep);
+    const ip = key.slice(sep + 1);
+    const lastSeen = lastSeenMap.get(key) || 0;
+    const isActive = lastSeen >= activeCutoffTs;
+    const isLatestIp = latestIpByUser.get(email) === ip;
+    if (!isActive) continue;
+    if (!isLatestIp && hits < XRAY_MIN_HITS_PER_IP) continue;
     if (!map.has(email)) map.set(email, new Set());
     map.get(email).add(ip);
   }
@@ -2889,6 +2931,9 @@ function disconnectXrayIpNow(ip) {
     safeExec('ss', ['-K', 'dst', src, 'sport', '=', `:${p}`]);
     safeExec('ss', ['-K', 'src', src, 'dport', '=', `:${p}`]);
     safeExec('ss', ['-K', 'src', src, 'sport', '=', `:${p}`]);
+    // Compatibility fallback for older iproute2 expression parsing.
+    safeExec('ss', ['-K', `dst ${src} dport = :${p}`]);
+    safeExec('ss', ['-K', `src ${src} sport = :${p}`]);
   }
 
   // If conntrack exists, drop tracked flows so packets are cut immediately.
@@ -3110,11 +3155,16 @@ async function lockIfExceeded(nowTs) {
       const user = String(r.username || '').trim();
       const userKey = user.toLowerCase();
       const lim = Number(r.limitip || 0);
-      const cnt = xrayMap.has(userKey) ? xrayMap.get(userKey).size : 0;
+      const lockIpSet = xrayMap.has(userKey) ? xrayMap.get(userKey) : new Set();
+      const cnt = lockIpSet.size;
+      if (IPLIMIT_DEBUG) {
+        const ips = Array.from(lockIpSet).slice(0, 8).join(',');
+        console.log(`[iplimit-debug][${item.type}] user=${user} lim=${lim} cnt=${cnt} ips=${ips}`);
+      }
       if (cnt <= lim) continue;
       const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type=? AND username=?", [item.type, user]);
       if (exists) continue;
-      const lockIps = Array.from((xrayMap.has(userKey) ? xrayMap.get(userKey) : new Set()));
+      const lockIps = Array.from(lockIpSet);
       await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
       for (const ipRaw of lockIps) {
         const ip = String(ipRaw || '').trim();
@@ -3171,7 +3221,9 @@ async function rebuildXrayFromDb() {
   };
   fs.mkdirSync('/usr/local/etc/xray', { recursive: true });
   fs.writeFileSync('/usr/local/etc/xray/config.json', JSON.stringify(cfg, null, 2));
-  restartService('xray');
+  if (!safeExec('systemctl', ['reload', 'xray'])) {
+    safeExec('systemctl', ['kill', '-s', 'HUP', 'xray']);
+  }
 }
 
 async function main() {
@@ -3961,6 +4013,8 @@ UDPHC_LOG_LINES_HISTORY=${UDPHC_LOG_LINES_HISTORY}
 UDPHC_LOG_LINES_REALTIME=${UDPHC_LOG_LINES_REALTIME}
 XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
 XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
+XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
+XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 EOF
   chmod 600 /etc/sc-1forcr.env
@@ -3985,11 +4039,15 @@ DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" |
 UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_REALTIME="$(echo "${UDPHC_LOG_LINES_REALTIME:-400}" | tr -cd '0-9')"
 xray_recent_window_min="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-30}" | tr -cd '0-9')"
+xray_active_window_sec="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-120}" | tr -cd '0-9')"
+xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-2}" | tr -cd '0-9')"
 [[ -z "${DROPBEAR_LOG_MAX_LINES}" || "${DROPBEAR_LOG_MAX_LINES}" -lt 2000 ]] && DROPBEAR_LOG_MAX_LINES="12000"
 [[ -z "${DROPBEAR_RECENT_LOG_MAX_LINES}" || "${DROPBEAR_RECENT_LOG_MAX_LINES}" -lt 500 ]] && DROPBEAR_RECENT_LOG_MAX_LINES="5000"
 [[ -z "${UDPHC_LOG_LINES_HISTORY}" || "${UDPHC_LOG_LINES_HISTORY}" -lt 200 ]] && UDPHC_LOG_LINES_HISTORY="1200"
 [[ -z "${UDPHC_LOG_LINES_REALTIME}" || "${UDPHC_LOG_LINES_REALTIME}" -lt 100 ]] && UDPHC_LOG_LINES_REALTIME="400"
 [[ -z "${xray_recent_window_min}" || "${xray_recent_window_min}" -lt 5 ]] && xray_recent_window_min="30"
+[[ -z "${xray_active_window_sec}" || "${xray_active_window_sec}" -lt 30 ]] && xray_active_window_sec="120"
+[[ -z "${xray_min_hits_per_ip}" || "${xray_min_hits_per_ip}" -lt 1 ]] && xray_min_hits_per_ip="2"
 
 api_call() {
   local method="$1" path="$2" data="${3:-}"
@@ -6467,13 +6525,14 @@ show_ssh_only_online() {
 
 xray_log_snapshot() {
   local dst="$1"
-  local cutoff_ts
+  local cutoff_ts active_cutoff_ts
   cutoff_ts="$(( $(date +%s) - (xray_recent_window_min * 60) ))"
+  active_cutoff_ts="$(( $(date +%s) - xray_active_window_sec ))"
   if [[ ! -f /var/log/xray/access.log ]]; then
     : > "${dst}"
     return
   fi
-  tail -n 25000 /var/log/xray/access.log | awk -v cutoff="${cutoff_ts}" '
+  tail -n 25000 /var/log/xray/access.log | awk -v cutoff="${cutoff_ts}" -v active_cutoff="${active_cutoff_ts}" -v min_hits="${xray_min_hits_per_ip}" '
     function norm_ip(v) {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
       gsub(/^\[/, "", v);
@@ -6491,6 +6550,7 @@ xray_log_snapshot() {
     {
       ts=ts_from_line($0);
       if (ts > 0 && ts < cutoff) next;
+      if (ts == 0) ts=systime();
 
       email=""; src="";
       if (match($0, /"email":"[^"]+"/)) {
@@ -6513,14 +6573,21 @@ xray_log_snapshot() {
       ip=norm_ip(src);
       if (ip == "") next;
       key=email "|" ip;
-      uniq[key]=1;
-      lastip[email]=ip;
+      hits[key]++;
+      if (!(key in last_ts) || ts > last_ts[key]) last_ts[key]=ts;
+      if (!(email in latest_ts) || ts >= latest_ts[email]) {
+        latest_ts[email]=ts;
+        lastip[email]=ip;
+      }
       seen[email]=1;
     }
     END {
-      for (k in uniq) {
+      for (k in hits) {
         split(k, a, /\|/);
-        cnt[a[1]]++;
+        u=a[1]; ip=a[2];
+        if (last_ts[k] < active_cutoff) continue;
+        if (hits[k] < min_hits && lastip[u] != ip) continue;
+        cnt[u]++;
       }
       for (u in seen) {
         printf "%s|%d|%s\n", u, (u in cnt ? cnt[u] : 0), (u in lastip ? lastip[u] : "-");
@@ -6694,6 +6761,9 @@ Time: $(date '+%F %T')"
     IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES}" \
     IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES}" \
     XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS}" \
+    XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES}" \
+    XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS}" \
+    XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP}" \
     TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
     TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}" \
     AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE}" \
