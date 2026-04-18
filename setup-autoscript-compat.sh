@@ -46,6 +46,7 @@ set -euo pipefail
 #   UDPHC_LOG_LINES_HISTORY=auto                 (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   UDPHC_LOG_LINES_REALTIME=auto                (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   XRAY_BLOCK_TCP_PORTS=80,443                  (opsional, port TCP yang diblok saat lock tmp xray)
+#   XRAY_RECENT_WINDOW_MINUTES=30                (opsional, jendela menit log xray untuk hitung multi-login)
 #   DB_PATH=/usr/sbin/potatonc/potato.db
 #   APP_DIR=/opt/sc-1forcr
 
@@ -87,6 +88,7 @@ DROPBEAR_RECENT_LOG_MAX_LINES="${DROPBEAR_RECENT_LOG_MAX_LINES:-}"
 UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-}"
 UDPHC_LOG_LINES_REALTIME="${UDPHC_LOG_LINES_REALTIME:-}"
 XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
+XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-30}"
 SSH_HC_AUTH_LOOKBACK_HOURS="${SSH_HC_AUTH_LOOKBACK_HOURS:-24}"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
@@ -1183,6 +1185,7 @@ DROPBEAR_RECENT_LOG_MAX_LINES=${DROPBEAR_RECENT_LOG_MAX_LINES}
 UDPHC_LOG_LINES_HISTORY=${UDPHC_LOG_LINES_HISTORY}
 UDPHC_LOG_LINES_REALTIME=${UDPHC_LOG_LINES_REALTIME}
 XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
+XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 EOF
 
@@ -2295,6 +2298,14 @@ const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443'
   .split(',')
   .map((v) => Number(String(v || '').trim()))
   .filter((n) => Number.isInteger(n) && n >= 1 && n <= 65535);
+const XRAY_RECENT_WINDOW_MINUTES_RAW = Number(process.env.XRAY_RECENT_WINDOW_MINUTES || (CHECK_INTERVAL_MINUTES * 3));
+const XRAY_RECENT_WINDOW_MINUTES = Number.isFinite(XRAY_RECENT_WINDOW_MINUTES_RAW) && XRAY_RECENT_WINDOW_MINUTES_RAW >= 5
+  ? Math.min(Math.floor(XRAY_RECENT_WINDOW_MINUTES_RAW), 1440)
+  : Math.max(10, CHECK_INTERVAL_MINUTES * 3);
+const XRAY_LOG_TAIL_LINES_RAW = Number(process.env.XRAY_LOG_TAIL_LINES || 8000);
+const XRAY_LOG_TAIL_LINES = Number.isFinite(XRAY_LOG_TAIL_LINES_RAW) && XRAY_LOG_TAIL_LINES_RAW >= 1000
+  ? Math.min(Math.floor(XRAY_LOG_TAIL_LINES_RAW), 60000)
+  : 8000;
 const RECENT_AUTH_WINDOW_MINUTES = Math.max(2, CHECK_INTERVAL_MINUTES);
 const DROPBEAR_LOG_MAX_LINES_RAW = Number(process.env.DROPBEAR_LOG_MAX_LINES || 12000);
 const DROPBEAR_LOG_MAX_LINES = Number.isFinite(DROPBEAR_LOG_MAX_LINES_RAW) && DROPBEAR_LOG_MAX_LINES_RAW >= 2000
@@ -2620,14 +2631,28 @@ function parseXrayRecentIpMap() {
   if (!fs.existsSync(path)) return map;
   let tailOut = '';
   try {
-    tailOut = execFileSync('tail', ['-n', '5000', path], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    tailOut = execFileSync('tail', ['-n', String(XRAY_LOG_TAIL_LINES), path], { encoding: 'utf8', maxBuffer: 12 * 1024 * 1024 });
   } catch (_) {
     return map;
   }
+  const cutoffTs = Date.now() - (XRAY_RECENT_WINDOW_MINUTES * 60 * 1000);
   const lines = String(tailOut || '').split('\n');
   for (const lineRaw of lines) {
     const line = String(lineRaw || '').trim();
     if (!line) continue;
+    const tm = line.match(/^(\d{4})\/(\d{2})\/(\d{2})\s+(\d{2}):(\d{2}):(\d{2})/);
+    if (tm) {
+      const ts = new Date(
+        Number(tm[1]),
+        Number(tm[2]) - 1,
+        Number(tm[3]),
+        Number(tm[4]),
+        Number(tm[5]),
+        Number(tm[6]),
+        0
+      ).getTime();
+      if (Number.isFinite(ts) && ts < cutoffTs) continue;
+    }
     const emailJson = line.match(/"email":"([^"]+)"/);
     const emailTxt = line.match(/\bemail:\s*([^\s]+)/i);
     const email = String(emailJson?.[1] || emailTxt?.[1] || '').trim().toLowerCase();
@@ -3901,6 +3926,7 @@ DROPBEAR_RECENT_LOG_MAX_LINES=${DROPBEAR_RECENT_LOG_MAX_LINES}
 UDPHC_LOG_LINES_HISTORY=${UDPHC_LOG_LINES_HISTORY}
 UDPHC_LOG_LINES_REALTIME=${UDPHC_LOG_LINES_REALTIME}
 XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
+XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
 EOF
   chmod 600 /etc/sc-1forcr.env
@@ -3924,10 +3950,12 @@ DROPBEAR_LOG_MAX_LINES="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9'
 DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_REALTIME="$(echo "${UDPHC_LOG_LINES_REALTIME:-400}" | tr -cd '0-9')"
+xray_recent_window_min="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-30}" | tr -cd '0-9')"
 [[ -z "${DROPBEAR_LOG_MAX_LINES}" || "${DROPBEAR_LOG_MAX_LINES}" -lt 2000 ]] && DROPBEAR_LOG_MAX_LINES="12000"
 [[ -z "${DROPBEAR_RECENT_LOG_MAX_LINES}" || "${DROPBEAR_RECENT_LOG_MAX_LINES}" -lt 500 ]] && DROPBEAR_RECENT_LOG_MAX_LINES="5000"
 [[ -z "${UDPHC_LOG_LINES_HISTORY}" || "${UDPHC_LOG_LINES_HISTORY}" -lt 200 ]] && UDPHC_LOG_LINES_HISTORY="1200"
 [[ -z "${UDPHC_LOG_LINES_REALTIME}" || "${UDPHC_LOG_LINES_REALTIME}" -lt 100 ]] && UDPHC_LOG_LINES_REALTIME="400"
+[[ -z "${xray_recent_window_min}" || "${xray_recent_window_min}" -lt 5 ]] && xray_recent_window_min="30"
 
 api_call() {
   local method="$1" path="$2" data="${3:-}"
@@ -6405,11 +6433,13 @@ show_ssh_only_online() {
 
 xray_log_snapshot() {
   local dst="$1"
+  local cutoff_ts
+  cutoff_ts="$(( $(date +%s) - (xray_recent_window_min * 60) ))"
   if [[ ! -f /var/log/xray/access.log ]]; then
     : > "${dst}"
     return
   fi
-  tail -n 25000 /var/log/xray/access.log | awk '
+  tail -n 25000 /var/log/xray/access.log | awk -v cutoff="${cutoff_ts}" '
     function norm_ip(v) {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
       gsub(/^\[/, "", v);
@@ -6417,7 +6447,17 @@ xray_log_snapshot() {
       sub(/:[0-9]+$/, "", v);
       return v;
     }
+    function ts_from_line(line, a, ts) {
+      if (match(line, /^([0-9]{4})\/([0-9]{2})\/([0-9]{2})[[:space:]]+([0-9]{2}):([0-9]{2}):([0-9]{2})/, a)) {
+        ts = mktime(a[1] " " a[2] " " a[3] " " a[4] " " a[5] " " a[6]);
+        if (ts > 0) return ts;
+      }
+      return 0;
+    }
     {
+      ts=ts_from_line($0);
+      if (ts > 0 && ts < cutoff) next;
+
       email=""; src="";
       if (match($0, /"email":"[^"]+"/)) {
         email=substr($0, RSTART+9, RLENGTH-10);
