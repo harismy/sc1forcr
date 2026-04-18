@@ -2330,6 +2330,12 @@ const DROPBEAR_RECENT_LOG_MAX_LINES = Number.isFinite(DROPBEAR_RECENT_LOG_MAX_LI
   ? Math.min(Math.floor(DROPBEAR_RECENT_LOG_MAX_LINES_RAW), 30000)
   : 5000;
 const IPLIMIT_DEBUG = String(process.env.IPLIMIT_DEBUG || '0').trim() === '1';
+const UDPCUSTOM_LOG_UNITS = Array.from(new Set([
+  UDPCUSTOM_SERVICE,
+  'sc-1forcr-udpcustom',
+  'udp-custom',
+  'udpcustom'
+].map((v) => String(v || '').trim()).filter(Boolean)));
 
 const db = new sqlite3.Database(DB_PATH);
 
@@ -2451,12 +2457,66 @@ function parseDropbearExitLine(lineRaw) {
   return { pid };
 }
 
+function parseUdpcustomAuthLine(lineRaw) {
+  const line = String(lineRaw || '').trim();
+  if (!line) return null;
+  const srcMatch = line.match(/\[src:([^\]]+)\]/i);
+  const src = String(srcMatch?.[1] || '').trim();
+  const userMatch =
+    line.match(/\[user:([^\]]+)\]/i) ||
+    line.match(/\[username:([^\]]+)\]/i) ||
+    line.match(/\[password:([^\]]+)\]/i) ||
+    line.match(/user[=: ]([^ ,\]]+)/i) ||
+    line.match(/username[=: ]([^ ,\]]+)/i);
+  const username = String(userMatch?.[1] || '').trim().toLowerCase();
+  const source = src || String((line.match(/src[=: ]([^ ,\]]+)/i) || [])[1] || '').trim();
+  const port = extractPort(source);
+  if (!username || !source) return null;
+  return { username, source, port };
+}
+
+function parseUdpcustomSessionEvent(lineRaw) {
+  const line = String(lineRaw || '').trim();
+  if (!line) return null;
+  const isConnect = /Client connected/i.test(line);
+  const isDisconnect = /Client disconnected/i.test(line);
+  if (!isConnect && !isDisconnect) return null;
+
+  const srcMatch = line.match(/\[src:([^\]]+)\]/i);
+  const srcRaw = String(srcMatch?.[1] || '').trim();
+  const ip = extractIp(srcRaw);
+  const port = extractPort(srcRaw);
+  const srcKey = (ip && port) ? `${ip}:${port}` : (srcRaw || ip || '');
+  if (!srcKey) return null;
+
+  const userMatch =
+    line.match(/\[user:([^\]]+)\]/i) ||
+    line.match(/\[username:([^\]]+)\]/i) ||
+    line.match(/\[password:([^\]]+)\]/i);
+  const username = String(userMatch?.[1] || '')
+    .trim()
+    .replace(/^[\["']+/, '')
+    .replace(/[\]"',;]+$/, '')
+    .toLowerCase();
+
+  return {
+    action: isConnect ? 'connect' : 'disconnect',
+    srcKey,
+    ip: ip || '',
+    username: username || ''
+  };
+}
+
 function parseSshAndUdpUsage() {
   const ipMap = new Map();
   const sessionMap = new Map();
   const recentAuthMap = new Map();
   const procSessionMap = new Map();
   const wsClientPortMap = new Map();
+  const udphcSessionMap = new Map();
+  const udphcIpMap = new Map();
+  let udphcParsedCount = 0;
+  let udphcActiveSessions = 0;
   const dropbearPorts = getDropbearPortSet();
   const dropbearActiveClientPorts = new Set();
 
@@ -2634,9 +2694,100 @@ function parseSshAndUdpUsage() {
     addSessionKeyToUserMap(procSessionMap, user, `proc-pid:${pid}`);
   }
 
-  // Catatan: keputusan lock akun SSH dihitung dari data SSH/Dropbear/WSS saja.
-  // Jangan campur log UDPHC di sini agar perilaku lock SSH konsisten.
-  return { ipMap, sessionMap, recentAuthMap, procSessionMap, wsClientPortMap };
+  // Tambahan sinyal dari log UDPHC (additive) agar user HC-only tetap bisa terdeteksi.
+  // Model hitung: stateful per event connect/disconnect sehingga sesi aktif lebih akurat.
+  const udphcSrcOwner = new Map(); // srcKey -> username
+  const udphcUserSessions = new Map(); // username -> Set<srcKey>
+  const udphcUserIps = new Map(); // username -> Set<ip>
+  const addUdphcSession = (user, srcKey, ip) => {
+    const u = String(user || '').trim().toLowerCase();
+    const s = String(srcKey || '').trim();
+    if (!u || !s || u === 'root') return;
+    if (!udphcUserSessions.has(u)) udphcUserSessions.set(u, new Set());
+    udphcUserSessions.get(u).add(s);
+    if (ip) {
+      if (!udphcUserIps.has(u)) udphcUserIps.set(u, new Set());
+      udphcUserIps.get(u).add(String(ip || '').trim());
+    }
+  };
+  const removeUdphcSession = (user, srcKey) => {
+    const u = String(user || '').trim().toLowerCase();
+    const s = String(srcKey || '').trim();
+    if (!u || !s) return;
+    if (!udphcUserSessions.has(u)) return;
+    udphcUserSessions.get(u).delete(s);
+  };
+
+  for (const unit of UDPCUSTOM_LOG_UNITS) {
+    let udphcLog = '';
+    try {
+      udphcLog = execFileSync(
+        'journalctl',
+        ['-u', unit, '-n', '25000', '--no-pager'],
+        { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }
+      );
+    } catch (_) {}
+    for (const lineRaw of String(udphcLog || '').split('\n')) {
+      const line = String(lineRaw || '');
+      if (/Server up and running/i.test(line) || /Started SC 1FORCR UDP Custom Core/i.test(line)) {
+        udphcSrcOwner.clear();
+        udphcUserSessions.clear();
+        udphcUserIps.clear();
+        continue;
+      }
+
+      const ev = parseUdpcustomSessionEvent(line);
+      if (ev) {
+        if (ev.action === 'connect') {
+          if (ev.username) {
+            udphcSrcOwner.set(ev.srcKey, ev.username);
+            addUdphcSession(ev.username, ev.srcKey, ev.ip);
+            udphcParsedCount += 1;
+          }
+        } else {
+          const owner = udphcSrcOwner.get(ev.srcKey);
+          if (owner) {
+            removeUdphcSession(owner, ev.srcKey);
+            udphcSrcOwner.delete(ev.srcKey);
+          }
+        }
+        continue;
+      }
+
+      // Fallback: jika format event bukan connected/disconnected, pakai parser auth lama.
+      const parsed = parseUdpcustomAuthLine(line);
+      if (!parsed) continue;
+      udphcParsedCount += 1;
+      const user = parsed.username;
+      const ip = extractIp(parsed.source);
+      const port = String(parsed.port || '').trim();
+      if (ip) {
+        addIpToUserMap(udphcIpMap, user, ip);
+        addSessionKeyToUserMap(udphcSessionMap, user, `udphc-ip:${ip}`);
+      }
+      if (ip && port) {
+        addUdphcSession(user, `${ip}:${port}`, ip);
+      } else if (ip) {
+        addUdphcSession(user, `udphc-ip:${ip}`, ip);
+      } else {
+        addSessionKeyToUserMap(udphcSessionMap, user, 'udphc-auth');
+        addUdphcSession(user, `udphc-auth:${udphcParsedCount}`, '');
+      }
+      if (port) addSessionKeyToUserMap(udphcSessionMap, user, `udphc-port:${port}`);
+    }
+  }
+  for (const [user, sessions] of udphcUserSessions.entries()) {
+    for (const s of sessions) addSessionKeyToUserMap(udphcSessionMap, user, `udphc-sess:${s}`);
+    udphcActiveSessions += sessions.size;
+  }
+  for (const [user, ips] of udphcUserIps.entries()) {
+    for (const ip of ips) addIpToUserMap(udphcIpMap, user, ip);
+  }
+  if (IPLIMIT_DEBUG) {
+    console.log(`[iplimit-debug][udphc] units=${UDPCUSTOM_LOG_UNITS.join(',')} parsed=${udphcParsedCount} active_sessions=${udphcActiveSessions}`);
+  }
+
+  return { ipMap, sessionMap, recentAuthMap, procSessionMap, wsClientPortMap, udphcSessionMap, udphcIpMap };
 }
 
 function parseXrayRecentIpMap() {
@@ -3136,6 +3287,8 @@ async function lockIfExceeded(nowTs) {
   const sshRecentAuthMap = sshUsage.recentAuthMap || new Map();
   const sshProcSessionMap = sshUsage.procSessionMap || new Map();
   const sshWsClientPortMap = sshUsage.wsClientPortMap || new Map();
+  const sshUdphcSessionMap = sshUsage.udphcSessionMap || new Map();
+  const sshUdphcIpMap = sshUsage.udphcIpMap || new Map();
   const xrayMap = parseXrayRecentIpMap();
   const udpcustomPort = getUdpCustomListenPort();
   let zivpnChanged = false;
@@ -3173,17 +3326,20 @@ async function lockIfExceeded(nowTs) {
     const cntWsPorts = setMaxSize(sshWsClientPortMap);
     const cntRecent = setMaxSize(sshRecentAuthMap);
     const cntProc = setMaxSize(sshProcSessionMap);
+    const cntUdphc = setMaxSize(sshUdphcSessionMap);
+    const cntUdphcIp = setMaxSize(sshUdphcIpMap);
     // Sumber realtime utama:
     // - ipMap/sessionMap untuk SSH normal
     // - wsClientPortMap untuk jalur HC/WS (satu koneksi = satu client port)
-    const cntActive = Math.max(cntIp, cntSession, cntWsPorts);
+    // - udphcSessionMap/udphcIpMap untuk jalur UDPHC native.
+    const cntActive = Math.max(cntIp, cntSession, cntWsPorts, cntUdphc, cntUdphcIp);
     // proc/recent dipakai sebagai fallback kuantitatif ringan (cap) agar kasus 2 HP tetap terdeteksi.
     // recent sudah dedup berdasarkan source IP, jadi tidak overcount karena port reconnect.
     const cntProcHint = Math.min(Math.max(cntProc, 0), 3);
     const cntRecentHint = Math.min(Math.max(cntRecent, 0), 3);
     const cnt = Math.max(cntActive, cntProcHint, cntRecentHint);
     if (IPLIMIT_DEBUG) {
-      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
+      console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
     }
     if (cnt <= lim) continue;
     const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]);
@@ -3200,7 +3356,10 @@ async function lockIfExceeded(nowTs) {
     safeExec('passwd', ['-l', user]);
 
     // Untuk UDPHC: drop semua src IP aktif user ini selama masa lock.
-    const lockIps = Array.from(setUnionValues(sshIpMap));
+    const lockIps = Array.from(new Set([
+      ...Array.from(setUnionValues(sshIpMap)),
+      ...Array.from(setUnionValues(sshUdphcIpMap))
+    ]));
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
     for (const ip of lockIps) {
       if (addUdpDropRule(ip, udpcustomPort)) {
@@ -6756,6 +6915,7 @@ show_udpcustom_online() {
 
 update_script_from_repo() {
   local url tmp active_backend alt_url downloaded_ok
+  local udpcustom_svc zstat ustat
   local banner_html banner_txt had_banner_html had_banner_txt
   local update_note ts_now new_ver
   url="${UPDATE_SCRIPT_URL:-}"
@@ -6809,6 +6969,15 @@ Time: $(date '+%F %T')"
   fi
   if [[ "${active_backend}" == "udp-custom" || "${active_backend}" == "udphc" ]]; then
     active_backend="udpcustom"
+  fi
+  # Prioritaskan kondisi service aktual agar mode sebelum update benar-benar dipertahankan.
+  udpcustom_svc="$(detect_udpcustom_service)"
+  zstat="$(systemctl is-active "${ZIVPN_SERVICE}" 2>/dev/null || true)"
+  ustat="$(systemctl is-active "${udpcustom_svc}" 2>/dev/null || true)"
+  if [[ "${ustat}" == "active" && "${zstat}" != "active" ]]; then
+    active_backend="udpcustom"
+  elif [[ "${zstat}" == "active" && "${ustat}" != "active" ]]; then
+    active_backend="zivpn"
   fi
 
   # Backup banner custom agar tidak tertimpa saat proses update installer.
@@ -6875,6 +7044,17 @@ Time: $(date '+%F %T')"
   elif [[ "${had_banner_txt}" != "1" ]]; then
     rm -f /etc/sc-1forcr/banner.txt >/dev/null 2>&1 || true
   fi
+
+  # Pastikan mode backend UDP pasca-update sama seperti sebelum update.
+  ACTIVE_UDP_BACKEND="${active_backend}"
+  update_sc_env_var "ACTIVE_UDP_BACKEND" "${ACTIVE_UDP_BACKEND}"
+  update_app_env_var "ACTIVE_UDP_BACKEND" "${ACTIVE_UDP_BACKEND}"
+  if [[ "${ACTIVE_UDP_BACKEND}" == "udpcustom" ]]; then
+    switch_udp_to_udpcustom || true
+  else
+    switch_udp_to_zivpn || true
+  fi
+  systemctl restart sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 
   ts_now="$(date '+%F %T')"
   new_ver="-"
