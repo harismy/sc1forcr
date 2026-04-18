@@ -2921,6 +2921,63 @@ function removeTcpDropRule(ip, port) {
   }
 }
 
+function normalizeRuleSource(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return '';
+  s = s.replace(/\/(32|128)$/, '');
+  return s;
+}
+
+function listCurrentTcpDropRuleIps(port, ipv6 = false) {
+  const cmd = ipv6 ? 'ip6tables-save' : 'iptables-save';
+  const out = readExec(cmd, []);
+  const set = new Set();
+  if (!out) return set;
+  const dport = String(port);
+  for (const lineRaw of String(out).split('\n')) {
+    const line = String(lineRaw || '').trim();
+    if (!line.startsWith('-A INPUT ')) continue;
+    if (!line.includes(' -p tcp ')) continue;
+    if (!line.includes(` --dport ${dport} `)) continue;
+    if (!line.endsWith(' -j DROP')) continue;
+    const m = line.match(/-s\s+([^\s]+)/);
+    const src = normalizeRuleSource(m?.[1] || '');
+    if (!src) continue;
+    set.add(src);
+  }
+  return set;
+}
+
+async function cleanupOrphanXrayDropRules() {
+  const expectedRows = await all(
+    "SELECT DISTINCT ip FROM temp_ip_lock_ips WHERE account_type IN ('vmess','vless','trojan')"
+  ).catch(() => []);
+  const expected = new Set(
+    expectedRows
+      .map((r) => normalizeRuleSource(String(r?.ip || '').trim()))
+      .filter(Boolean)
+  );
+
+  let removed = 0;
+  for (const p of XRAY_BLOCK_TCP_PORTS) {
+    const ipv4Set = listCurrentTcpDropRuleIps(p, false);
+    for (const ip of ipv4Set) {
+      if (expected.has(ip)) continue;
+      removeTcpDropRule(ip, p);
+      removed += 1;
+    }
+    const ipv6Set = listCurrentTcpDropRuleIps(p, true);
+    for (const ip of ipv6Set) {
+      if (expected.has(ip)) continue;
+      removeTcpDropRule(ip, p);
+      removed += 1;
+    }
+  }
+  if (IPLIMIT_DEBUG && removed > 0) {
+    console.log(`[iplimit-debug][xray] orphan tcp-drop removed=${removed}`);
+  }
+}
+
 function disconnectXrayIpNow(ip) {
   const src = String(ip || '').trim();
   if (!src) return;
@@ -3231,6 +3288,7 @@ async function main() {
   await ensureTables();
   const u = await unlockExpired(now);
   const l = await lockIfExceeded(now);
+  await cleanupOrphanXrayDropRules().catch(() => {});
   if (u.xrayChanged || l.xrayChanged) {
     await rebuildXrayFromDb().catch(() => {});
   }
