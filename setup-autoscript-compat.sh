@@ -2879,6 +2879,31 @@ function removeTcpDropRule(ip, port) {
   }
 }
 
+function disconnectXrayIpNow(ip) {
+  const src = String(ip || '').trim();
+  if (!src) return;
+
+  // Try to kill active sockets from/to this peer IP (best effort).
+  safeExec('ss', ['-K', 'dst', src]);
+  safeExec('ss', ['-K', 'src', src]);
+
+  // Narrow filters for common ports used by xray behind nginx/haproxy.
+  for (const p of XRAY_BLOCK_TCP_PORTS) {
+    safeExec('ss', ['-K', 'dst', src, 'dport', '=', `:${p}`]);
+    safeExec('ss', ['-K', 'dst', src, 'sport', '=', `:${p}`]);
+    safeExec('ss', ['-K', 'src', src, 'dport', '=', `:${p}`]);
+    safeExec('ss', ['-K', 'src', src, 'sport', '=', `:${p}`]);
+  }
+
+  // If conntrack exists, drop tracked flows so packets are cut immediately.
+  if (safeExec('conntrack', ['-V'])) {
+    for (const p of XRAY_BLOCK_TCP_PORTS) {
+      safeExec('conntrack', ['-D', '-p', 'tcp', '-s', src, '--dport', String(p)]);
+      safeExec('conntrack', ['-D', '-p', 'tcp', '-d', src, '--sport', String(p)]);
+    }
+  }
+}
+
 function disconnectSshWsByClientPorts(ports) {
   const list = Array.from(new Set((ports || []).map((v) => String(v || '').trim()).filter((v) => /^[0-9]{1,5}$/.test(v))));
   for (const p of list) {
@@ -3101,6 +3126,10 @@ async function lockIfExceeded(nowTs) {
         let blocked = false;
         for (const p of XRAY_BLOCK_TCP_PORTS) {
           if (addTcpDropRule(ip, p)) blocked = true;
+        }
+        if (blocked) {
+          // Force-cut active session so lock is effective immediately.
+          disconnectXrayIpNow(ip);
         }
         if (blocked) {
           await run("INSERT OR IGNORE INTO temp_ip_lock_ips(account_type, username, ip) VALUES(?, ?, ?)", [item.type, user, ip]).catch(() => {});
