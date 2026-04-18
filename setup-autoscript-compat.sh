@@ -482,7 +482,9 @@ CREATE TABLE IF NOT EXISTS account_sshs (
   date_exp TEXT,
   status TEXT DEFAULT 'AKTIF',
   quota INTEGER DEFAULT 0,
-  limitip INTEGER DEFAULT 0
+  limitip INTEGER DEFAULT 0,
+  owner_telegram_id INTEGER,
+  owner_telegram_chat_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS account_vmesses (
@@ -491,7 +493,9 @@ CREATE TABLE IF NOT EXISTS account_vmesses (
   date_exp TEXT,
   status TEXT DEFAULT 'AKTIF',
   quota INTEGER DEFAULT 0,
-  limitip INTEGER DEFAULT 0
+  limitip INTEGER DEFAULT 0,
+  owner_telegram_id INTEGER,
+  owner_telegram_chat_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS account_vlesses (
@@ -500,7 +504,9 @@ CREATE TABLE IF NOT EXISTS account_vlesses (
   date_exp TEXT,
   status TEXT DEFAULT 'AKTIF',
   quota INTEGER DEFAULT 0,
-  limitip INTEGER DEFAULT 0
+  limitip INTEGER DEFAULT 0,
+  owner_telegram_id INTEGER,
+  owner_telegram_chat_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS account_trojans (
@@ -509,7 +515,9 @@ CREATE TABLE IF NOT EXISTS account_trojans (
   date_exp TEXT,
   status TEXT DEFAULT 'AKTIF',
   quota INTEGER DEFAULT 0,
-  limitip INTEGER DEFAULT 0
+  limitip INTEGER DEFAULT 0,
+  owner_telegram_id INTEGER,
+  owner_telegram_chat_id INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS temp_ip_locks (
@@ -523,6 +531,17 @@ CREATE TABLE IF NOT EXISTS temp_ip_locks (
 
 INSERT OR IGNORE INTO servers("key") VALUES('${API_AUTH_TOKEN}');
 SQL
+
+  # Backward-compatible migration for older DB schema.
+  local t
+  for t in account_sshs account_vmesses account_vlesses account_trojans; do
+    if ! sqlite3 "${DB_PATH}" "PRAGMA table_info(${t});" | grep -q '|owner_telegram_id|'; then
+      sqlite3 "${DB_PATH}" "ALTER TABLE ${t} ADD COLUMN owner_telegram_id INTEGER;" >/dev/null 2>&1 || true
+    fi
+    if ! sqlite3 "${DB_PATH}" "PRAGMA table_info(${t});" | grep -q '|owner_telegram_chat_id|'; then
+      sqlite3 "${DB_PATH}" "ALTER TABLE ${t} ADD COLUMN owner_telegram_chat_id INTEGER;" >/dev/null 2>&1 || true
+    fi
+  done
 }
 
 apply_system_optimizations() {
@@ -1202,6 +1221,25 @@ function auth(req, res, next) {
   if (!token || token !== AUTH_TOKEN) return fail(res, 401, 'unauthorized');
   next();
 }
+function parseIntId(raw) {
+  const n = Number(String(raw ?? '').trim());
+  return Number.isInteger(n) ? n : null;
+}
+function getOwnerInfo(req, body = {}) {
+  const ownerTelegramId = parseIntId(
+    req?.headers?.['x-telegram-user-id'] ??
+    body?.telegram_user_id ??
+    body?.owner_telegram_id ??
+    body?.user_id
+  );
+  const ownerTelegramChatId = parseIntId(
+    req?.headers?.['x-telegram-chat-id'] ??
+    body?.telegram_chat_id ??
+    body?.owner_telegram_chat_id ??
+    body?.chat_id
+  );
+  return { ownerTelegramId, ownerTelegramChatId };
+}
 function ymdLocal(d) {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, '0');
@@ -1474,11 +1512,49 @@ async function renderAndReloadXray() {
   };
   fs.mkdirSync('/usr/local/etc/xray', { recursive: true });
   fs.writeFileSync('/usr/local/etc/xray/config.json', JSON.stringify(cfg, null, 2));
-  safeExec('systemctl', ['restart', 'xray']);
+  // Hindari restart agar koneksi user existing tidak terputus.
+  // Prioritas: systemctl reload, fallback kirim HUP ke service.
+  if (!safeExec('systemctl', ['reload', 'xray'])) {
+    safeExec('systemctl', ['kill', '-s', 'HUP', 'xray']);
+  }
 }
 
 app.get('/vps/health', (_req, res) => ok(res, { ok: true, domain: DOMAIN }));
 app.use('/vps', auth);
+
+app.get('/vps/my-accounts', async (req, res) => {
+  try {
+    const ownerTelegramId = parseIntId(req.query?.telegram_user_id ?? req.headers?.['x-telegram-user-id']);
+    if (!ownerTelegramId) return fail(res, 400, 'telegram_user_id required');
+    const includeInactive = String(req.query?.include_inactive || '0').trim() === '1';
+    const statusFilter = includeInactive ? '' : "AND UPPER(TRIM(COALESCE(status,'')))='AKTIF'";
+
+    const rows = await all(
+      `
+      SELECT 'ssh' AS type, username, date_exp, status, quota, limitip FROM account_sshs
+      WHERE owner_telegram_id=? ${statusFilter}
+      UNION ALL
+      SELECT 'vmess' AS type, username, date_exp, status, quota, limitip FROM account_vmesses
+      WHERE owner_telegram_id=? ${statusFilter}
+      UNION ALL
+      SELECT 'vless' AS type, username, date_exp, status, quota, limitip FROM account_vlesses
+      WHERE owner_telegram_id=? ${statusFilter}
+      UNION ALL
+      SELECT 'trojan' AS type, username, date_exp, status, quota, limitip FROM account_trojans
+      WHERE owner_telegram_id=? ${statusFilter}
+      ORDER BY LOWER(username), type
+      `,
+      [ownerTelegramId, ownerTelegramId, ownerTelegramId, ownerTelegramId]
+    );
+    return ok(res, {
+      telegram_user_id: ownerTelegramId,
+      accounts: rows || [],
+      total: Array.isArray(rows) ? rows.length : 0
+    });
+  } catch (e) {
+    return fail(res, 500, e.message);
+  }
+});
 
 function sshPayload(username, password, expDate, limitip) {
   return {
@@ -1503,9 +1579,25 @@ async function ensureUsernameNotExists(table, username) {
   }
 }
 
-async function createOrUpdateSshFromBody(body, forcedDays = null) {
-  const username = String(body?.username || '').trim();
-  const password = String(body?.password || username || '').trim() || username;
+async function generateTrialUsername(table, prefix = 'trial') {
+  const cleanPrefix = String(prefix || 'trial').toLowerCase().replace(/[^a-z0-9]/g, '') || 'trial';
+  for (let i = 0; i < 50; i += 1) {
+    const candidate = `${cleanPrefix}${String(Math.floor(Math.random() * 10000)).padStart(4, '0')}`;
+    const row = await get(`SELECT 1 AS ok FROM ${table} WHERE LOWER(username)=LOWER(?)`, [candidate]);
+    if (!row) return candidate;
+  }
+  return `${cleanPrefix}${Date.now().toString().slice(-6)}`;
+}
+
+async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
+  const isTrial = forcedDays !== null;
+  let username = String(body?.username || '').trim().toLowerCase();
+  if (!username && isTrial) {
+    username = await generateTrialUsername('account_sshs', 'trial');
+  }
+  const owner = getOwnerInfo(req, body || {});
+  const requestedPassword = String(body?.password || '').trim();
+  const password = requestedPassword || (isTrial ? crypto.randomBytes(6).toString('hex') : username);
   const expDays = forcedDays === null ? Number(body?.expired || 30) : Number(forcedDays || 1);
   const quota = Number(body?.kuota || 0);
   const limitip = Number(body?.limitip || 0);
@@ -1514,8 +1606,8 @@ async function createOrUpdateSshFromBody(body, forcedDays = null) {
   const expDate = ymdPlusDays(expDays);
   ensureLinuxUser(username, password, expDate);
   await run(
-    "INSERT INTO account_sshs(username,password,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)",
-    [username, password, expDate, 'AKTIF', quota, limitip]
+    "INSERT INTO account_sshs(username,password,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id) VALUES(?,?,?,?,?,?,?,?)",
+    [username, password, expDate, 'AKTIF', quota, limitip, owner.ownerTelegramId, owner.ownerTelegramChatId]
   );
   syncZivpnUser(username, true);
   syncUdpcustomUser(password, true);
@@ -1524,7 +1616,7 @@ async function createOrUpdateSshFromBody(body, forcedDays = null) {
 
 app.post('/vps/sshvpn', async (req, res) => {
   try {
-    return ok(res, await createOrUpdateSshFromBody(req.body, null));
+    return ok(res, await createOrUpdateSshFromBody(req, req.body, null));
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
   }
@@ -1532,7 +1624,7 @@ app.post('/vps/sshvpn', async (req, res) => {
 
 app.post('/vps/trialsshvpn', async (req, res) => {
   try {
-    return ok(res, await createOrUpdateSshFromBody(req.body, 1));
+    return ok(res, await createOrUpdateSshFromBody(req, req.body, 1));
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
   }
@@ -1605,16 +1697,29 @@ app.patch('/vps/unlocksshvpn/:username/pw', async (req, res) => {
   return ok(res, { username });
 });
 
-async function createXray(protocol, username, expDays, quota, limitip, trial) {
-  if (!username) throw new Error('username required');
+async function createXray(req, protocol, username, expDays, quota, limitip, trial) {
+  const protocolTable = {
+    vmess: 'account_vmesses',
+    vless: 'account_vlesses',
+    trojan: 'account_trojans'
+  };
+  const owner = getOwnerInfo(req, req?.body || {});
+  let finalUsername = String(username || '').trim().toLowerCase();
+  if (!finalUsername && trial) {
+    finalUsername = await generateTrialUsername(protocolTable[protocol], 'trial');
+  }
+  if (!finalUsername) throw new Error('username required');
   const expDate = ymdPlusDays(trial ? 1 : expDays);
   let data = null;
   if (protocol === 'vmess') {
-    await ensureUsernameNotExists('account_vmesses', username);
+    await ensureUsernameNotExists('account_vmesses', finalUsername);
     const uuid = crypto.randomUUID();
-    await run("INSERT INTO account_vmesses(username,uuid,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)", [username, uuid, expDate, 'AKTIF', quota, limitip]);
+    await run(
+      "INSERT INTO account_vmesses(username,uuid,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id) VALUES(?,?,?,?,?,?,?,?)",
+      [finalUsername, uuid, expDate, 'AKTIF', quota, limitip, owner.ownerTelegramId, owner.ownerTelegramChatId]
+    );
     data = {
-      hostname: DOMAIN, username, uuid, expired: expDate, exp: expDate, time: nowTime(),
+      hostname: DOMAIN, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
       path: { ws: '/vmess', stn: '/vmess', upgrade: '/upvmess' },
@@ -1622,11 +1727,14 @@ async function createXray(protocol, username, expDays, quota, limitip, trial) {
       link: { tls: vmessLink(DOMAIN, uuid, true), none: vmessLink(DOMAIN, uuid, false), grpc: vmessLink(DOMAIN, uuid, true), uptls: vmessLink(DOMAIN, uuid, true), upntls: vmessLink(DOMAIN, uuid, false) }
     };
   } else if (protocol === 'vless') {
-    await ensureUsernameNotExists('account_vlesses', username);
+    await ensureUsernameNotExists('account_vlesses', finalUsername);
     const uuid = crypto.randomUUID();
-    await run("INSERT INTO account_vlesses(username,uuid,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)", [username, uuid, expDate, 'AKTIF', quota, limitip]);
+    await run(
+      "INSERT INTO account_vlesses(username,uuid,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id) VALUES(?,?,?,?,?,?,?,?)",
+      [finalUsername, uuid, expDate, 'AKTIF', quota, limitip, owner.ownerTelegramId, owner.ownerTelegramChatId]
+    );
     data = {
-      hostname: DOMAIN, username, uuid, expired: expDate, exp: expDate, time: nowTime(),
+      hostname: DOMAIN, username: finalUsername, uuid, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
       path: { ws: '/vless', stn: '/vless', upgrade: '/upvless' },
@@ -1634,11 +1742,14 @@ async function createXray(protocol, username, expDays, quota, limitip, trial) {
       link: { tls: vlessLink(DOMAIN, uuid, true), none: vlessLink(DOMAIN, uuid, false), grpc: vlessLink(DOMAIN, uuid, true), uptls: vlessLink(DOMAIN, uuid, true), upntls: vlessLink(DOMAIN, uuid, false) }
     };
   } else if (protocol === 'trojan') {
-    await ensureUsernameNotExists('account_trojans', username);
+    await ensureUsernameNotExists('account_trojans', finalUsername);
     const pass = crypto.randomUUID();
-    await run("INSERT INTO account_trojans(username,password,date_exp,status,quota,limitip) VALUES(?,?,?,?,?,?)", [username, pass, expDate, 'AKTIF', quota, limitip]);
+    await run(
+      "INSERT INTO account_trojans(username,password,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id) VALUES(?,?,?,?,?,?,?,?)",
+      [finalUsername, pass, expDate, 'AKTIF', quota, limitip, owner.ownerTelegramId, owner.ownerTelegramChatId]
+    );
     data = {
-      hostname: DOMAIN, username, password: pass, uuid: pass, expired: expDate, exp: expDate, time: nowTime(),
+      hostname: DOMAIN, username: finalUsername, password: pass, uuid: pass, expired: expDate, exp: expDate, time: nowTime(),
       city: 'Auto', isp: 'Auto',
       port: { tls: '443', none: '80', any: '443', grpc: '443' },
       path: { ws: '/trojan', stn: '/trojan', upgrade: '/uptrojan' },
@@ -1652,7 +1763,7 @@ async function createXray(protocol, username, expDays, quota, limitip, trial) {
 
 app.post('/vps/vmessall', async (req, res) => {
   try {
-    const data = await createXray('vmess', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
+    const data = await createXray(req, 'vmess', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
     return ok(res, data);
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
@@ -1660,7 +1771,7 @@ app.post('/vps/vmessall', async (req, res) => {
 });
 app.post('/vps/trialvmessall', async (req, res) => {
   try {
-    const data = await createXray('vmess', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
+    const data = await createXray(req, 'vmess', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
     return ok(res, data);
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
@@ -1668,7 +1779,7 @@ app.post('/vps/trialvmessall', async (req, res) => {
 });
 app.post('/vps/vlessall', async (req, res) => {
   try {
-    const data = await createXray('vless', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
+    const data = await createXray(req, 'vless', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
     return ok(res, data);
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
@@ -1676,7 +1787,7 @@ app.post('/vps/vlessall', async (req, res) => {
 });
 app.post('/vps/trialvlessall', async (req, res) => {
   try {
-    const data = await createXray('vless', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
+    const data = await createXray(req, 'vless', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
     return ok(res, data);
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
@@ -1684,7 +1795,7 @@ app.post('/vps/trialvlessall', async (req, res) => {
 });
 app.post('/vps/trojanall', async (req, res) => {
   try {
-    const data = await createXray('trojan', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
+    const data = await createXray(req, 'trojan', String(req.body?.username || '').trim(), Number(req.body?.expired || 30), Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), false);
     return ok(res, data);
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
@@ -1692,7 +1803,7 @@ app.post('/vps/trojanall', async (req, res) => {
 });
 app.post('/vps/trialtrojanall', async (req, res) => {
   try {
-    const data = await createXray('trojan', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
+    const data = await createXray(req, 'trojan', String(req.body?.username || '').trim(), 1, Number(req.body?.kuota || 0), Number(req.body?.limitip || 0), true);
     return ok(res, data);
   } catch (e) {
     return fail(res, Number(e?.statusCode || 500), e.message);
@@ -3397,10 +3508,10 @@ payload = {
         "source_domain": domain or "unknown",
     },
     "data": {
-        "ssh": fetch("account_sshs", ["username", "password", "date_exp", "status", "quota", "limitip"]),
-        "vmess": fetch("account_vmesses", ["username", "uuid", "date_exp", "status", "quota", "limitip"]),
-        "vless": fetch("account_vlesses", ["username", "uuid", "date_exp", "status", "quota", "limitip"]),
-        "trojan": fetch("account_trojans", ["username", "password", "date_exp", "status", "quota", "limitip"]),
+        "ssh": fetch("account_sshs", ["username", "password", "date_exp", "status", "quota", "limitip", "owner_telegram_id", "owner_telegram_chat_id"]),
+        "vmess": fetch("account_vmesses", ["username", "uuid", "date_exp", "status", "quota", "limitip", "owner_telegram_id", "owner_telegram_chat_id"]),
+        "vless": fetch("account_vlesses", ["username", "uuid", "date_exp", "status", "quota", "limitip", "owner_telegram_id", "owner_telegram_chat_id"]),
+        "trojan": fetch("account_trojans", ["username", "password", "date_exp", "status", "quota", "limitip", "owner_telegram_id", "owner_telegram_chat_id"]),
         "zivpn_auth": [],
         "banner_html": "",
         "banner_txt": "",
@@ -3511,7 +3622,9 @@ CREATE TABLE IF NOT EXISTS account_sshs (
   date_exp TEXT,
   status TEXT DEFAULT 'AKTIF',
   quota INTEGER DEFAULT 0,
-  limitip INTEGER DEFAULT 0
+  limitip INTEGER DEFAULT 0,
+  owner_telegram_id INTEGER,
+  owner_telegram_chat_id INTEGER
 );
 CREATE TABLE IF NOT EXISTS account_vmesses (
   username TEXT PRIMARY KEY,
@@ -3519,7 +3632,9 @@ CREATE TABLE IF NOT EXISTS account_vmesses (
   date_exp TEXT,
   status TEXT DEFAULT 'AKTIF',
   quota INTEGER DEFAULT 0,
-  limitip INTEGER DEFAULT 0
+  limitip INTEGER DEFAULT 0,
+  owner_telegram_id INTEGER,
+  owner_telegram_chat_id INTEGER
 );
 CREATE TABLE IF NOT EXISTS account_vlesses (
   username TEXT PRIMARY KEY,
@@ -3527,7 +3642,9 @@ CREATE TABLE IF NOT EXISTS account_vlesses (
   date_exp TEXT,
   status TEXT DEFAULT 'AKTIF',
   quota INTEGER DEFAULT 0,
-  limitip INTEGER DEFAULT 0
+  limitip INTEGER DEFAULT 0,
+  owner_telegram_id INTEGER,
+  owner_telegram_chat_id INTEGER
 );
 CREATE TABLE IF NOT EXISTS account_trojans (
   username TEXT PRIMARY KEY,
@@ -3535,7 +3652,9 @@ CREATE TABLE IF NOT EXISTS account_trojans (
   date_exp TEXT,
   status TEXT DEFAULT 'AKTIF',
   quota INTEGER DEFAULT 0,
-  limitip INTEGER DEFAULT 0
+  limitip INTEGER DEFAULT 0,
+  owner_telegram_id INTEGER,
+  owner_telegram_chat_id INTEGER
 );
 SQL
 
@@ -3567,14 +3686,16 @@ def upsert_ssh(rows):
             continue
         cur.execute(
             """
-            INSERT INTO account_sshs(username,password,date_exp,status,quota,limitip)
-            VALUES(?,?,?,?,?,?)
+            INSERT INTO account_sshs(username,password,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id)
+            VALUES(?,?,?,?,?,?,?,?)
             ON CONFLICT(username) DO UPDATE SET
               password=excluded.password,
               date_exp=excluded.date_exp,
               status=excluded.status,
               quota=excluded.quota,
-              limitip=excluded.limitip
+              limitip=excluded.limitip,
+              owner_telegram_id=excluded.owner_telegram_id,
+              owner_telegram_chat_id=excluded.owner_telegram_chat_id
             """,
             (
                 u,
@@ -3583,6 +3704,8 @@ def upsert_ssh(rows):
                 str((r or {}).get("status", "AKTIF")) or "AKTIF",
                 to_int((r or {}).get("quota", 0)),
                 to_int((r or {}).get("limitip", 0)),
+                to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
+                to_int((r or {}).get("owner_telegram_chat_id", 0), 0) or None,
             ),
         )
 
@@ -3593,14 +3716,16 @@ def upsert_uuid(table, rows):
             continue
         cur.execute(
             f"""
-            INSERT INTO {table}(username,uuid,date_exp,status,quota,limitip)
-            VALUES(?,?,?,?,?,?)
+            INSERT INTO {table}(username,uuid,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id)
+            VALUES(?,?,?,?,?,?,?,?)
             ON CONFLICT(username) DO UPDATE SET
               uuid=excluded.uuid,
               date_exp=excluded.date_exp,
               status=excluded.status,
               quota=excluded.quota,
-              limitip=excluded.limitip
+              limitip=excluded.limitip,
+              owner_telegram_id=excluded.owner_telegram_id,
+              owner_telegram_chat_id=excluded.owner_telegram_chat_id
             """,
             (
                 u,
@@ -3609,6 +3734,8 @@ def upsert_uuid(table, rows):
                 str((r or {}).get("status", "AKTIF")) or "AKTIF",
                 to_int((r or {}).get("quota", 0)),
                 to_int((r or {}).get("limitip", 0)),
+                to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
+                to_int((r or {}).get("owner_telegram_chat_id", 0), 0) or None,
             ),
         )
 
@@ -3619,14 +3746,16 @@ def upsert_trojan(rows):
             continue
         cur.execute(
             """
-            INSERT INTO account_trojans(username,password,date_exp,status,quota,limitip)
-            VALUES(?,?,?,?,?,?)
+            INSERT INTO account_trojans(username,password,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id)
+            VALUES(?,?,?,?,?,?,?,?)
             ON CONFLICT(username) DO UPDATE SET
               password=excluded.password,
               date_exp=excluded.date_exp,
               status=excluded.status,
               quota=excluded.quota,
-              limitip=excluded.limitip
+              limitip=excluded.limitip,
+              owner_telegram_id=excluded.owner_telegram_id,
+              owner_telegram_chat_id=excluded.owner_telegram_chat_id
             """,
             (
                 u,
@@ -3635,6 +3764,8 @@ def upsert_trojan(rows):
                 str((r or {}).get("status", "AKTIF")) or "AKTIF",
                 to_int((r or {}).get("quota", 0)),
                 to_int((r or {}).get("limitip", 0)),
+                to_int((r or {}).get("owner_telegram_id", 0), 0) or None,
+                to_int((r or {}).get("owner_telegram_chat_id", 0), 0) or None,
             ),
         )
 
