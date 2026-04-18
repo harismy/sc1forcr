@@ -3065,11 +3065,12 @@ async function ensureTables() {
 
 async function unlockExpired(nowTs) {
   const rows = await all("SELECT account_type, username, zivpn_removed FROM temp_ip_locks WHERE locked_until <= ?", [nowTs]);
-  if (rows.length === 0) return { zivpnChanged: false, udpcustomChanged: false };
+  if (rows.length === 0) return { zivpnChanged: false, udpcustomChanged: false, xrayChanged: false };
 
   const udpcustomPort = getUdpCustomListenPort();
   let zivpnChanged = false;
   let udpcustomChanged = false;
+  let xrayChanged = false;
   for (const row of rows) {
     const t = String(row.account_type || '');
     const u = String(row.username || '');
@@ -3114,15 +3115,18 @@ async function unlockExpired(nowTs) {
       }
     } else if (t === 'vmess') {
       await run("UPDATE account_vmesses SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
+      xrayChanged = true;
     } else if (t === 'vless') {
       await run("UPDATE account_vlesses SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
+      xrayChanged = true;
     } else if (t === 'trojan') {
       await run("UPDATE account_trojans SET status='AKTIF' WHERE LOWER(username)=LOWER(?)", [u]).catch(() => {});
+      xrayChanged = true;
     }
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
   }
-  return { zivpnChanged, udpcustomChanged };
+  return { zivpnChanged, udpcustomChanged, xrayChanged };
 }
 
 async function lockIfExceeded(nowTs) {
@@ -3136,6 +3140,7 @@ async function lockIfExceeded(nowTs) {
   const udpcustomPort = getUdpCustomListenPort();
   let zivpnChanged = false;
   let udpcustomChanged = false;
+  let xrayChanged = false;
 
   const sshRows = await all("SELECT username, password, limitip FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(limitip,0) AS INTEGER) > 0");
   for (const r of sshRows) {
@@ -3254,9 +3259,10 @@ async function lockIfExceeded(nowTs) {
       }
       await run(`UPDATE ${item.table} SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
       await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES(?, ?, ?, 0)", [item.type, user, nowTs + LOCK_SECONDS]).catch(() => {});
+      xrayChanged = true;
     }
   }
-  return { zivpnChanged, udpcustomChanged };
+  return { zivpnChanged, udpcustomChanged, xrayChanged };
 }
 
 async function rebuildXrayFromDb() {
@@ -3302,6 +3308,9 @@ async function main() {
   const u = await unlockExpired(now);
   const l = await lockIfExceeded(now);
   await cleanupOrphanXrayDropRules().catch(() => {});
+  if (u.xrayChanged || l.xrayChanged) {
+    await rebuildXrayFromDb().catch(() => {});
+  }
   if ((u.zivpnChanged || l.zivpnChanged) && shouldRestartZivpn()) {
     restartService(ZIVPN_SERVICE);
   }
