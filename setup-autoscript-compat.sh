@@ -2787,6 +2787,25 @@ function restartService(service) {
   if (!safeExec('systemctl', ['restart', service])) safeExec('service', [service, 'restart']);
 }
 
+function isTcpPortListening(port) {
+  const p = Number(port);
+  if (!Number.isInteger(p) || p < 1 || p > 65535) return false;
+  const out = readExec('ss', ['-lnt']);
+  if (!out) return false;
+  const re = new RegExp(`(^|\\s)(127\\.0\\.0\\.1|0\\.0\\.0\\.0|::|\\[::\\]|\\[::1\\]):${p}(\\s|$)`);
+  return String(out).split('\n').some((line) => re.test(String(line || '')));
+}
+
+function ensureXrayInboundsHealthy() {
+  const required = [10001, 10002, 10003];
+  const missing = required.filter((port) => !isTcpPortListening(port));
+  if (missing.length === 0) return;
+  if (IPLIMIT_DEBUG) {
+    console.log(`[iplimit-debug][xray] inbound missing ports=${missing.join(',')} -> restart xray`);
+  }
+  restartService('xray');
+}
+
 function shouldRestartZivpn() {
   if (ACTIVE_UDP_BACKEND === 'udpcustom' || ACTIVE_UDP_BACKEND === 'udp-custom' || ACTIVE_UDP_BACKEND === 'udphc') {
     return false;
@@ -3298,6 +3317,7 @@ async function main() {
   if ((u.udpcustomChanged || l.udpcustomChanged) && shouldRestartUdpcustom()) {
     restartService(UDPCUSTOM_SERVICE);
   }
+  ensureXrayInboundsHealthy();
   db.close();
 }
 
