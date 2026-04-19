@@ -6708,13 +6708,6 @@ draw_dashboard() {
   printf "│   Spesifikasi server anda: ${cap_ram_gb} GB RAM / ${cap_cores} vCPU${NC}                    \n"
   printf "│   Auto tuning SC         : ${cap_mode} (tier ${cap_tier})${NC}                               \n"
   printf "│   Estimasi akun          : sekitar ${cap_est} user${NC}                              \n"
-  printf "│ \n"
-  printf "│   ${CYAN}${BOLD}Script menyesuaikan limit scan log agar${NC}\n" 
-  printf "│   ${CYAN}${BOLD}tidak terlalu berat di server.${NC}      \n"
-  printf "│ \n"
-  printf "│   ${CYAN}${BOLD}Auto tunning ini memprediksi estimasi akun${NC}      \n"
-  printf "│   ${CYAN}${BOLD}dengan mengabaikan Bandwidth server.${NC}      \n"
-  printf "│   ${CYAN}${BOLD}Jika BW unlimited maka tidak perlu di pikirkan. ${NC}      \n"
   hr
   printf "│ ${CYAN}${BOLD}■ LOCATION & ISP${NC}${BOLD}${NC}                                    \n"
   printf "│   IP      : ${ip}${NC}                                                \n"
