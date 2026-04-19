@@ -1310,14 +1310,14 @@ async function notifyAccountEvent(action, service, account, owner) {
     const limitip = String(account?.limitip || '0');
     const msg =
       `SC 1FORCR NOTIF\n` +
-      `Aksi: ${String(action || '-').toUpperCase()}\n` +
-      `Layanan: ${String(service || '-').toUpperCase()}\n` +
-      `Domain: ${DOMAIN || '-'}\n` +
-      `Username: ${username}\n` +
-      `Expired: ${exp}\n` +
-      `Limit IP: ${limitip}\n` +
-      `Telegram User ID (Pelaku): ${userId}\n` +
-      `Telegram Chat ID: ${chatId}\n` +
+      `Jenis    : ${String(action || '-').toUpperCase()}\n` +
+      `Layanan  : ${String(service || '-').toUpperCase()}\n` +
+      `Domain   : ${DOMAIN || '-'}\n` +
+      `Username : ${username}\n` +
+      `Expired  : ${exp}\n` +
+      `Limit IP : ${limitip}\n` +
+      `Telegram User ID : ${userId}\n` +
+      `Telegram Chat ID : ${chatId}\n` +
       `Time: ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
     await telegramNotify(msg);
   } catch (_) {}
@@ -4668,7 +4668,17 @@ detect_udphc_service() {
   echo "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}"
 }
 
-ssh_users="$(who 2>/dev/null | awk '{print tolower($1)}' | awk 'NF{c[$1]++} END{for (u in c) printf "%s(%d)\n", u, c[u]}' | sort || true)"
+ssh_users="$(who 2>/dev/null \
+  | awk '{print tolower($1)}' \
+  | awk '
+      NF {
+        u=$1
+        if (u == "root") next
+        if (u !~ /^[a-z0-9._-]+$/) next
+        c[u]++
+      }
+      END { for (u in c) printf "%s(%d)\n", u, c[u] }
+    ' | sort || true)"
 ssh_cnt="$(echo "${ssh_users}" | awk 'NF{n++} END{print n+0}')"
 
 xray_users=""
@@ -4700,9 +4710,19 @@ if [[ -f /var/log/xray/access.log ]]; then
 fi
 
 udphc_service="$(detect_udphc_service)"
-udphc_users="$(journalctl -u "${udphc_service}" -n 8000 --no-pager 2>/dev/null \
-  | awk '
+udphc_now="$(date +%s 2>/dev/null || echo 0)"
+[[ -z "${udphc_now}" || ! "${udphc_now}" =~ ^[0-9]+$ ]] && udphc_now="0"
+udphc_users="$(journalctl -u "${udphc_service}" -n 12000 -o short-unix --no-pager 2>/dev/null \
+  | awk -v now="${udphc_now}" -v win="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" '
     {
+      ts=0
+      if (match($0, /^[0-9]+(\.[0-9]+)?/)) {
+        raw=substr($0, RSTART, RLENGTH)
+        sub(/\..*$/, "", raw)
+        ts=raw+0
+      }
+      if (ts <= 0) ts=now
+
       u=""; src=""
       low=tolower($0)
       if (match($0, /\[user:[^]]+\]/)) {
@@ -4720,13 +4740,16 @@ udphc_users="$(journalctl -u "${udphc_service}" -n 8000 --no-pager 2>/dev/null \
       if (u ~ /^[a-z0-9._-]+$/) {
         if (low ~ /disconnected|logout|closed/) {
           delete ses[key]
+          delete seen[key]
         } else {
           ses[key]=1
+          seen[key]=ts
         }
       }
     }
     END {
       for (k in ses) {
+        if ((now - seen[k]) > win) continue
         split(k, a, "|")
         if (a[1] != "") c[a[1]]++
       }
@@ -4775,24 +4798,22 @@ Waktu    : $(date '+%F %T')
 Interval : ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
 Window   : ${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} detik (XRAY last seen)
 
-RINGKASAN AKUN AKTIF (DB)
+RINGKASAN AKUN AKTIF 
 - SSH/ZIVPN : ${acct_ssh}
 - VMESS     : ${acct_vmess}
 - VLESS     : ${acct_vless}
 - TROJAN    : ${acct_trojan}
 
 ONLINE TERDETEKSI
-- SSH shell : ${ssh_cnt}
+- SSH       : ${ssh_cnt}
   User      : $(short_list "${ssh_users}" 10)
-- XRAY log  : ${xray_cnt}
+  ==============================================
+- XRAY      : ${xray_cnt}
   User      : $(short_list "${xray_users}" 10)
-- UDPHC log : ${udphc_cnt}
+  ==============================================
+- UDPHC     : ${udphc_cnt}
   User      : $(short_list "${udphc_users}" 10)
 
-Catatan:
-- SSH dari sesi shell aktif saat ini.
-- XRAY dihitung dari last seen pada jendela realtime.
-- UDPHC dihitung dari state connect/disconnect pada log."
 
 send_tg "${msg}"
 EOF
