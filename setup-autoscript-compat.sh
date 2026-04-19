@@ -5888,6 +5888,14 @@ monitor_temp_lock_menu() {
 }
 
 detect_udpcustom_service() {
+  if systemctl is-active --quiet sc-1forcr-udpcustom 2>/dev/null; then
+    echo "sc-1forcr-udpcustom"
+    return
+  fi
+  if systemctl is-active --quiet udp-custom 2>/dev/null; then
+    echo "udp-custom"
+    return
+  fi
   if systemctl list-unit-files | grep -q '^sc-1forcr-udpcustom\.service'; then
     echo "sc-1forcr-udpcustom"
     return
@@ -6234,11 +6242,13 @@ show_combined_online() {
   : > "${tmp_udp_pair}"
   : > "${tmp_udp_count}"
   if [[ "${mode}" == "history" ]]; then
-    udp_ttl="3600"
+    udp_ttl="43200"
     journalctl -u "${udpcustom}" -n "${UDPHC_LOG_LINES_HISTORY}" -o short-unix --no-pager 2>/dev/null
   else
-    udp_ttl="180"
-    journalctl -u "${udpcustom}" --since "-8 min" -n "${UDPHC_LOG_LINES_REALTIME}" -o short-unix --no-pager 2>/dev/null
+    # Realtime tetap butuh histori cukup agar sesi UDPHC yang masih aktif
+    # (tanpa spam log periodik) tidak langsung "hilang" dari monitor.
+    udp_ttl="1800"
+    journalctl -u "${udpcustom}" -n "${UDPHC_LOG_LINES_HISTORY}" -o short-unix --no-pager 2>/dev/null
   fi | awk -v ttl="${udp_ttl}" '
     function norm_user(v) {
       gsub(/^[[:space:]]+|[[:space:]]+$/, "", v);
@@ -6257,12 +6267,37 @@ show_combined_online() {
       sub(/:[0-9]+$/, "", v);
       return v;
     }
+    function mark_active(raw_user, raw_src, tsv,   u,s,ip,key) {
+      u=norm_user(raw_user);
+      s=raw_src;
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", s);
+      if (u == "" || s == "") return;
+      ip=ip_only(s);
+      if (ip == "") return;
+      key=s;
+      active[key]=u "|" ip;
+      seen[key]=tsv + 0;
+    }
+    function mark_disconnected(raw_src,   s) {
+      s=raw_src;
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", s);
+      if (s == "") return;
+      if (s in active) delete active[s];
+      if (s in seen) delete seen[s];
+    }
     {
       ts=$1;
       sub(/\..*$/, "", ts);
       if (ts !~ /^[0-9]+$/) ts=now;
       line=$0;
       src=""; u=""; ip=""; key="";
+
+      if (line ~ /Server up and running|Started SC 1FORCR UDP Custom Core/) {
+        delete active;
+        delete seen;
+        next;
+      }
+
       if (line ~ /\[src:[^]]+\][[:space:]]+\[user:[^]]+\][[:space:]]+Client connected/) {
         src=line;
         sub(/^.*\[src:/, "", src);
@@ -6270,21 +6305,36 @@ show_combined_online() {
         u=line;
         sub(/^.*\[user:/, "", u);
         sub(/\].*$/, "", u);
-        u=norm_user(u);
-        ip=ip_only(src);
-        if (src != "" && u != "" && ip != "") {
-          key=u "|" ip;
-          active[src]=key;
-          seen[src]=ts + 0;
-        }
+        mark_active(u, src, ts);
         next;
       }
       if (line ~ /\[src:[^]]+\][[:space:]]+Client disconnected/) {
         src=line;
         sub(/^.*\[src:/, "", src);
         sub(/\].*$/, "", src);
-        if (src in active) delete active[src];
-        if (src in seen) delete seen[src];
+        mark_disconnected(src);
+        next;
+      }
+
+      # Fallback format log lain: user=... src=... atau src=... user=...
+      if (line ~ /user[=: ][^ ,\]]+.*src[=: ][^ ,\]]+/) {
+        u=line;
+        sub(/^.*user[=: ]/, "", u);
+        sub(/[ ,\]].*$/, "", u);
+        src=line;
+        sub(/^.*src[=: ]/, "", src);
+        sub(/[ ,\]].*$/, "", src);
+        mark_active(u, src, ts);
+        next;
+      }
+      if (line ~ /src[=: ][^ ,\]]+.*user[=: ][^ ,\]]+/) {
+        src=line;
+        sub(/^.*src[=: ]/, "", src);
+        sub(/[ ,\]].*$/, "", src);
+        u=line;
+        sub(/^.*user[=: ]/, "", u);
+        sub(/[ ,\]].*$/, "", u);
+        mark_active(u, src, ts);
         next;
       }
     }
