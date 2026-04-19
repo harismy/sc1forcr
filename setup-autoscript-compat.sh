@@ -1652,6 +1652,50 @@ async function renderAndReloadXray() {
   writeXrayConfigAndReload(cfg);
 }
 
+function isExpiredDateValue(v) {
+  const s = String(v || '').trim();
+  if (!s) return false;
+  if (/^\d{4}-\d{2}-\d{2}[ T][0-9]{2}:[0-9]{2}(:[0-9]{2})?$/.test(s)) {
+    const iso = s.includes('T') ? s : s.replace(' ', 'T');
+    const ts = new Date(iso).getTime();
+    if (!Number.isFinite(ts)) return false;
+    return Date.now() >= ts;
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    const today = ymdLocal(new Date());
+    return s <= today;
+  }
+  const ts = new Date(s).getTime();
+  if (!Number.isFinite(ts)) return false;
+  return Date.now() >= ts;
+}
+
+async function cleanupExpiredXrayAccounts() {
+  const targets = [
+    { table: 'account_vmesses', type: 'vmess' },
+    { table: 'account_vlesses', type: 'vless' },
+    { table: 'account_trojans', type: 'trojan' }
+  ];
+  let changed = false;
+  for (const item of targets) {
+    const rows = await all(
+      `SELECT username, date_exp FROM ${item.table} ` +
+      "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
+      "AND TRIM(COALESCE(date_exp,'')) <> ''"
+    ).catch(() => []);
+    for (const row of rows) {
+      const u = String(row?.username || '').trim();
+      const exp = String(row?.date_exp || '').trim();
+      if (!u || !isExpiredDateValue(exp)) continue;
+      await run(`DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?)`, [u]).catch(() => {});
+      changed = true;
+    }
+  }
+  if (changed) {
+    await renderAndReloadXray().catch(() => {});
+  }
+}
+
 app.get('/vps/health', (_req, res) => ok(res, { ok: true, domain: DOMAIN }));
 app.use('/vps', auth);
 
@@ -2088,6 +2132,8 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, '127.0.0.1', () => {
   syncSshBackendsFromDb();
   setInterval(syncSshBackendsFromDb, 2 * 60 * 1000);
+  cleanupExpiredXrayAccounts().catch(() => {});
+  setInterval(() => { cleanupExpiredXrayAccounts().catch(() => {}); }, 60 * 1000);
   console.log(`sc-1forcr-api on 127.0.0.1:${PORT}`);
 });
 EOF
@@ -5915,11 +5961,11 @@ tools_menu() {
     echo "===================================="
     echo "          MENU TOOLS"
     echo "===================================="
-    echo "1) Informasi Key SC"
-    echo "2) Install API Summary 1FORCR"
+    echo "1) Informasi Key Script"
+    echo "2) Install API 1FORCR"
     echo "3) Setting Banner HTML"
     echo "4) Update Script"
-    echo "5) Setting Notif Telegram"
+    echo "5) Setting BOT Telegram"
     echo "6) Setting Checker IP Limit"
     echo "7) Setting Notif Akun Online"
     echo "0) Kembali"
@@ -6636,18 +6682,85 @@ draw_dashboard() {
   local c_ssh c_vmess c_vless c_trojan
   local health
   local cap_ram_gb cap_cores cap_tier cap_est cap_mode
-  local line
 
-  # Color definitions
-  local RED='\033[0;31m'
-  local GREEN='\033[0;32m'
-  local YELLOW='\033[0;33m'
-  local BLUE='\033[0;34m'
-  local CYAN='\033[0;36m'
-  local BOLD='\033[1m'
-  local NC='\033[0m'
-  local CHECK="${YELLOW}CHECK${NC}"
-  local GOOD="${GREEN}GOOD${NC}"
+  # ANSI colors (aman untuk bash di Linux)
+  local ESC=$'\033'
+  local RED="${ESC}[0;31m"
+  local GREEN="${ESC}[0;32m"
+  local YELLOW="${ESC}[0;33m"
+  local BLUE="${ESC}[0;34m"
+  local CYAN="${ESC}[0;36m"
+  local BOLD="${ESC}[1m"
+  local NC="${ESC}[0m"
+
+  local BOX_W=66
+
+  repeat_char() {
+    local char="$1"
+    local count="$2"
+    local out=""
+    while [ "${#out}" -lt "$count" ]; do
+      out="${out}${char}"
+    done
+    printf '%s' "${out:0:$count}"
+  }
+
+  strip_ansi() {
+    sed -r 's/\x1B\[[0-9;]*[mK]//g'
+  }
+
+  visible_len() {
+    local text="$1"
+    printf '%s' "$text" | strip_ansi | awk '{ print length }'
+  }
+
+  pad_right() {
+    local text="$1"
+    local width="$2"
+    local vlen pad
+    vlen="$(visible_len "$text")"
+    pad=$((width - vlen))
+    [ "$pad" -lt 0 ] && pad=0
+    printf '%s%*s' "$text" "$pad" ""
+  }
+
+  print_top() {
+    printf '┌%s┐\n' "$(repeat_char '─' "$((BOX_W + 2))")"
+  }
+
+  print_mid() {
+    printf '├%s┤\n' "$(repeat_char '─' "$((BOX_W + 2))")"
+  }
+
+  print_bottom() {
+    printf '└%s┘\n' "$(repeat_char '─' "$((BOX_W + 2))")"
+  }
+
+  print_line() {
+    local text="$1"
+    local padded
+    padded="$(pad_right "$text" "$BOX_W")"
+    printf '│ %s │\n' "$padded"
+  }
+
+  print_center() {
+    local text="$1"
+    local vlen left right
+    vlen="$(visible_len "$text")"
+    if [ "$vlen" -ge "$BOX_W" ]; then
+      print_line "$text"
+      return
+    fi
+    left=$(( (BOX_W - vlen) / 2 ))
+    right=$(( BOX_W - vlen - left ))
+    printf '│ %*s%s%*s │\n' "$left" "" "$text" "$right" ""
+  }
+
+  kv_line() {
+    local key="$1"
+    local value="$2"
+    print_line "  $(printf '%-13s' "$key") : $value"
+  }
 
   # Data collection
   os_name="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
@@ -6674,8 +6787,9 @@ draw_dashboard() {
   if [[ "${xray_on}" == "ON" && "${ws_on}" == "ON" && "${loadblc_on}" == "ON" ]]; then
     health="GOOD"
   fi
-  local health_display="${CHECK}"
-  [[ "${health}" == "GOOD" ]] && health_display="${GOOD}"
+
+  local health_display="${YELLOW}CHECK${NC}"
+  [[ "${health}" == "GOOD" ]] && health_display="${GREEN}GOOD${NC}"
 
   c_ssh="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_sshs;" 2>/dev/null || echo 0)"
   c_vmess="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vmesses;" 2>/dev/null || echo 0)"
@@ -6684,80 +6798,73 @@ draw_dashboard() {
 
   read_vnstat_stats
   IFS='|' read -r cap_ram_gb cap_cores cap_tier cap_est <<< "$(get_server_capacity_profile)"
+
   if [[ "$(menu_bool_01 "${IPLIMIT_AUTO_TUNE:-1}")" == "1" ]]; then
     cap_mode="AUTO"
   else
     cap_mode="MANUAL"
   fi
 
-  # Helper for separator (without right border)
-  hr() {
-    printf "├─────────────────────────────────────────────────\n"
-  }
-
-  # Dashboard - no closing pipe on the right
-  printf "┌─────────────────────────────────────────────────\n"
-  printf "│${BOLD}             SC 1FORCR NEXUS DASHBOARD            ${NC}\n"
-  printf "├─────────────────────────────────────────────────\n"
-
-  # System & Network
-  printf "│ ${CYAN}${BOLD}■ SYSTEM & NETWORK${NC}${BOLD}${NC}                                  \n"
-  printf "│   OS                     : ${os_name}${NC}                              \n"
-  printf "│   RAM                    : ${ram_mb:-"-"}  │ SWAP : ${swap_mb:-"-"}${NC}                         \n"
-  printf "│   UPTIME                 : ${uptime_h}h ${uptime_m}m${NC}                                           \n"
-  printf "│   Spesifikasi server anda: ${cap_ram_gb} GB RAM / ${cap_cores} vCPU${NC}                    \n"
-  printf "│   Auto tuning SC         : ${cap_mode} (tier ${cap_tier})${NC}                               \n"
-  printf "│   Estimasi akun          : sekitar ${cap_est} user${NC}                              \n"
-
-  hr
-  printf "│ ${CYAN}${BOLD}■ LOCATION & ISP${NC}${BOLD}${NC}                                    \n"
-  printf "│   IP      : ${ip}${NC}                                                \n"
-  printf "│   CITY    : ${city}${NC}                                              \n"
-  printf "│   ISP     : ${isp}${NC}                                              \n"
-  printf "│   DOMAIN  : ${DOMAIN}${NC}                                           \n"
-  hr
-
-  # Traffic Stats
-  printf "│ ${CYAN}${BOLD}■ TRAFFIC STATS${NC}${BOLD}${NC}                                     \n"
-  printf "│   MONTH   : ${VNSTAT_MONTH_TOTAL}     [${VNSTAT_MONTH_NAME}]${NC}                 \n"
-  printf "│   RX      : ${VNSTAT_MONTH_RX}${NC}                                              \n"
-  printf "│   TX      : ${VNSTAT_MONTH_TX}${NC}                                              \n"
-  printf "│   DAY     : ${VNSTAT_DAY_TOTAL}     [${VNSTAT_DAY_NAME}]${NC}                    \n"
-  printf "│   RX      : ${VNSTAT_DAY_RX}${NC}                                               \n"
-  printf "│   TX      : ${VNSTAT_DAY_TX}${NC}                                               \n"
-  printf "│   CURRENT : ${VNSTAT_RATE}${NC}                                              \n"
-  hr
-
-  # Services Status (includes zivpn and udphc)
-  printf "│ ${CYAN}${BOLD}■ SERVICES STATUS${NC}${BOLD}${NC}                                   \n"
-  local xray_color="${GREEN}ON${NC}"; [[ "$xray_on" != "ON" ]] && xray_color="${RED}OFF${NC}"
-  local ws_color="${GREEN}ON${NC}";   [[ "$ws_on" != "ON" ]] && ws_color="${RED}OFF${NC}"
-  local lb_color="${GREEN}ON${NC}";   [[ "$loadblc_on" != "ON" ]] && lb_color="${RED}OFF${NC}"
+  local xray_color="${GREEN}ON${NC}";  [[ "$xray_on" != "ON" ]] && xray_color="${RED}OFF${NC}"
+  local ws_color="${GREEN}ON${NC}";    [[ "$ws_on" != "ON" ]] && ws_color="${RED}OFF${NC}"
+  local lb_color="${GREEN}ON${NC}";    [[ "$loadblc_on" != "ON" ]] && lb_color="${RED}OFF${NC}"
   local zivpn_color="${GREEN}ON${NC}"; [[ "$zivpn_on" != "ON" ]] && zivpn_color="${RED}OFF${NC}"
   local udphc_color="${GREEN}ON${NC}"; [[ "$udphc_on" != "ON" ]] && udphc_color="${RED}OFF${NC}"
   local ssh_color="${GREEN}ON${NC}";   [[ "$ssh_on" != "ON" ]] && ssh_color="${RED}OFF${NC}"
 
-  printf "│   XRAY    : ${xray_color}   │ SSH-WS : ${ws_color}    │ LOADBLC : ${lb_color}   \n"
-  printf "│   ZIVPN   : ${zivpn_color}   │ UDPHC  : ${udphc_color}   │ SSH     : ${ssh_color}   \n"
-  printf "│   HEALTH  : ${health_display}${NC} │ \n"
-  hr
+  clear
+  print_top
+  print_center "${CYAN}${BOLD}SC 1FORCR NEXUS DASHBOARD${NC}"
+  print_mid
 
-  # Account Summary
-  printf "│ ${CYAN}${BOLD}■ ACCOUNT SUMMARY${NC}${BOLD}${NC}                                   \n"
-  printf "│   SSH/OpenVPN : %-4s     │ VMESS : %-4s     \n" "${c_ssh}" "${c_vmess}"
-  printf "│   VLESS       : %-4s     │ TROJAN: %-4s     \n" "${c_vless}" "${c_trojan}"
-  hr
+  print_line "${CYAN}${BOLD}■ SYSTEM & NETWORK${NC}"
+  kv_line "OS"  "${os_name}"
+  kv_line "RAM"  "${ram_mb:-"-"} | SWAP : ${swap_mb:-"-"}"
+  kv_line "UPTIME"  "${uptime_h}h ${uptime_m}m"
+  kv_line "Spesifikasi"  "${cap_ram_gb} GB RAM / ${cap_cores} vCPU"
+  kv_line "Auto tuningSC" "${cap_mode} (tier ${cap_tier})"
+  kv_line "Estimasi akun"  "sekitar ${cap_est} user"
+  print_mid
 
-  # Version & Client
-  printf "│ ${BLUE}${BOLD}■ VERSION & CLIENT${NC}${BOLD}${NC}                                  \n"
-  printf "│   Version     : ${SCRIPT_VERSION:-unknown}${NC}                                 \n"
-  printf "│   Distribusi  : Community / Open Source${NC}                                \n"
-  printf "│   Client Name : ${ip}${NC}                                                \n"
-  printf "│   Expiry In   : Unlimited${NC}                                              \n"
-  printf "└─────────────────────────────────────────────────\n"
-  printf " ─────────────────────────────────────────────────\n"
-  printf "           ${BOLD}to access use 'menu' command${NC}\n"
-  printf " ─────────────────────────────────────────────────\n"
+  print_line "${CYAN}${BOLD}■ LOCATION & ISP${NC}"
+  kv_line "IP" "${ip}"
+  kv_line "CITY" "${city}"
+  kv_line "ISP" "${isp}"
+  kv_line "DOMAIN" "${DOMAIN:-"-"}"
+  print_mid
+
+  print_line "${CYAN}${BOLD}■ TRAFFIC STATS${NC}"
+  kv_line "MONTH" "${VNSTAT_MONTH_TOTAL} [${VNSTAT_MONTH_NAME}]"
+  kv_line "RX" "${VNSTAT_MONTH_RX}"
+  kv_line "TX" "${VNSTAT_MONTH_TX}"
+  kv_line "DAY" "${VNSTAT_DAY_TOTAL} [${VNSTAT_DAY_NAME}]"
+  kv_line "RX" "${VNSTAT_DAY_RX}"
+  kv_line "TX" "${VNSTAT_DAY_TX}"
+  kv_line "CURRENT" "${VNSTAT_RATE}"
+  print_mid
+
+  print_line "${CYAN}${BOLD}■ SERVICES STATUS${NC}"
+  print_line "  XRAY    : ${xray_color}   | SSH-WS : ${ws_color}   | LOADBLC : ${lb_color}"
+  print_line "  ZIVPN   : ${zivpn_color}   | UDPHC  : ${udphc_color}  | SSH     : ${ssh_color}"
+  print_line "  HEALTH  : ${health_display}"
+  print_mid
+
+  print_line "${CYAN}${BOLD}■ ACCOUNT SUMMARY${NC}"
+  print_line "  SSH/OpenVPN : ${c_ssh}  | VMESS  : ${c_vmess}"
+  print_line "  VLESS       : ${c_vless}   | TROJAN : ${c_trojan}"
+  print_mid
+
+  print_line "${BLUE}${BOLD}■ VERSION & CLIENT${NC}"
+  kv_line "Version" "${SCRIPT_VERSION:-unknown}"
+  kv_line "Distribusi" "Community / Open Source"
+  kv_line "Client Name" "${ip}"
+  kv_line "Expiry In" "Unlimited"
+  print_bottom
+
+  printf '\n'
+  printf ' %s\n' "$(repeat_char '─' 30)"
+  printf " ${BOLD}to access use 'menu' command${NC}\n"
+  printf ' %s\n' "$(repeat_char '─' 30)"
 }
 show_combined_online() {
   local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h
