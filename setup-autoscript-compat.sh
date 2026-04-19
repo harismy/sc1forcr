@@ -5493,6 +5493,16 @@ restart_active_udp_backend() {
   echo "Tidak ada backend UDP yang aktif."
 }
 
+restart_all_services() {
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl restart ssh dropbear nginx haproxy xray sc-1forcr-api sc-1forcr-sshws >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-iplimit.timer >/dev/null 2>&1 || true
+  systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  restart_active_udp_backend
+}
+
 udp_port_from_config() {
   local cfg="$1" fallback="$2" port
   port="${fallback}"
@@ -5612,8 +5622,7 @@ service_menu() {
       show_core_services_onoff
       ;;
     2)
-      systemctl restart ssh dropbear nginx haproxy xray sc-1forcr-api sc-1forcr-sshws
-      restart_active_udp_backend
+      restart_all_services
       echo "Restart selesai."
       ;;
     3)
@@ -7216,6 +7225,8 @@ Time: $(date '+%F %T')"
     switch_udp_to_zivpn || true
   fi
   systemctl restart sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
+  restart_all_services
+  echo "Semua service selesai direstart otomatis setelah update."
 
   ts_now="$(date '+%F %T')"
   new_ver="-"
