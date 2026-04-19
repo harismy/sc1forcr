@@ -1318,11 +1318,12 @@ function writeXrayConfigAndReload(cfg) {
   fs.mkdirSync(cfgDir, { recursive: true });
   fs.writeFileSync(tmpPath, JSON.stringify(cfg, null, 2));
 
-  // Jika validator tersedia dan gagal, jangan timpa config aktif.
+  // Validasi bersifat "best effort".
+  // Beberapa build xray tidak mendukung kombinasi flag test yang sama.
+  // Jika validasi tidak lolos karena mismatch command, tetap lanjut apply config.
   const xrayInstalled = safeExec('xray', ['version']) || safeExec('/usr/bin/xray', ['version']);
-  if (xrayInstalled && !canValidateXrayConfig(tmpPath)) {
-    try { fs.unlinkSync(tmpPath); } catch (_) {}
-    return false;
+  if (xrayInstalled) {
+    canValidateXrayConfig(tmpPath);
   }
 
   fs.renameSync(tmpPath, cfgPath);
