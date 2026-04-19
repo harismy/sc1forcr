@@ -1293,6 +1293,41 @@ function dateExpPlusMinutes(minutes) {
 function nowTime() {
   return new Date().toTimeString().slice(0, 8);
 }
+function reloadXrayServiceSafe() {
+  if (safeExec('systemctl', ['reload', 'xray'])) return true;
+  if (safeExec('systemctl', ['restart', 'xray'])) return true;
+  safeExec('systemctl', ['kill', '-s', 'HUP', 'xray']);
+  return safeExec('systemctl', ['start', 'xray']);
+}
+function canValidateXrayConfig(tmpPath) {
+  const testCmds = [
+    ['xray', ['run', '-test', '-config', tmpPath]],
+    ['xray', ['-test', '-config', tmpPath]],
+    ['/usr/bin/xray', ['run', '-test', '-config', tmpPath]],
+    ['/usr/bin/xray', ['-test', '-config', tmpPath]]
+  ];
+  for (const [cmd, args] of testCmds) {
+    if (safeExec(cmd, args)) return true;
+  }
+  return false;
+}
+function writeXrayConfigAndReload(cfg) {
+  const cfgDir = '/usr/local/etc/xray';
+  const cfgPath = `${cfgDir}/config.json`;
+  const tmpPath = `${cfgPath}.tmp`;
+  fs.mkdirSync(cfgDir, { recursive: true });
+  fs.writeFileSync(tmpPath, JSON.stringify(cfg, null, 2));
+
+  // Jika validator tersedia dan gagal, jangan timpa config aktif.
+  const xrayInstalled = safeExec('xray', ['version']) || safeExec('/usr/bin/xray', ['version']);
+  if (xrayInstalled && !canValidateXrayConfig(tmpPath)) {
+    try { fs.unlinkSync(tmpPath); } catch (_) {}
+    return false;
+  }
+
+  fs.renameSync(tmpPath, cfgPath);
+  return reloadXrayServiceSafe();
+}
 function run(sql, params = []) {
   return new Promise((resolve, reject) => {
     db.run(sql, params, function onRun(err) {
@@ -1550,13 +1585,7 @@ async function renderAndReloadXray() {
     ],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }]
   };
-  fs.mkdirSync('/usr/local/etc/xray', { recursive: true });
-  fs.writeFileSync('/usr/local/etc/xray/config.json', JSON.stringify(cfg, null, 2));
-  // Hindari restart agar koneksi user existing tidak terputus.
-  // Prioritas: systemctl reload, fallback kirim HUP ke service.
-  if (!safeExec('systemctl', ['reload', 'xray'])) {
-    safeExec('systemctl', ['kill', '-s', 'HUP', 'xray']);
-  }
+  writeXrayConfigAndReload(cfg);
 }
 
 app.get('/vps/health', (_req, res) => ok(res, { ok: true, domain: DOMAIN }));
@@ -3681,11 +3710,7 @@ async function rebuildXrayFromDb() {
     ],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }]
   };
-  fs.mkdirSync('/usr/local/etc/xray', { recursive: true });
-  fs.writeFileSync('/usr/local/etc/xray/config.json', JSON.stringify(cfg, null, 2));
-  if (!safeExec('systemctl', ['reload', 'xray'])) {
-    safeExec('systemctl', ['kill', '-s', 'HUP', 'xray']);
-  }
+  writeXrayConfigAndReload(cfg);
 }
 
 async function main() {
