@@ -1416,7 +1416,12 @@ async function syncSshBackendsFromDb() {
   if (sshBackendSyncBusy) return;
   sshBackendSyncBusy = true;
   try {
-    const rows = await all("SELECT username, password FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' ORDER BY LOWER(username)");
+    const rows = await all(
+      "SELECT username, password FROM account_sshs " +
+      "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
+      "AND (TRIM(COALESCE(date_exp,''))='' OR date(date_exp) >= date('now','localtime')) " +
+      "ORDER BY LOWER(username)"
+    );
     const zivpnUsers = [];
     const udphcSecrets = [];
     const zivpnSeen = new Set();
@@ -1658,25 +1663,61 @@ async function renewSsh(req, res) {
   try {
     const username = String(req.params.username || '').trim();
     const exp = Number(req.params.exp || 30);
-    const row = await get("SELECT password,limitip,quota,date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]);
-    const pass = String(row?.password || username);
-    const currentQuota = Number(row?.quota || 0);
+    const row = await get("SELECT password,limitip,quota,date_exp FROM account_sshs WHERE LOWER(username)=LOWER(?)", [username]).catch(() => null);
+    const owner = getOwnerInfo(req, req.body || {});
+    const bodyPass = String(req.body?.password || '').trim();
     const bodyQuota = Number(req.body?.kuota);
-    const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : currentQuota;
-    const fromExp = String(row?.date_exp || '-');
+    const bodyLimitIp = Number(req.body?.limitip);
     const today = ymdPlusDays(0);
+    const fromExp = String(row?.date_exp || '-');
     const baseExp = String(row?.date_exp || '');
     const renewBase = (/^\d{4}-\d{2}-\d{2}$/.test(baseExp) && baseExp > today) ? baseExp : today;
     const expDate = ymdPlusDays(exp, renewBase);
+    if (!row) {
+      const pass = bodyPass || username;
+      const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : 0;
+      const nextLimitIp = Number.isFinite(bodyLimitIp) ? bodyLimitIp : 0;
+      ensureLinuxUser(username, pass, expDate);
+      await run(
+        "INSERT INTO account_sshs(username,password,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id) VALUES(?,?,?,?,?,?,?,?)",
+        [username, pass, expDate, 'AKTIF', nextQuota, nextLimitIp, owner.ownerTelegramId, owner.ownerTelegramChatId]
+      );
+      syncZivpnUser(username, true);
+      syncUdpcustomUser(pass, true);
+      return ok(res, {
+        username,
+        from: '-',
+        to: expDate,
+        exp: expDate,
+        quota: String(nextQuota),
+        limitip: String(nextLimitIp),
+        created: true,
+        time: nowTime()
+      });
+    }
+
+    const oldPass = String(row?.password || '').trim();
+    const pass = bodyPass || oldPass || username;
+    const currentQuota = Number(row?.quota || 0);
+    const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : currentQuota;
+    const currentLimitIp = Number(row?.limitip || 0);
+    const nextLimitIp = Number.isFinite(bodyLimitIp) ? bodyLimitIp : currentLimitIp;
     ensureLinuxUser(username, pass, expDate);
-    await run("UPDATE account_sshs SET date_exp=?, quota=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)", [expDate, nextQuota, username]);
+    await run(
+      "UPDATE account_sshs SET password=?, date_exp=?, quota=?, limitip=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)",
+      [pass, expDate, nextQuota, nextLimitIp, username]
+    );
+    syncZivpnUser(username, true);
+    if (oldPass && oldPass !== pass) syncUdpcustomUser(oldPass, false);
+    syncUdpcustomUser(pass, true);
     return ok(res, {
       username,
       from: fromExp,
       to: expDate,
       exp: expDate,
       quota: String(nextQuota),
-      limitip: String(row?.limitip || 0),
+      limitip: String(nextLimitIp),
+      created: false,
       time: nowTime()
     });
   } catch (e) {
@@ -1819,24 +1860,65 @@ app.post('/vps/trialtrojanall', async (req, res) => {
   }
 });
 
-async function renewXray(table, username, exp, body) {
-  const row = await get(`SELECT date_exp,quota,limitip FROM ${table} WHERE LOWER(username)=LOWER(?)`, [username]);
-  const currentQuota = Number(row?.quota || 0);
+async function renewXray(table, username, exp, req) {
+  const body = req?.body || {};
+  const owner = getOwnerInfo(req, body);
+  const secretByTable = {
+    account_vmesses: 'uuid',
+    account_vlesses: 'uuid',
+    account_trojans: 'password'
+  };
+  const secretCol = String(secretByTable[table] || '').trim();
+  if (!secretCol) throw new Error('invalid table');
+
+  const row = await get(`SELECT ${secretCol} AS secret, date_exp, quota, limitip FROM ${table} WHERE LOWER(username)=LOWER(?)`, [username]).catch(() => null);
   const bodyQuota = Number(body?.kuota);
-  const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : currentQuota;
+  const bodyLimitIp = Number(body?.limitip);
   const today = ymdPlusDays(0);
+  const fromExp = String(row?.date_exp || '-');
   const baseExp = String(row?.date_exp || '');
   const renewBase = (/^\d{4}-\d{2}-\d{2}$/.test(baseExp) && baseExp > today) ? baseExp : today;
   const expDate = ymdPlusDays(exp, renewBase);
-  await run(`UPDATE ${table} SET date_exp=?, quota=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)`, [expDate, nextQuota, username]);
+
+  if (!row) {
+    const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : 0;
+    const nextLimitIp = Number.isFinite(bodyLimitIp) ? bodyLimitIp : 0;
+    const secret = (table === 'account_trojans') ? crypto.randomUUID() : crypto.randomUUID();
+    await run(
+      `INSERT INTO ${table}(username,${secretCol},date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id) VALUES(?,?,?,?,?,?,?,?)`,
+      [username, secret, expDate, 'AKTIF', nextQuota, nextLimitIp, owner.ownerTelegramId, owner.ownerTelegramChatId]
+    );
+    await renderAndReloadXray();
+    return {
+      username,
+      from: '-',
+      to: expDate,
+      exp: expDate,
+      quota: String(nextQuota),
+      limitip: String(nextLimitIp),
+      created: true,
+      time: nowTime()
+    };
+  }
+
+  const currentQuota = Number(row?.quota || 0);
+  const nextQuota = Number.isFinite(bodyQuota) ? bodyQuota : currentQuota;
+  const currentLimitIp = Number(row?.limitip || 0);
+  const nextLimitIp = Number.isFinite(bodyLimitIp) ? bodyLimitIp : currentLimitIp;
+  const secret = String(row?.secret || '').trim() || crypto.randomUUID();
+  await run(
+    `UPDATE ${table} SET ${secretCol}=?, date_exp=?, quota=?, limitip=?, status='AKTIF' WHERE LOWER(username)=LOWER(?)`,
+    [secret, expDate, nextQuota, nextLimitIp, username]
+  );
   await renderAndReloadXray();
   return {
     username,
-    from: String(row?.date_exp || '-'),
+    from: fromExp,
     to: expDate,
     exp: expDate,
     quota: String(nextQuota),
-    limitip: String(row?.limitip || 0),
+    limitip: String(nextLimitIp),
+    created: false,
     time: nowTime()
   };
 }
@@ -1853,7 +1935,7 @@ async function setStatusXray(table, username, status) {
 
 const renewXrayHandler = (table) => async (req, res) => {
   try {
-    return ok(res, await renewXray(table, String(req.params.username || '').trim(), Number(req.params.exp || 30), req.body));
+    return ok(res, await renewXray(table, String(req.params.username || '').trim(), Number(req.params.exp || 30), req));
   } catch (e) {
     return fail(res, 500, e.message);
   }
@@ -3197,6 +3279,22 @@ function extractClientPortsFromSessionKeys(keys) {
   return out;
 }
 
+function ymdLocalNow() {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function isExpiredDate(dateExp, todayYmd = '') {
+  const v = String(dateExp || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const today = String(todayYmd || ymdLocalNow()).trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(today)) return false;
+  return v < today;
+}
+
 async function ensureTables() {
   await run(`CREATE TABLE IF NOT EXISTS temp_ip_locks (
     account_type TEXT NOT NULL,
@@ -3212,6 +3310,68 @@ async function ensureTables() {
     ip TEXT NOT NULL,
     PRIMARY KEY (account_type, username, ip)
   )`);
+}
+
+async function enforceExpiredAccounts() {
+  const today = ymdLocalNow();
+  let zivpnChanged = false;
+  let udpcustomChanged = false;
+  let xrayChanged = false;
+
+  const sshRows = await all(
+    "SELECT username, password, date_exp FROM account_sshs " +
+    "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
+    "AND TRIM(COALESCE(date_exp,'')) <> '' " +
+    "AND date(date_exp) < date('now','localtime')"
+  ).catch(() => []);
+  for (const row of sshRows) {
+    const user = String(row?.username || '').trim();
+    const pass = String(row?.password || '').trim();
+    const exp = String(row?.date_exp || '').trim();
+    if (!user || !isExpiredDate(exp, today)) continue;
+
+    if (!safeExec('userdel', ['-r', user])) {
+      safeExec('passwd', ['-l', user]);
+      safeExec('usermod', ['-s', '/usr/sbin/nologin', user]);
+    }
+
+    if (removeZivpnUser(user)) zivpnChanged = true;
+    let udphcSecretChanged = false;
+    if (pass) {
+      if (removeUdpcustomUser(pass)) udphcSecretChanged = true;
+    }
+    if (removeUdpcustomUser(user)) udphcSecretChanged = true;
+    if (udphcSecretChanged) udpcustomChanged = true;
+
+    await run("DELETE FROM account_sshs WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
+    await run("DELETE FROM temp_ip_lock_ips WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
+    await run("DELETE FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]).catch(() => {});
+  }
+
+  const xrayTargets = [
+    { type: 'vmess', table: 'account_vmesses' },
+    { type: 'vless', table: 'account_vlesses' },
+    { type: 'trojan', table: 'account_trojans' }
+  ];
+  for (const item of xrayTargets) {
+    const rows = await all(
+      `SELECT username, date_exp FROM ${item.table} ` +
+      "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
+      "AND TRIM(COALESCE(date_exp,'')) <> '' " +
+      "AND date(date_exp) < date('now','localtime')"
+    ).catch(() => []);
+    for (const row of rows) {
+      const user = String(row?.username || '').trim();
+      const exp = String(row?.date_exp || '').trim();
+      if (!user || !isExpiredDate(exp, today)) continue;
+      await run(`DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
+      await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
+      await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
+      xrayChanged = true;
+    }
+  }
+
+  return { zivpnChanged, udpcustomChanged, xrayChanged };
 }
 
 async function unlockExpired(nowTs) {
@@ -3464,16 +3624,17 @@ async function rebuildXrayFromDb() {
 async function main() {
   const now = Math.floor(Date.now() / 1000);
   await ensureTables();
+  const e = await enforceExpiredAccounts();
   const u = await unlockExpired(now);
   const l = await lockIfExceeded(now);
   await cleanupOrphanXrayDropRules().catch(() => {});
-  if (u.xrayChanged || l.xrayChanged) {
+  if (e.xrayChanged || u.xrayChanged || l.xrayChanged) {
     await rebuildXrayFromDb().catch(() => {});
   }
-  if ((u.zivpnChanged || l.zivpnChanged) && shouldRestartZivpn()) {
+  if ((e.zivpnChanged || u.zivpnChanged || l.zivpnChanged) && shouldRestartZivpn()) {
     restartService(ZIVPN_SERVICE);
   }
-  if ((u.udpcustomChanged || l.udpcustomChanged) && shouldRestartUdpcustom()) {
+  if ((e.udpcustomChanged || u.udpcustomChanged || l.udpcustomChanged) && shouldRestartUdpcustom()) {
     restartService(UDPCUSTOM_SERVICE);
   }
   ensureXrayInboundsHealthy();
