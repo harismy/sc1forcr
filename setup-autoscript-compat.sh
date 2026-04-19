@@ -1419,7 +1419,7 @@ async function syncSshBackendsFromDb() {
     const rows = await all(
       "SELECT username, password FROM account_sshs " +
       "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
-      "AND (TRIM(COALESCE(date_exp,''))='' OR date(date_exp) >= date('now','localtime')) " +
+      "AND (TRIM(COALESCE(date_exp,''))='' OR date(date_exp) > date('now','localtime')) " +
       "ORDER BY LOWER(username)"
     );
     const zivpnUsers = [];
@@ -3292,7 +3292,7 @@ function isExpiredDate(dateExp, todayYmd = '') {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
   const today = String(todayYmd || ymdLocalNow()).trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(today)) return false;
-  return v < today;
+  return v <= today;
 }
 
 async function ensureTables() {
@@ -3322,7 +3322,7 @@ async function enforceExpiredAccounts() {
     "SELECT username, password, date_exp FROM account_sshs " +
     "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
     "AND TRIM(COALESCE(date_exp,'')) <> '' " +
-    "AND date(date_exp) < date('now','localtime')"
+    "AND date(date_exp) <= date('now','localtime')"
   ).catch(() => []);
   for (const row of sshRows) {
     const user = String(row?.username || '').trim();
@@ -3358,7 +3358,7 @@ async function enforceExpiredAccounts() {
       `SELECT username, date_exp FROM ${item.table} ` +
       "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
       "AND TRIM(COALESCE(date_exp,'')) <> '' " +
-      "AND date(date_exp) < date('now','localtime')"
+      "AND date(date_exp) <= date('now','localtime')"
     ).catch(() => []);
     for (const row of rows) {
       const user = String(row?.username || '').trim();
