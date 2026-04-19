@@ -1303,22 +1303,54 @@ function telegramNotify(text) {
 async function notifyAccountEvent(action, service, account, owner) {
   try {
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
-    const userId = Number(owner?.ownerTelegramId || 0) > 0 ? String(owner.ownerTelegramId) : '-';
-    const chatId = Number(owner?.ownerTelegramChatId || 0) > 0 ? String(owner.ownerTelegramChatId) : '-';
+    const userIdNum = Number(owner?.ownerTelegramId || 0);
+    const chatIdNum = Number(owner?.ownerTelegramChatId || 0);
+    const userId = Number.isInteger(userIdNum) && userIdNum !== 0 ? String(userIdNum) : '-';
+    const chatId = Number.isInteger(chatIdNum) && chatIdNum !== 0 ? String(chatIdNum) : '-';
     const username = String(account?.username || '-');
     const exp = String(account?.exp || account?.expired || account?.to || '-');
     const limitip = String(account?.limitip || '0');
+    const kind = /^trial/i.test(username) || String(action || '').toLowerCase() === 'trial' ? 'TRIAL' : 'REGULER';
     const msg =
       `SC 1FORCR NOTIF\n` +
-      `Jenis    : ${String(action || '-').toUpperCase()}\n` +
+      `Event    : ${String(action || '-').toUpperCase()}\n` +
       `Layanan  : ${String(service || '-').toUpperCase()}\n` +
       `Domain   : ${DOMAIN || '-'}\n` +
       `Username : ${username}\n` +
+      `Kategori : ${kind}\n` +
       `Expired  : ${exp}\n` +
       `Limit IP : ${limitip}\n` +
-      `Telegram User ID : ${userId}\n` +
-      `Telegram Chat ID : ${chatId}\n` +
-      `Time: ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+      `TG User  : ${userId}\n` +
+      `TG Chat  : ${chatId}\n` +
+      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+    await telegramNotify(msg);
+  } catch (_) {}
+}
+async function notifyExpiredAccountEvent(service, account = {}, owner = {}) {
+  try {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+    const userId = Number(owner?.ownerTelegramId || owner?.owner_telegram_id || 0) !== 0
+      ? String(owner.ownerTelegramId ?? owner.owner_telegram_id)
+      : '-';
+    const chatId = Number(owner?.ownerTelegramChatId || owner?.owner_telegram_chat_id || 0) !== 0
+      ? String(owner.ownerTelegramChatId ?? owner.owner_telegram_chat_id)
+      : '-';
+    const username = String(account?.username || '-');
+    const exp = String(account?.exp || account?.expired || account?.date_exp || '-');
+    const limitip = String(account?.limitip || '0');
+    const kind = /^trial/i.test(username) ? 'TRIAL' : 'REGULER';
+    const msg =
+      `SC 1FORCR NOTIF\n` +
+      `Event    : EXPIRED\n` +
+      `Layanan  : ${String(service || '-').toUpperCase()}\n` +
+      `Domain   : ${DOMAIN || '-'}\n` +
+      `Username : ${username}\n` +
+      `Kategori : ${kind}\n` +
+      `Expired  : ${exp}\n` +
+      `Limit IP : ${limitip}\n` +
+      `TG User  : ${userId}\n` +
+      `TG Chat  : ${chatId}\n` +
+      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
     await telegramNotify(msg);
   } catch (_) {}
 }
@@ -1679,7 +1711,7 @@ async function cleanupExpiredXrayAccounts() {
   let changed = false;
   for (const item of targets) {
     const rows = await all(
-      `SELECT username, date_exp FROM ${item.table} ` +
+      `SELECT username, date_exp, limitip, owner_telegram_id, owner_telegram_chat_id FROM ${item.table} ` +
       "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
       "AND TRIM(COALESCE(date_exp,'')) <> ''"
     ).catch(() => []);
@@ -1687,6 +1719,14 @@ async function cleanupExpiredXrayAccounts() {
       const u = String(row?.username || '').trim();
       const exp = String(row?.date_exp || '').trim();
       if (!u || !isExpiredDateValue(exp)) continue;
+      await notifyExpiredAccountEvent(item.type, {
+        username: u,
+        date_exp: exp,
+        limitip: String(row?.limitip ?? '0')
+      }, {
+        owner_telegram_id: row?.owner_telegram_id,
+        owner_telegram_chat_id: row?.owner_telegram_chat_id
+      });
       await run(`DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?)`, [u]).catch(() => {});
       changed = true;
     }
@@ -2629,16 +2669,37 @@ async function notifyMultiLoginLock(service, username, limitip, detected, ips = 
     if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
     const list = Array.isArray(ips) ? ips.filter(Boolean).slice(0, 8) : [];
     const msg =
-      `SC 1FORCR MULTI_LOGIN\n` +
-      `Aksi: LOCK_TMP\n` +
-      `Layanan: ${String(service || '-').toUpperCase()}\n` +
-      `Username: ${String(username || '-')}\n` +
-      `Limit IP: ${Number(limitip || 0)}\n` +
-      `Terdeteksi: ${Number(detected || 0)}\n` +
-      `IP: ${list.length > 0 ? list.join(', ') : '-'}\n` +
-      `Owner Telegram User ID: ${ownerId || '-'}\n` +
-      `Owner Telegram Chat ID: ${ownerChatId || '-'}\n` +
-      `Time: ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+      `SC 1FORCR NOTIF\n` +
+      `Event    : MULTI_LOGIN\n` +
+      `Action   : LOCK_TMP\n` +
+      `Layanan  : ${String(service || '-').toUpperCase()}\n` +
+      `Username : ${String(username || '-')}\n` +
+      `Limit IP : ${Number(limitip || 0)}\n` +
+      `Detected : ${Number(detected || 0)}\n` +
+      `IP List  : ${list.length > 0 ? list.join(', ') : '-'}\n` +
+      `TG User  : ${ownerId || '-'}\n` +
+      `TG Chat  : ${ownerChatId || '-'}\n` +
+      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+    await telegramNotify(msg);
+  } catch (_) {}
+}
+
+async function notifyExpiredAccount(service, username, exp, limitip = 0, ownerId = null, ownerChatId = null) {
+  try {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+    const user = String(username || '-').trim() || '-';
+    const kind = /^trial/i.test(user) ? 'TRIAL' : 'REGULER';
+    const msg =
+      `SC 1FORCR NOTIF\n` +
+      `Event    : EXPIRED\n` +
+      `Layanan  : ${String(service || '-').toUpperCase()}\n` +
+      `Username : ${user}\n` +
+      `Kategori : ${kind}\n` +
+      `Expired  : ${String(exp || '-')}\n` +
+      `Limit IP : ${Number(limitip || 0)}\n` +
+      `TG User  : ${ownerId || '-'}\n` +
+      `TG Chat  : ${ownerChatId || '-'}\n` +
+      `Time     : ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
     await telegramNotify(msg);
   } catch (_) {}
 }
@@ -3559,7 +3620,7 @@ async function enforceExpiredAccounts() {
   let xrayChanged = false;
 
   const sshRows = await all(
-    "SELECT username, password, date_exp FROM account_sshs " +
+    "SELECT username, password, date_exp, limitip, owner_telegram_id, owner_telegram_chat_id FROM account_sshs " +
     "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
     "AND TRIM(COALESCE(date_exp,'')) <> '' " +
     "AND date(date_exp) <= date('now','localtime')"
@@ -3569,6 +3630,14 @@ async function enforceExpiredAccounts() {
     const pass = String(row?.password || '').trim();
     const exp = String(row?.date_exp || '').trim();
     if (!user || !isExpiredDate(exp, today)) continue;
+    await notifyExpiredAccount(
+      'ssh/zivpn/udphc',
+      user,
+      exp,
+      Number(row?.limitip || 0),
+      Number(row?.owner_telegram_id || 0) || null,
+      Number(row?.owner_telegram_chat_id || 0) || null
+    );
 
     if (!safeExec('userdel', ['-r', user])) {
       safeExec('passwd', ['-l', user]);
@@ -3595,7 +3664,7 @@ async function enforceExpiredAccounts() {
   ];
   for (const item of xrayTargets) {
     const rows = await all(
-      `SELECT username, date_exp FROM ${item.table} ` +
+      `SELECT username, date_exp, limitip, owner_telegram_id, owner_telegram_chat_id FROM ${item.table} ` +
       "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
       "AND TRIM(COALESCE(date_exp,'')) <> '' " +
       "AND date(date_exp) <= date('now','localtime')"
@@ -3604,6 +3673,14 @@ async function enforceExpiredAccounts() {
       const user = String(row?.username || '').trim();
       const exp = String(row?.date_exp || '').trim();
       if (!user || !isExpiredDate(exp, today)) continue;
+      await notifyExpiredAccount(
+        item.type,
+        user,
+        exp,
+        Number(row?.limitip || 0),
+        Number(row?.owner_telegram_id || 0) || null,
+        Number(row?.owner_telegram_chat_id || 0) || null
+      );
       await run(`DELETE FROM ${item.table} WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
       await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
       await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [item.type, user]).catch(() => {});
@@ -4357,13 +4434,14 @@ if [[ -n "${TELEGRAM_BOT_TOKEN}" && -n "${TELEGRAM_CHAT_ID}" ]]; then
   zivpn_count="$(jq -r '.data.zivpn_auth | length' "${backup_json}" 2>/dev/null || echo 0)"
   banner_html_on="$(jq -r 'if (.data.banner_html // "") != "" then "yes" else "no" end' "${backup_json}" 2>/dev/null || echo no)"
   banner_txt_on="$(jq -r 'if (.data.banner_txt // "") != "" then "yes" else "no" end' "${backup_json}" 2>/dev/null || echo no)"
-  caption="SC 1FORCR auto backup
-Domain: ${DOMAIN}
-Host: ${host}
-WIB: $(TZ=Asia/Jakarta date '+%F %T')
-File: $(basename "${backup_json}")
-SSH:${ssh_count} VMESS:${vmess_count} VLESS:${vless_count} TROJAN:${trojan_count} ZIVPN:${zivpn_count}
-BannerHTML:${banner_html_on} BannerTXT:${banner_txt_on}"
+  caption="SC 1FORCR NOTIF
+Event    : AUTO_BACKUP
+Domain   : ${DOMAIN}
+Host     : ${host}
+WIB      : $(TZ=Asia/Jakarta date '+%F %T')
+File     : $(basename "${backup_json}")
+Akun     : SSH=${ssh_count} VMESS=${vmess_count} VLESS=${vless_count} TROJAN=${trojan_count} ZIVPN=${zivpn_count}
+Banner   : HTML=${banner_html_on} TXT=${banner_txt_on}"
   curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
     -F "chat_id=${TELEGRAM_CHAT_ID}" \
     -F "disable_content_type_detection=true" \
@@ -4838,7 +4916,8 @@ short_list() {
   fi
 }
 
-msg="SC 1FORCR | LAPORAN ONLINE
+msg="SC 1FORCR NOTIF
+Event    : ONLINE_REPORT
 Domain   : ${DOMAIN}
 Waktu    : $(date '+%F %T')
 Interval : ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
@@ -5013,11 +5092,11 @@ telegram_notify() {
 telegram_notify_action() {
   local action="$1" type="$2" username="$3"
   telegram_notify "SC 1FORCR
-Action: ${action}
-Type: ${type}
-Username: ${username}
-Domain: ${DOMAIN}
-Time: $(date '+%F %T')"
+Event    : ${action}
+Layanan  : ${type}
+Domain   : ${DOMAIN}
+Username : ${username}
+Time     : $(date '+%F %T')"
 }
 
 cancelled() {
@@ -7879,19 +7958,23 @@ update_script_from_repo() {
   fi
   if [[ "${downloaded_ok}" != "1" ]]; then
     echo "Gagal download update script."
-    telegram_notify "Update SC 1FORCR GAGAL
-Domain: ${DOMAIN}
-Alasan: gagal download script update
-Time: $(date '+%F %T')"
+    telegram_notify "SC 1FORCR NOTIF
+Event    : UPDATE_SCRIPT
+Status   : GAGAL
+Domain   : ${DOMAIN}
+Alasan   : gagal download script update
+Time     : $(date '+%F %T')"
     return
   fi
   chmod +x "${tmp}"
   if ! bash -n "${tmp}"; then
     echo "Update script gagal validasi syntax (bash -n)."
-    telegram_notify "Update SC 1FORCR GAGAL
-Domain: ${DOMAIN}
-Alasan: validasi syntax script gagal
-Time: $(date '+%F %T')"
+    telegram_notify "SC 1FORCR NOTIF
+Event    : UPDATE_SCRIPT
+Status   : GAGAL
+Domain   : ${DOMAIN}
+Alasan   : validasi syntax script gagal
+Time     : $(date '+%F %T')"
     return
   fi
 
@@ -7954,10 +8037,12 @@ Time: $(date '+%F %T')"
     ACTIVE_UDP_BACKEND="${active_backend}" \
     bash "${tmp}"; then
     echo "Update script gagal dijalankan."
-    telegram_notify "Update SC 1FORCR GAGAL
-Domain: ${DOMAIN}
-Alasan: installer update exit non-zero
-Time: $(date '+%F %T')"
+    telegram_notify "SC 1FORCR NOTIF
+Event    : UPDATE_SCRIPT
+Status   : GAGAL
+Domain   : ${DOMAIN}
+Alasan   : installer update exit non-zero
+Time     : $(date '+%F %T')"
     rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
     return
   fi
@@ -7999,13 +8084,15 @@ Time: $(date '+%F %T')"
     new_ver="$(awk -F= '/^SCRIPT_VERSION=/{print $2}' /etc/sc-1forcr-version | head -n1)"
     [[ -z "${new_ver}" ]] && new_ver="-"
   fi
-  update_note="Update SC 1FORCR BERHASIL
-Domain: ${DOMAIN}
-Version: ${new_ver}
-Time: ${ts_now}
-Checker IP Limit: ${IPLIMIT_CHECK_INTERVAL_MINUTES}m/${IPLIMIT_LOCK_MINUTES}m
-Auto Backup: ${AUTO_BACKUP_ENABLE}
-Online Notify: ${ONLINE_NOTIFY_ENABLE}/${ONLINE_NOTIFY_INTERVAL_HOURS}h window=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}s"
+  update_note="SC 1FORCR NOTIF
+Event    : UPDATE_SCRIPT
+Status   : BERHASIL
+Domain   : ${DOMAIN}
+Version  : ${new_ver}
+Time     : ${ts_now}
+IPLimit  : ${IPLIMIT_CHECK_INTERVAL_MINUTES}m/${IPLIMIT_LOCK_MINUTES}m
+Backup   : ${AUTO_BACKUP_ENABLE}
+Online   : ${ONLINE_NOTIFY_ENABLE}/${ONLINE_NOTIFY_INTERVAL_HOURS}h win=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}s"
   telegram_notify "${update_note}"
 
   rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
@@ -8058,9 +8145,10 @@ set_telegram_notif_config() {
   if [[ -n "${TELEGRAM_BOT_TOKEN:-}" && -n "${TELEGRAM_CHAT_ID:-}" ]]; then
     if prompt_input ans "Kirim pesan test sekarang? [y/N]: "; then
       if [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]; then
-        telegram_notify "Test notif SC 1FORCR
-Domain: ${DOMAIN}
-Time: $(date '+%F %T')"
+        telegram_notify "SC 1FORCR NOTIF
+Event    : TEST_NOTIF
+Domain   : ${DOMAIN}
+Time     : $(date '+%F %T')"
         echo "Pesan test dikirim (cek chat Telegram)."
       fi
     fi
