@@ -37,6 +37,8 @@ set -euo pipefail
 #   AUTO_BACKUP_ENABLE=1                         (opsional, 1=aktif timer backup harian)
 #   AUTO_BACKUP_DIR=/root/backup-sc-1forcr      (opsional)
 #   AUTO_BACKUP_KEEP_DAYS=7                      (opsional)
+#   ONLINE_NOTIFY_ENABLE=1                       (opsional, 1=kirim notifikasi akun online berkala)
+#   ONLINE_NOTIFY_INTERVAL_HOURS=3               (opsional, interval notifikasi online dalam jam)
 #   IPLIMIT_CHECK_INTERVAL_MINUTES=10            (opsional, interval checker iplimit dalam menit)
 #   IPLIMIT_LOCK_MINUTES=15                      (opsional, durasi lock sementara dalam menit)
 #   IPLIMIT_AUTO_TUNE=1                          (opsional, 1=otomatis tuning berbasis RAM/vCPU)
@@ -82,6 +84,8 @@ TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE:-1}"
 AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
 AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
+ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
+ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-10}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
@@ -1203,11 +1207,16 @@ XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
 XRAY_MIN_HITS_PER_IP=${XRAY_MIN_HITS_PER_IP}
 SSH_HC_AUTH_LOOKBACK_HOURS=${SSH_HC_AUTH_LOOKBACK_HOURS}
+TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
+ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
 EOF
 
   cat > "${APP_DIR}/api.js" <<'EOF'
 const express = require('express');
 const fs = require('fs');
+const https = require('https');
 const sqlite3 = require('sqlite3').verbose();
 const { execFileSync } = require('child_process');
 const crypto = require('crypto');
@@ -1226,6 +1235,8 @@ const UDPCUSTOM_CONFIG = process.env.UDPCUSTOM_CONFIG || '/root/udp/config.json'
 const UDPCUSTOM_SERVICE = process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom';
 const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
 const DROPBEAR_ALT_PORT = String(process.env.DROPBEAR_ALT_PORT || '143').trim();
+const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
+const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 
 const db = new sqlite3.Database(DB_PATH);
 
@@ -1258,6 +1269,53 @@ function getOwnerInfo(req, body = {}) {
     body?.chat_id
   );
   return { ownerTelegramId, ownerTelegramChatId };
+}
+function telegramNotify(text) {
+  return new Promise((resolve) => {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !text) return resolve(false);
+    const payload = `chat_id=${encodeURIComponent(TELEGRAM_CHAT_ID)}&text=${encodeURIComponent(String(text))}`;
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    }, (res) => {
+      res.on('data', () => {});
+      res.on('end', () => resolve(true));
+    });
+    req.on('error', () => resolve(false));
+    req.setTimeout(4500, () => {
+      try { req.destroy(); } catch (_) {}
+      resolve(false);
+    });
+    req.write(payload);
+    req.end();
+  });
+}
+async function notifyAccountEvent(action, service, account, owner) {
+  try {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+    const userId = Number(owner?.ownerTelegramId || 0) > 0 ? String(owner.ownerTelegramId) : '-';
+    const chatId = Number(owner?.ownerTelegramChatId || 0) > 0 ? String(owner.ownerTelegramChatId) : '-';
+    const username = String(account?.username || '-');
+    const exp = String(account?.exp || account?.expired || account?.to || '-');
+    const limitip = String(account?.limitip || '0');
+    const msg =
+      `SC 1FORCR NOTIF\n` +
+      `Aksi: ${String(action || '-').toUpperCase()}\n` +
+      `Layanan: ${String(service || '-').toUpperCase()}\n` +
+      `Domain: ${DOMAIN || '-'}\n` +
+      `Username: ${username}\n` +
+      `Expired: ${exp}\n` +
+      `Limit IP: ${limitip}\n` +
+      `Telegram User ID (Pelaku): ${userId}\n` +
+      `Telegram Chat ID: ${chatId}\n` +
+      `Time: ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+    await telegramNotify(msg);
+  } catch (_) {}
 }
 function ymdLocal(d) {
   const y = d.getFullYear();
@@ -1682,7 +1740,9 @@ async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
   );
   syncZivpnUser(username, true);
   syncUdpcustomUser(password, true);
-  return sshPayload(username, password, expDate, limitip);
+  const payload = sshPayload(username, password, expDate, limitip);
+  await notifyAccountEvent(isTrial ? 'trial' : 'create', 'ssh/zivpn', payload, owner);
+  return payload;
 }
 
 app.post('/vps/sshvpn', async (req, res) => {
@@ -1865,6 +1925,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
     };
   }
   await renderAndReloadXray();
+  await notifyAccountEvent(trial ? 'trial' : 'create', protocol, data, owner);
   return data;
 }
 
@@ -2420,6 +2481,7 @@ write_iplimit_checker() {
   log "Menulis checker limit IP otomatis..."
   cat > "${APP_DIR}/iplimit-checker.js" <<'EOF'
 const fs = require('fs');
+const https = require('https');
 const sqlite3 = require('sqlite3').verbose();
 const { execFileSync } = require('child_process');
 
@@ -2431,6 +2493,8 @@ const UDPCUSTOM_LISTEN_PORT = Number(process.env.UDPCUSTOM_LISTEN_PORT || 5667);
 const UDPCUSTOM_SERVICE = String(process.env.UDPCUSTOM_SERVICE || 'sc-1forcr-udpcustom').trim() || 'sc-1forcr-udpcustom';
 const DROPBEAR_PORT = String(process.env.DROPBEAR_PORT || '109').trim();
 const DROPBEAR_ALT_PORT = String(process.env.DROPBEAR_ALT_PORT || '143').trim();
+const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || '').trim();
+const TELEGRAM_CHAT_ID = String(process.env.TELEGRAM_CHAT_ID || '').trim();
 const ACTIVE_UDP_BACKEND = String(process.env.ACTIVE_UDP_BACKEND || '').trim().toLowerCase();
 const CHECK_INTERVAL_MINUTES_RAW = Number(process.env.IPLIMIT_CHECK_INTERVAL_MINUTES || 10);
 const CHECK_INTERVAL_MINUTES = Number.isFinite(CHECK_INTERVAL_MINUTES_RAW) && CHECK_INTERVAL_MINUTES_RAW > 0
@@ -2482,6 +2546,51 @@ const UDPCUSTOM_LOG_UNITS = Array.from(new Set([
 ].map((v) => String(v || '').trim()).filter(Boolean)));
 
 const db = new sqlite3.Database(DB_PATH);
+
+function telegramNotify(text) {
+  return new Promise((resolve) => {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !text) return resolve(false);
+    const payload = `chat_id=${encodeURIComponent(TELEGRAM_CHAT_ID)}&text=${encodeURIComponent(String(text))}`;
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': Buffer.byteLength(payload)
+      }
+    }, (res) => {
+      res.on('data', () => {});
+      res.on('end', () => resolve(true));
+    });
+    req.on('error', () => resolve(false));
+    req.setTimeout(4500, () => {
+      try { req.destroy(); } catch (_) {}
+      resolve(false);
+    });
+    req.write(payload);
+    req.end();
+  });
+}
+
+async function notifyMultiLoginLock(service, username, limitip, detected, ips = [], ownerId = null, ownerChatId = null) {
+  try {
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+    const list = Array.isArray(ips) ? ips.filter(Boolean).slice(0, 8) : [];
+    const msg =
+      `SC 1FORCR MULTI_LOGIN\n` +
+      `Aksi: LOCK_TMP\n` +
+      `Layanan: ${String(service || '-').toUpperCase()}\n` +
+      `Username: ${String(username || '-')}\n` +
+      `Limit IP: ${Number(limitip || 0)}\n` +
+      `Terdeteksi: ${Number(detected || 0)}\n` +
+      `IP: ${list.length > 0 ? list.join(', ') : '-'}\n` +
+      `Owner Telegram User ID: ${ownerId || '-'}\n` +
+      `Owner Telegram Chat ID: ${ownerChatId || '-'}\n` +
+      `Time: ${new Date().toISOString().replace('T', ' ').slice(0, 19)}`;
+    await telegramNotify(msg);
+  } catch (_) {}
+}
 
 function run(sql, params = []) {
   return new Promise((resolve, reject) => {
@@ -3550,7 +3659,10 @@ async function lockIfExceeded(nowTs) {
     graceMap.set(`${t}|${u}`, Number(g?.grace_until || 0));
   }
 
-  const sshRows = await all("SELECT username, password, limitip FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(limitip,0) AS INTEGER) > 0");
+  const sshRows = await all(
+    "SELECT username, password, limitip, owner_telegram_id, owner_telegram_chat_id " +
+    "FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(limitip,0) AS INTEGER) > 0"
+  );
   for (const r of sshRows) {
     const user = String(r.username || '').trim();
     const pass = String(r.password || '').trim();
@@ -3633,6 +3745,15 @@ async function lockIfExceeded(nowTs) {
     if (udphcSecretChanged) udpcustomChanged = true;
     await run("UPDATE account_sshs SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)", [user]).catch(() => {});
     await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES('ssh', ?, ?, ?)", [user, nowTs + LOCK_SECONDS, removed]).catch(() => {});
+    await notifyMultiLoginLock(
+      'ssh/zivpn',
+      user,
+      lim,
+      cnt,
+      lockIps,
+      Number(r.owner_telegram_id || 0) || null,
+      Number(r.owner_telegram_chat_id || 0) || null
+    );
   }
 
   const scan = [
@@ -3641,7 +3762,10 @@ async function lockIfExceeded(nowTs) {
     { type: 'trojan', table: 'account_trojans' }
   ];
   for (const item of scan) {
-    const rows = await all(`SELECT username, limitip FROM ${item.table} WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(limitip,0) AS INTEGER) > 0`);
+    const rows = await all(
+      `SELECT username, limitip, owner_telegram_id, owner_telegram_chat_id ` +
+      `FROM ${item.table} WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(limitip,0) AS INTEGER) > 0`
+    );
     for (const r of rows) {
       const user = String(r.username || '').trim();
       const userKey = user.toLowerCase();
@@ -3675,6 +3799,15 @@ async function lockIfExceeded(nowTs) {
       }
       await run(`UPDATE ${item.table} SET status='LOCK_TMP' WHERE LOWER(username)=LOWER(?)`, [user]).catch(() => {});
       await run("INSERT OR REPLACE INTO temp_ip_locks(account_type, username, locked_until, zivpn_removed) VALUES(?, ?, ?, 0)", [item.type, user, nowTs + LOCK_SECONDS]).catch(() => {});
+      await notifyMultiLoginLock(
+        item.type,
+        user,
+        lim,
+        cnt,
+        lockIps,
+        Number(r.owner_telegram_id || 0) || null,
+        Number(r.owner_telegram_chat_id || 0) || null
+      );
       xrayChanged = true;
     }
   }
@@ -4468,6 +4601,205 @@ EOF
   systemctl enable --now sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
 }
 
+setup_online_notify_timer() {
+  local notify_interval_h
+  notify_interval_h="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
+  if [[ -z "${notify_interval_h}" || "${notify_interval_h}" -lt 1 || "${notify_interval_h}" -gt 168 ]]; then
+    notify_interval_h="3"
+  fi
+
+  log "Setup notifikasi akun online berkala (${notify_interval_h} jam)..."
+
+  cat > /usr/local/sbin/sc-1forcr-online-notify <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/sc-1forcr.env"
+[[ -f "${ENV_FILE}" ]] && source "${ENV_FILE}" || true
+
+DOMAIN="${DOMAIN:-unknown}"
+DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
+TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
+TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
+ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
+ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
+[[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
+
+if [[ "${ONLINE_NOTIFY_ENABLE}" != "1" ]]; then
+  exit 0
+fi
+if [[ -z "${TELEGRAM_BOT_TOKEN}" || -z "${TELEGRAM_CHAT_ID}" ]]; then
+  exit 0
+fi
+
+send_tg() {
+  local text="$1"
+  [[ -z "${text}" ]] && return 0
+  curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    -d "chat_id=${TELEGRAM_CHAT_ID}" \
+    -d "disable_web_page_preview=true" \
+    --data-urlencode "text=${text}" >/dev/null 2>&1 || true
+}
+
+detect_udphc_service() {
+  if systemctl is-active --quiet sc-1forcr-udpcustom 2>/dev/null; then
+    echo "sc-1forcr-udpcustom"
+    return
+  fi
+  if systemctl is-active --quiet udp-custom 2>/dev/null; then
+    echo "udp-custom"
+    return
+  fi
+  if systemctl list-unit-files | grep -q '^sc-1forcr-udpcustom\.service'; then
+    echo "sc-1forcr-udpcustom"
+    return
+  fi
+  if systemctl list-unit-files | grep -q '^udp-custom\.service'; then
+    echo "udp-custom"
+    return
+  fi
+  echo "${UDPCUSTOM_SERVICE:-sc-1forcr-udpcustom}"
+}
+
+ssh_users="$(who 2>/dev/null | awk '{print tolower($1)}' | awk 'NF{c[$1]++} END{for (u in c) printf "%s(%d)\n", u, c[u]}' | sort || true)"
+ssh_cnt="$(echo "${ssh_users}" | awk 'NF{n++} END{print n+0}')"
+
+xray_users=""
+xray_cnt=0
+if [[ -f /var/log/xray/access.log ]]; then
+  xray_users="$(tail -n 12000 /var/log/xray/access.log 2>/dev/null \
+    | awk '
+      {
+        u=""
+        if (match($0, /email":"[^"]+"/)) {
+          u=substr($0, RSTART, RLENGTH)
+          sub(/^email":"/, "", u)
+          sub(/"$/, "", u)
+        } else if (match($0, /user":"[^"]+"/)) {
+          u=substr($0, RSTART, RLENGTH)
+          sub(/^user":"/, "", u)
+          sub(/"$/, "", u)
+        }
+        u=tolower(u)
+        if (u ~ /^[a-z0-9._-]+$/) c[u]++
+      }
+      END { for (u in c) printf "%s(%d)\n", u, c[u] }
+    ' | sort || true)"
+  xray_cnt="$(echo "${xray_users}" | awk 'NF{n++} END{print n+0}')"
+fi
+
+udphc_service="$(detect_udphc_service)"
+udphc_users="$(journalctl -u "${udphc_service}" -n 8000 --no-pager 2>/dev/null \
+  | awk '
+    {
+      u=""; src=""
+      low=tolower($0)
+      if (match($0, /\[user:[^]]+\]/)) {
+        u=substr($0, RSTART+6, RLENGTH-7)
+      } else if (match($0, /user[=: ][^ ,\]]+/)) {
+        u=substr($0, RSTART, RLENGTH)
+        sub(/^user[=: ]/, "", u)
+      }
+      if (match($0, /src[=: ][^ ,\]]+/)) {
+        src=substr($0, RSTART, RLENGTH)
+        sub(/^src[=: ]/, "", src)
+      }
+      u=tolower(u)
+      key=u "|" src
+      if (u ~ /^[a-z0-9._-]+$/) {
+        if (low ~ /disconnected|logout|closed/) {
+          delete ses[key]
+        } else {
+          ses[key]=1
+        }
+      }
+    }
+    END {
+      for (k in ses) {
+        split(k, a, "|")
+        if (a[1] != "") c[a[1]]++
+      }
+      for (u in c) printf "%s(%d)\n", u, c[u]
+    }
+  ' | sort || true)"
+udphc_cnt="$(echo "${udphc_users}" | awk 'NF{n++} END{print n+0}')"
+
+acct_ssh="-"; acct_vmess="-"; acct_vless="-"; acct_trojan="-"
+if [[ -f "${DB_PATH}" ]]; then
+  acct_ssh="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF';" 2>/dev/null || echo "-")"
+  acct_vmess="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF';" 2>/dev/null || echo "-")"
+  acct_vless="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF';" 2>/dev/null || echo "-")"
+  acct_trojan="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF';" 2>/dev/null || echo "-")"
+fi
+
+short_list() {
+  local data="$1" max="${2:-12}"
+  echo "${data}" | awk 'NF' | head -n "${max}" | awk 'BEGIN{first=1} {if(!first) printf ", "; printf "%s", $0; first=0} END{print ""}' || true
+}
+
+msg="SC 1FORCR ONLINE REPORT
+Domain: ${DOMAIN}
+Waktu: $(date '+%F %T')
+Interval: ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
+
+Akun aktif DB:
+- SSH/ZIVPN: ${acct_ssh}
+- VMESS: ${acct_vmess}
+- VLESS: ${acct_vless}
+- TROJAN: ${acct_trojan}
+
+User terdeteksi online:
+- SSH shell: ${ssh_cnt}
+- XRAY (tail log): ${xray_cnt}
+- UDPHC (journal): ${udphc_cnt}
+
+Detail:
+SSH : $(short_list "${ssh_users}" 12)
+XRAY: $(short_list "${xray_users}" 12)
+UDPHC: $(short_list "${udphc_users}" 12)"
+
+send_tg "${msg}"
+EOF
+  chmod +x /usr/local/sbin/sc-1forcr-online-notify
+
+  cat > /etc/systemd/system/sc-1forcr-online-notify.service <<'EOF'
+[Unit]
+Description=SC 1FORCR Online Account Notify
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/sc-1forcr-online-notify
+NoNewPrivileges=true
+PrivateTmp=true
+EOF
+
+  cat > /etc/systemd/system/sc-1forcr-online-notify.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR online account notifier every ${notify_interval_h} hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=${notify_interval_h}h
+AccuracySec=1min
+RandomizedDelaySec=0
+Persistent=true
+Unit=sc-1forcr-online-notify.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  if [[ "${ONLINE_NOTIFY_ENABLE}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+    systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+  fi
+}
+
 write_cli_menu() {
   local menu_runtime
   menu_runtime="${APP_DIR}/menu-sc-1forcr.sh"
@@ -4495,6 +4827,8 @@ TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 AUTO_BACKUP_ENABLE=${AUTO_BACKUP_ENABLE}
 AUTO_BACKUP_DIR=${AUTO_BACKUP_DIR}
 AUTO_BACKUP_KEEP_DAYS=${AUTO_BACKUP_KEEP_DAYS}
+ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
+ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
 IPLIMIT_AUTO_TUNE=${IPLIMIT_AUTO_TUNE}
@@ -4527,6 +4861,8 @@ API_BASE="http://127.0.0.1:${API_PORT}/vps"
 ZIVPN_DNAT_RANGE="${ZIVPN_DNAT_RANGE:-6000:19999}"
 UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-6000:6999}"
+ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
+ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
 DROPBEAR_LOG_MAX_LINES="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9')"
 DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
@@ -4543,6 +4879,8 @@ xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-1}" | tr -cd '0-9')"
 [[ -z "${xray_recent_window_min}" || "${xray_recent_window_min}" -lt 5 ]] && xray_recent_window_min="60"
 [[ -z "${xray_active_window_sec}" || "${xray_active_window_sec}" -lt 30 ]] && xray_active_window_sec="600"
 [[ -z "${xray_min_hits_per_ip}" || "${xray_min_hits_per_ip}" -lt 1 ]] && xray_min_hits_per_ip="1"
+[[ "${ONLINE_NOTIFY_ENABLE}" != "0" ]] && ONLINE_NOTIFY_ENABLE="1"
+[[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
 
 api_call() {
   local method="$1" path="$2" data="${3:-}"
@@ -4647,6 +4985,25 @@ AccuracySec=1s
 RandomizedDelaySec=0
 Persistent=true
 Unit=sc-1forcr-iplimit.service
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+write_online_notify_timer_unit() {
+  local interval_h="$1"
+  cat > /etc/systemd/system/sc-1forcr-online-notify.timer <<EOF
+[Unit]
+Description=Run SC 1FORCR online account notifier every ${interval_h} hours
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=${interval_h}h
+AccuracySec=1min
+RandomizedDelaySec=0
+Persistent=true
+Unit=sc-1forcr-online-notify.service
 
 [Install]
 WantedBy=timers.target
@@ -5414,6 +5771,67 @@ set_iplimit_checker_config_menu() {
   echo "- Durasi unlock    : ${IPLIMIT_LOCK_MINUTES} menit"
 }
 
+set_online_notify_config_menu() {
+  local current_enable current_interval enable_in interval_in
+  current_enable="${ONLINE_NOTIFY_ENABLE:-1}"
+  [[ "${current_enable}" != "0" ]] && current_enable="1"
+  current_interval="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
+  [[ -z "${current_interval}" || "${current_interval}" -lt 1 || "${current_interval}" -gt 168 ]] && current_interval="3"
+
+  echo "=== SETTING NOTIF AKUN ONLINE ==="
+  echo "Status saat ini    : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  echo "Interval saat ini  : ${current_interval} jam"
+  echo
+  echo "Kosongkan input untuk mempertahankan nilai lama."
+  echo "Ketik 'batal' untuk kembali."
+
+  if ! prompt_input enable_in "Aktifkan notif online? (1=aktif,0=nonaktif) [${current_enable}]: "; then
+    return
+  fi
+  [[ "${enable_in,,}" == "batal" ]] && return
+  enable_in="${enable_in:-${current_enable}}"
+  case "${enable_in,,}" in
+    1|on|yes|y) enable_in="1" ;;
+    0|off|no|n) enable_in="0" ;;
+    *)
+      echo "Input status tidak valid. Gunakan 1 atau 0."
+      return
+      ;;
+  esac
+
+  if ! prompt_input interval_in "Interval notif (jam) [${current_interval}]: "; then
+    return
+  fi
+  [[ "${interval_in,,}" == "batal" ]] && return
+  interval_in="${interval_in:-${current_interval}}"
+  if [[ ! "${interval_in}" =~ ^[0-9]+$ || "${interval_in}" -lt 1 || "${interval_in}" -gt 168 ]]; then
+    echo "Interval notif harus angka 1-168 jam."
+    return
+  fi
+
+  ONLINE_NOTIFY_ENABLE="${enable_in}"
+  ONLINE_NOTIFY_INTERVAL_HOURS="${interval_in}"
+  update_sc_env_var "ONLINE_NOTIFY_ENABLE" "${ONLINE_NOTIFY_ENABLE}"
+  update_sc_env_var "ONLINE_NOTIFY_INTERVAL_HOURS" "${ONLINE_NOTIFY_INTERVAL_HOURS}"
+  update_app_env_var "ONLINE_NOTIFY_ENABLE" "${ONLINE_NOTIFY_ENABLE}"
+  update_app_env_var "ONLINE_NOTIFY_INTERVAL_HOURS" "${ONLINE_NOTIFY_INTERVAL_HOURS}"
+  write_online_notify_timer_unit "${ONLINE_NOTIFY_INTERVAL_HOURS}"
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if [[ "${ONLINE_NOTIFY_ENABLE}" == "1" ]]; then
+    systemctl enable --now sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+    systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+    systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
+  else
+    systemctl disable --now sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+  fi
+
+  echo
+  echo "Berhasil update notif akun online:"
+  echo "- Status   : $([[ "${ONLINE_NOTIFY_ENABLE}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
+  echo "- Interval : ${ONLINE_NOTIFY_INTERVAL_HOURS} jam"
+}
+
 tools_menu() {
   while true; do
     clear
@@ -5426,9 +5844,10 @@ tools_menu() {
     echo "4) Update Script"
     echo "5) Setting Notif Telegram"
     echo "6) Setting Checker IP Limit"
+    echo "7) Setting Notif Akun Online"
     echo "0) Kembali"
     echo
-    if ! prompt_input tm "Pilih menu [0-6]: "; then
+    if ! prompt_input tm "Pilih menu [0-7]: "; then
       return
     fi
     clear
@@ -5439,6 +5858,7 @@ tools_menu() {
       4) update_script_from_repo ;;
       5) set_telegram_notif_config ;;
       6) set_iplimit_checker_config_menu ;;
+      7) set_online_notify_config_menu ;;
       0) return ;;
       *) echo "Pilihan tidak valid." ;;
     esac
@@ -5612,6 +6032,8 @@ restart_all_services() {
   systemctl start sc-1forcr-iplimit.service >/dev/null 2>&1 || true
   systemctl restart sc-1forcr-autoreboot.timer >/dev/null 2>&1 || true
   systemctl restart sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+  systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
   restart_active_udp_backend
 }
 
@@ -7348,6 +7770,8 @@ Time: $(date '+%F %T')"
     AUTO_BACKUP_ENABLE="${AUTO_BACKUP_ENABLE}" \
     AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR}" \
     AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS}" \
+    ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE}" \
+    ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS}" \
     ACTIVE_UDP_BACKEND="${active_backend}" \
     bash "${tmp}"; then
     echo "Update script gagal dijalankan."
@@ -7401,7 +7825,8 @@ Domain: ${DOMAIN}
 Version: ${new_ver}
 Time: ${ts_now}
 Checker IP Limit: ${IPLIMIT_CHECK_INTERVAL_MINUTES}m/${IPLIMIT_LOCK_MINUTES}m
-Auto Backup: ${AUTO_BACKUP_ENABLE}"
+Auto Backup: ${AUTO_BACKUP_ENABLE}
+Online Notify: ${ONLINE_NOTIFY_ENABLE}/${ONLINE_NOTIFY_INTERVAL_HOURS}h"
   telegram_notify "${update_note}"
 
   rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
@@ -7436,11 +7861,16 @@ set_telegram_notif_config() {
   if [[ -n "${token}" ]]; then
     TELEGRAM_BOT_TOKEN="${token}"
     update_sc_env_var "TELEGRAM_BOT_TOKEN" "${TELEGRAM_BOT_TOKEN}"
+    update_app_env_var "TELEGRAM_BOT_TOKEN" "${TELEGRAM_BOT_TOKEN}"
   fi
   if [[ -n "${chat}" ]]; then
     TELEGRAM_CHAT_ID="${chat}"
     update_sc_env_var "TELEGRAM_CHAT_ID" "${TELEGRAM_CHAT_ID}"
+    update_app_env_var "TELEGRAM_CHAT_ID" "${TELEGRAM_CHAT_ID}"
   fi
+  systemctl restart sc-1forcr-api >/dev/null 2>&1 || true
+  systemctl restart sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+  systemctl start sc-1forcr-online-notify.service >/dev/null 2>&1 || true
 
   echo "Konfigurasi Telegram tersimpan."
   echo "Bot Token     : $(mask_secret "${TELEGRAM_BOT_TOKEN:-}")"
@@ -7760,6 +8190,10 @@ systemctl stop sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-autobackup.timer >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-autobackup.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-autobackup.service >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-online-notify.timer >/dev/null 2>&1 || true
+systemctl stop sc-1forcr-online-notify.service >/dev/null 2>&1 || true
+systemctl disable sc-1forcr-online-notify.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 systemctl disable sc-1forcr-udp-bootfix.service >/dev/null 2>&1 || true
 systemctl stop sc-1forcr-udpcustom >/dev/null 2>&1 || true
@@ -7774,6 +8208,8 @@ rm -f /etc/systemd/system/sc-1forcr-autoreboot.service
 rm -f /etc/systemd/system/sc-1forcr-autoreboot.timer
 rm -f /etc/systemd/system/sc-1forcr-autobackup.service
 rm -f /etc/systemd/system/sc-1forcr-autobackup.timer
+rm -f /etc/systemd/system/sc-1forcr-online-notify.service
+rm -f /etc/systemd/system/sc-1forcr-online-notify.timer
 rm -f /etc/systemd/system/sc-1forcr-udp-bootfix.service
 rm -f /etc/systemd/system/sc-1forcr-udpcustom.service
 rm -f /etc/systemd/system/potato-compat-api.service
@@ -7791,6 +8227,7 @@ rm -f /usr/local/sbin/uninstall-potato-compat
 rm -f /usr/local/sbin/sc-1forcr-safe-reboot
 rm -f /usr/local/sbin/sc-1forcr-auto-backup
 rm -f /usr/local/sbin/sc-1forcr-restore-backup
+rm -f /usr/local/sbin/sc-1forcr-online-notify
 rm -f /usr/local/sbin/sc-1forcr-udp-bootfix
 
 echo "Uninstall SC 1FORCR selesai."
@@ -7928,6 +8365,7 @@ main() {
   setup_udp_bootfix_service
   setup_auto_reboot_timer
   setup_auto_backup_timer
+  setup_online_notify_timer
   show_install_progress 90 "Sedikit lagi, finishing konfigurasi..."
 
   write_cli_menu
@@ -7970,6 +8408,7 @@ Catatan:
 - Auto reboot aktif setiap hari jam 03:00 via systemd timer sc-1forcr-autoreboot.timer.
 - Reboot hanya menjalankan sync + reboot (tanpa ubah konfigurasi layanan).
 - Auto backup semua akun (JSON) dikirim ke Telegram setiap jam 02:00 WIB via sc-1forcr-autobackup.timer.
+- Notifikasi akun online berkala ke Telegram aktif default tiap ${ONLINE_NOTIFY_INTERVAL_HOURS} jam via sc-1forcr-online-notify.timer.
 - Backup manual: /usr/local/sbin/sc-1forcr-auto-backup manual
 - Restore akun dari backup: /usr/local/sbin/sc-1forcr-restore-backup /path/file.json
 - UDP boot-fix aktif via systemd sc-1forcr-udp-bootfix.service (re-apply backend/rule saat startup).
