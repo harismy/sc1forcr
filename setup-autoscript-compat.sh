@@ -925,8 +925,8 @@ fw_allow_udp_input() {
   fw="$(fw_backend_kind)"
   case "${fw}" in
     iptables)
-      iptables -C INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || \
-        iptables -I INPUT -p udp --dport "${port}" -j ACCEPT
+      iptables -w 10 -C INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || \
+        iptables -w 10 -I INPUT -p udp --dport "${port}" -j ACCEPT
       ;;
     nft)
       if nft list chain inet filter input >/dev/null 2>&1; then
@@ -947,8 +947,8 @@ fw_add_udp_dnat_range() {
   fw="$(fw_backend_kind)"
   case "${fw}" in
     iptables)
-      iptables -t nat -C PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1 || \
-        iptables -t nat -I PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}"
+      iptables -w 10 -t nat -C PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1 || \
+        iptables -w 10 -t nat -I PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}"
       ;;
     nft)
       nft add table ip nat >/dev/null 2>&1 || true
@@ -964,8 +964,8 @@ fw_delete_udp_dnat_range() {
   fw="$(fw_backend_kind)"
   case "${fw}" in
     iptables)
-      while iptables -t nat -C PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1; do
-        iptables -t nat -D PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1 || break
+      while iptables -w 10 -t nat -C PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1; do
+        iptables -w 10 -t nat -D PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1 || break
       done
       ;;
     nft)
@@ -3822,8 +3822,8 @@ fw_allow_udp_input() {
   local port="$1"
   case "$(fw_backend_kind)" in
     iptables)
-      iptables -C INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || \
-        iptables -I INPUT -p udp --dport "${port}" -j ACCEPT
+      iptables -w 10 -C INPUT -p udp --dport "${port}" -j ACCEPT >/dev/null 2>&1 || \
+        iptables -w 10 -I INPUT -p udp --dport "${port}" -j ACCEPT
       ;;
     nft)
       if nft list chain inet filter input >/dev/null 2>&1; then
@@ -3842,8 +3842,8 @@ fw_add_udp_dnat_range() {
   [[ -z "${range}" ]] && return 0
   case "$(fw_backend_kind)" in
     iptables)
-      iptables -t nat -C PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1 || \
-        iptables -t nat -I PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}"
+      iptables -w 10 -t nat -C PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1 || \
+        iptables -w 10 -t nat -I PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}"
       ;;
     nft)
       local range_nft
@@ -3861,8 +3861,8 @@ fw_delete_udp_dnat_range() {
   [[ -z "${range}" ]] && return 0
   case "$(fw_backend_kind)" in
     iptables)
-      while iptables -t nat -C PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1; do
-        iptables -t nat -D PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1 || break
+      while iptables -w 10 -t nat -C PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1; do
+        iptables -w 10 -t nat -D PREROUTING -p udp --dport "${range}" -j DNAT --to-destination ":${to_port}" >/dev/null 2>&1 || break
       done
       ;;
     nft)
@@ -5434,8 +5434,8 @@ cleanup_zivpn_dnat_for_udphc() {
   udphc_port="$(jq -r '.listen // empty' /root/udp/config.json 2>/dev/null | sed -E 's/^:([0-9]+)$/\1/' | tr -cd '0-9')"
   [[ -z "${udphc_port}" ]] && udphc_port="5667"
   if command -v iptables >/dev/null 2>&1; then
-    while iptables -t nat -C PREROUTING -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${udphc_port}" >/dev/null 2>&1; do
-      iptables -t nat -D PREROUTING -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${udphc_port}" >/dev/null 2>&1 || break
+    while iptables -w 10 -t nat -C PREROUTING -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${udphc_port}" >/dev/null 2>&1; do
+      iptables -w 10 -t nat -D PREROUTING -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${udphc_port}" >/dev/null 2>&1 || break
     done
   elif command -v nft >/dev/null 2>&1; then
     range_nft="${ZIVPN_DNAT_RANGE/:/-}"
@@ -5456,10 +5456,10 @@ ensure_zivpn_dnat_for_zivpn() {
   [[ -z "${zivpn_port}" ]] && zivpn_port="5667"
 
   if command -v iptables >/dev/null 2>&1; then
-    iptables -C INPUT -p udp --dport "${zivpn_port}" -j ACCEPT >/dev/null 2>&1 || \
-      iptables -I INPUT -p udp --dport "${zivpn_port}" -j ACCEPT
-    iptables -t nat -C PREROUTING -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${zivpn_port}" >/dev/null 2>&1 || \
-      iptables -t nat -I PREROUTING -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${zivpn_port}"
+    iptables -w 10 -C INPUT -p udp --dport "${zivpn_port}" -j ACCEPT >/dev/null 2>&1 || \
+      iptables -w 10 -I INPUT -p udp --dport "${zivpn_port}" -j ACCEPT
+    iptables -w 10 -t nat -C PREROUTING -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${zivpn_port}" >/dev/null 2>&1 || \
+      iptables -w 10 -t nat -I PREROUTING -p udp --dport "${ZIVPN_DNAT_RANGE}" -j DNAT --to-destination ":${zivpn_port}"
   elif command -v nft >/dev/null 2>&1; then
     range_nft="${ZIVPN_DNAT_RANGE/:/-}"
     nft add table ip nat >/dev/null 2>&1 || true
@@ -5499,10 +5499,10 @@ switch_udp_to_udpcustom() {
   cleanup_zivpn_dnat_for_udphc
   if [[ -n "${dnat_range}" ]]; then
     if command -v iptables >/dev/null 2>&1; then
-      iptables -C INPUT -p udp --dport "${udphc_port}" -j ACCEPT >/dev/null 2>&1 || \
-        iptables -I INPUT -p udp --dport "${udphc_port}" -j ACCEPT
-      iptables -t nat -C PREROUTING -p udp --dport "${dnat_range}" -j DNAT --to-destination ":${udphc_port}" >/dev/null 2>&1 || \
-        iptables -t nat -I PREROUTING -p udp --dport "${dnat_range}" -j DNAT --to-destination ":${udphc_port}"
+      iptables -w 10 -C INPUT -p udp --dport "${udphc_port}" -j ACCEPT >/dev/null 2>&1 || \
+        iptables -w 10 -I INPUT -p udp --dport "${udphc_port}" -j ACCEPT
+      iptables -w 10 -t nat -C PREROUTING -p udp --dport "${dnat_range}" -j DNAT --to-destination ":${udphc_port}" >/dev/null 2>&1 || \
+        iptables -w 10 -t nat -I PREROUTING -p udp --dport "${dnat_range}" -j DNAT --to-destination ":${udphc_port}"
     elif command -v nft >/dev/null 2>&1; then
       range_nft="${dnat_range/:/-}"
       nft add table ip nat >/dev/null 2>&1 || true
