@@ -6630,80 +6630,29 @@ read_vnstat_stats() {
 }
 
 draw_dashboard() {
-  local os_name ram_used ram_total swap_used swap_total uptime_s uptime_h uptime_m
+  local os_name ram_mb swap_mb uptime_s uptime_h uptime_m
   local ip city isp udpcustom
   local ssh_on xray_on ws_on loadblc_on zivpn_on udphc_on
   local c_ssh c_vmess c_vless c_trojan
   local health
   local cap_ram_gb cap_cores cap_tier cap_est cap_mode
+  local line
 
-  # =========================
-  # Colors
-  # =========================
+  # Color definitions
   local RED='\033[0;31m'
   local GREEN='\033[0;32m'
   local YELLOW='\033[0;33m'
   local BLUE='\033[0;34m'
   local CYAN='\033[0;36m'
-  local WHITE='\033[1;37m'
   local BOLD='\033[1m'
-  local DIM='\033[2m'
   local NC='\033[0m'
+  local CHECK="${YELLOW}CHECK${NC}"
+  local GOOD="${GREEN}GOOD${NC}"
 
-  # =========================
-  # Helpers
-  # =========================
-  hr() {
-    printf "├──────────────────────────────────────────────────────────────┤\n"
-  }
-
-  # 1 kolom aman
-  row_plain() {
-    printf "│ %-60s │\n" "$1"
-  }
-
-  # label : value aman
-  kv() {
-    local label="$1"
-    local value="$2"
-    printf "│ %-18s : %-38s │\n" "$label" "$value"
-  }
-
-  # 2 kolom tanpa warna
-  row2_plain() {
-    printf "│ %-28s │ %-27s │\n" "$1" "$2"
-  }
-
-  # header section
-  section() {
-    printf "│ ${WHITE}${BOLD}%-60s${NC} │\n" "$1"
-  }
-
-  # status warna, tapi jangan dipad ke width besar
-  status_word() {
-    if [[ "$1" == "ON" ]]; then
-      printf "${GREEN}${BOLD}ON${NC}"
-    else
-      printf "${RED}${BOLD}OFF${NC}"
-    fi
-  }
-
-  gradient_header() {
-    printf "┌──────────────────────────────────────────────────────────────┐\n"
-    printf "│ ${CYAN}${BOLD}SC 1FORCR NEXUS DASHBOARD${NC}%-31s │\n" ""
-    printf "├──────────────────────────────────────────────────────────────┤\n"
-  }
-
-  # =========================
-  # Data
-  # =========================
+  # Data collection
   os_name="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
-
-  ram_used="$(free -m 2>/dev/null | awk '/^Mem:/ {print $3 "M"}')"
-  ram_total="$(free -m 2>/dev/null | awk '/^Mem:/ {print $2 "M"}')"
-  swap_used="$(free -m 2>/dev/null | awk '/^Swap:/ {print $3 "M"}')"
-  swap_total="$(free -m 2>/dev/null | awk '/^Swap:/ {print $2 "M"}')"
-
+  ram_mb="$(free -m 2>/dev/null | awk '/^Mem:/ {print $3 "M"}')"
+  swap_mb="$(free -m 2>/dev/null | awk '/^Swap:/ {print $3 "M"}')"
   uptime_s="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
   uptime_h="$((uptime_s / 3600))"
   uptime_m="$(((uptime_s % 3600) / 60))"
@@ -6725,9 +6674,8 @@ draw_dashboard() {
   if [[ "${xray_on}" == "ON" && "${ws_on}" == "ON" && "${loadblc_on}" == "ON" ]]; then
     health="GOOD"
   fi
-
-  local health_display="● NEED CHECK"
-  [[ "${health}" == "GOOD" ]] && health_display="● SYSTEM STABLE"
+  local health_display="${CHECK}"
+  [[ "${health}" == "GOOD" ]] && health_display="${GOOD}"
 
   c_ssh="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_sshs;" 2>/dev/null || echo 0)"
   c_vmess="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vmesses;" 2>/dev/null || echo 0)"
@@ -6736,70 +6684,81 @@ draw_dashboard() {
 
   read_vnstat_stats
   IFS='|' read -r cap_ram_gb cap_cores cap_tier cap_est <<< "$(get_server_capacity_profile)"
-
   if [[ "$(menu_bool_01 "${IPLIMIT_AUTO_TUNE:-1}")" == "1" ]]; then
     cap_mode="AUTO"
   else
     cap_mode="MANUAL"
   fi
 
-  # =========================
-  # Output
-  # =========================
-  gradient_header
+  # Helper for separator (without right border)
+  hr() {
+    printf "├─────────────────────────────────────────────────\n"
+  }
 
-  section "SYSTEM & NETWORK"
-  kv "OS" "$os_name"
-  kv "RAM" "${ram_used:-"-"} / ${ram_total:-"-"}"
-  kv "SWAP" "${swap_used:-"-"} / ${swap_total:-"-"}"
-  kv "UPTIME" "${uptime_h} jam ${uptime_m} menit"
-  kv "SPESIFIKASI" "${cap_ram_gb} GB RAM / ${cap_cores} vCPU"
-  kv "AUTO TUNING" "${cap_mode} (tier ${cap_tier})"
-  kv "ESTIMASI AKUN" "sekitar ${cap_est} user"
+  # Dashboard - no closing pipe on the right
+  printf "┌─────────────────────────────────────────────────\n"
+  printf "│${BOLD}             SC 1FORCR NEXUS DASHBOARD            ${NC}\n"
+  printf "├─────────────────────────────────────────────────\n"
+
+  # System & Network
+  printf "│ ${CYAN}${BOLD}■ SYSTEM & NETWORK${NC}${BOLD}${NC}                                  \n"
+  printf "│   OS                     : ${os_name}${NC}                              \n"
+  printf "│   RAM                    : ${ram_mb:-"-"}  │ SWAP : ${swap_mb:-"-"}${NC}                         \n"
+  printf "│   UPTIME                 : ${uptime_h}h ${uptime_m}m${NC}                                           \n"
+  printf "│   Spesifikasi server anda: ${cap_ram_gb} GB RAM / ${cap_cores} vCPU${NC}                    \n"
+  printf "│   Auto tuning SC         : ${cap_mode} (tier ${cap_tier})${NC}                               \n"
+  printf "│   Estimasi akun          : sekitar ${cap_est} user${NC}                              \n"
+
+  hr
+  printf "│ ${CYAN}${BOLD}■ LOCATION & ISP${NC}${BOLD}${NC}                                    \n"
+  printf "│   IP      : ${ip}${NC}                                                \n"
+  printf "│   CITY    : ${city}${NC}                                              \n"
+  printf "│   ISP     : ${isp}${NC}                                              \n"
+  printf "│   DOMAIN  : ${DOMAIN}${NC}                                           \n"
   hr
 
-  section "LOCATION & ISP"
-  kv "IP PUBLIK" "$ip"
-  kv "KOTA" "$city"
-  kv "ISP" "$isp"
-  kv "DOMAIN" "${DOMAIN:-"-"}"
+  # Traffic Stats
+  printf "│ ${CYAN}${BOLD}■ TRAFFIC STATS${NC}${BOLD}${NC}                                     \n"
+  printf "│   MONTH   : ${VNSTAT_MONTH_TOTAL}     [${VNSTAT_MONTH_NAME}]${NC}                 \n"
+  printf "│   RX      : ${VNSTAT_MONTH_RX}${NC}                                              \n"
+  printf "│   TX      : ${VNSTAT_MONTH_TX}${NC}                                              \n"
+  printf "│   DAY     : ${VNSTAT_DAY_TOTAL}     [${VNSTAT_DAY_NAME}]${NC}                    \n"
+  printf "│   RX      : ${VNSTAT_DAY_RX}${NC}                                               \n"
+  printf "│   TX      : ${VNSTAT_DAY_TX}${NC}                                               \n"
+  printf "│   CURRENT : ${VNSTAT_RATE}${NC}                                              \n"
   hr
 
-  section "TRAFFIC STATS"
-  kv "BULAN INI" "${VNSTAT_MONTH_TOTAL:-"-"} [${VNSTAT_MONTH_NAME:-"-"}]"
-  row2_plain "RX : ${VNSTAT_MONTH_RX:-"-"}" "TX : ${VNSTAT_MONTH_TX:-"-"}"
-  kv "HARI INI" "${VNSTAT_DAY_TOTAL:-"-"} [${VNSTAT_DAY_NAME:-"-"}]"
-  row2_plain "RX : ${VNSTAT_DAY_RX:-"-"}" "TX : ${VNSTAT_DAY_TX:-"-"}"
-  kv "CURRENT RATE" "${VNSTAT_RATE:-"-"}"
+  # Services Status (includes zivpn and udphc)
+  printf "│ ${CYAN}${BOLD}■ SERVICES STATUS${NC}${BOLD}${NC}                                   \n"
+  local xray_color="${GREEN}ON${NC}"; [[ "$xray_on" != "ON" ]] && xray_color="${RED}OFF${NC}"
+  local ws_color="${GREEN}ON${NC}";   [[ "$ws_on" != "ON" ]] && ws_color="${RED}OFF${NC}"
+  local lb_color="${GREEN}ON${NC}";   [[ "$loadblc_on" != "ON" ]] && lb_color="${RED}OFF${NC}"
+  local zivpn_color="${GREEN}ON${NC}"; [[ "$zivpn_on" != "ON" ]] && zivpn_color="${RED}OFF${NC}"
+  local udphc_color="${GREEN}ON${NC}"; [[ "$udphc_on" != "ON" ]] && udphc_color="${RED}OFF${NC}"
+  local ssh_color="${GREEN}ON${NC}";   [[ "$ssh_on" != "ON" ]] && ssh_color="${RED}OFF${NC}"
+
+  printf "│   XRAY    : ${xray_color}   │ SSH-WS : ${ws_color}    │ LOADBLC : ${lb_color}   \n"
+  printf "│   ZIVPN   : ${zivpn_color}   │ UDPHC  : ${udphc_color}   │ SSH     : ${ssh_color}   \n"
+  printf "│   HEALTH  : ${health_display}${NC} │ \n"
   hr
 
-  section "SERVICES STATUS"
-  printf "│ %-14s : %b │ %-14s : %b │\n" "XRAY"    "$(status_word "$xray_on")"    "SSH-WS" "$(status_word "$ws_on")"
-  printf "│ %-14s : %b │ %-14s : %b │\n" "LOADBLC" "$(status_word "$loadblc_on")" "SSH"    "$(status_word "$ssh_on")"
-  printf "│ %-14s : %b │ %-14s : %b │\n" "ZIVPN"   "$(status_word "$zivpn_on")"   "UDPHC"  "$(status_word "$udphc_on")"
-
-  if [[ "${health}" == "GOOD" ]]; then
-    printf "│ %-18s : ${GREEN}${BOLD}● SYSTEM STABLE${NC}%-23s │\n" "HEALTH" ""
-  else
-    printf "│ %-18s : ${YELLOW}${BOLD}● NEED CHECK${NC}%-26s │\n" "HEALTH" ""
-  fi
+  # Account Summary
+  printf "│ ${CYAN}${BOLD}■ ACCOUNT SUMMARY${NC}${BOLD}${NC}                                   \n"
+  printf "│   SSH/OpenVPN : %-4s     │ VMESS : %-4s     \n" "${c_ssh}" "${c_vmess}"
+  printf "│   VLESS       : %-4s     │ TROJAN: %-4s     \n" "${c_vless}" "${c_trojan}"
   hr
 
-  section "ACCOUNT SUMMARY"
-  row2_plain "SSH / OpenVPN : ${c_ssh}" "VMESS : ${c_vmess}"
-  row2_plain "VLESS         : ${c_vless}" "TROJAN: ${c_trojan}"
-  hr
-
-  section "VERSION & CLIENT"
-  kv "VERSION" "${SCRIPT_VERSION:-unknown}"
-  kv "DISTRIBUSI" "Community / Open Source"
-  kv "CLIENT NAME" "$ip"
-  kv "EXPIRY" "Unlimited"
-
-  printf "└──────────────────────────────────────────────────────────────┘\n"
-  printf "${DIM}  ketik ${BOLD}menu${NC}${DIM} untuk membuka panel utama${NC}\n"
+  # Version & Client
+  printf "│ ${BLUE}${BOLD}■ VERSION & CLIENT${NC}${BOLD}${NC}                                  \n"
+  printf "│   Version     : ${SCRIPT_VERSION:-unknown}${NC}                                 \n"
+  printf "│   Distribusi  : Community / Open Source${NC}                                \n"
+  printf "│   Client Name : ${ip}${NC}                                                \n"
+  printf "│   Expiry In   : Unlimited${NC}                                              \n"
+  printf "└─────────────────────────────────────────────────\n"
+  printf " ─────────────────────────────────────────────────\n"
+  printf "           ${BOLD}to access use 'menu' command${NC}\n"
+  printf " ─────────────────────────────────────────────────\n"
 }
-
 show_combined_online() {
   local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h
   mode="${1:-realtime}"
