@@ -6630,7 +6630,7 @@ read_vnstat_stats() {
 }
 
 draw_dashboard() {
-  local os_name ram_mb swap_mb uptime_s uptime_h uptime_m
+  local os_name ram_used ram_total swap_used swap_total uptime_s uptime_h uptime_m
   local ip city isp udpcustom
   local ssh_on xray_on ws_on loadblc_on zivpn_on udphc_on
   local c_ssh c_vmess c_vless c_trojan
@@ -6638,14 +6638,13 @@ draw_dashboard() {
   local cap_ram_gb cap_cores cap_tier cap_est cap_mode
 
   # =========================
-  # Color definitions
+  # Colors
   # =========================
   local RED='\033[0;31m'
   local GREEN='\033[0;32m'
   local YELLOW='\033[0;33m'
   local BLUE='\033[0;34m'
   local CYAN='\033[0;36m'
-  local MAGENTA='\033[0;35m'
   local WHITE='\033[1;37m'
   local BOLD='\033[1m'
   local DIM='\033[2m'
@@ -6658,59 +6657,52 @@ draw_dashboard() {
     printf "├──────────────────────────────────────────────────────────────┤\n"
   }
 
-  row() {
-    printf "│ %-60b │\n" "$1"
+  # 1 kolom aman
+  row_plain() {
+    printf "│ %-60s │\n" "$1"
   }
 
-  row2() {
-    printf "│ %-28b │ %-27b │\n" "$1" "$2"
+  # label : value aman
+  kv() {
+    local label="$1"
+    local value="$2"
+    printf "│ %-18s : %-38s │\n" "$label" "$value"
   }
 
+  # 2 kolom tanpa warna
+  row2_plain() {
+    printf "│ %-28s │ %-27s │\n" "$1" "$2"
+  }
+
+  # header section
+  section() {
+    printf "│ ${WHITE}${BOLD}%-60s${NC} │\n" "$1"
+  }
+
+  # status warna, tapi jangan dipad ke width besar
   status_word() {
     if [[ "$1" == "ON" ]]; then
-      printf "%bON%b" "${GREEN}${BOLD}" "${NC}"
+      printf "${GREEN}${BOLD}ON${NC}"
     else
-      printf "%bOFF%b" "${RED}${BOLD}" "${NC}"
+      printf "${RED}${BOLD}OFF${NC}"
     fi
   }
 
-  gradient_text() {
-    local text="$1"
-    local colors=(
-      "\033[38;5;39m"
-      "\033[38;5;45m"
-      "\033[38;5;51m"
-      "\033[38;5;50m"
-      "\033[38;5;49m"
-      "\033[38;5;48m"
-    )
-
-    local i=0
-    local out=""
-    local char
-    for ((c=0; c<${#text}; c++)); do
-      char="${text:$c:1}"
-      if [[ "$char" == " " ]]; then
-        out+=" "
-      else
-        out+="${colors[$((i % ${#colors[@]}))]}${char}"
-        ((i++))
-      fi
-    done
-
-    printf "%b${NC}" "$out"
-  }
-
-  pulse_dot() {
-    printf "\033[1;5;32m●\033[0m"
+  gradient_header() {
+    printf "┌──────────────────────────────────────────────────────────────┐\n"
+    printf "│ ${CYAN}${BOLD}SC 1FORCR NEXUS DASHBOARD${NC}%-31s │\n" ""
+    printf "├──────────────────────────────────────────────────────────────┤\n"
   }
 
   # =========================
-  # Data collection
+  # Data
   # =========================
   os_name="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
-  ram_mb="$(free -m 2>/dev/null | awk '/^Mem:/ {print $3 "M / " $2 "M"}')"
-  swap_mb="$(free -m 2>/dev/null | awk '/^Swap:/ {print $3 "M / " $2 "M"}')"
+
+  ram_used="$(free -m 2>/dev/null | awk '/^Mem:/ {print $3 "M"}')"
+  ram_total="$(free -m 2>/dev/null | awk '/^Mem:/ {print $2 "M"}')"
+  swap_used="$(free -m 2>/dev/null | awk '/^Swap:/ {print $3 "M"}')"
+  swap_total="$(free -m 2>/dev/null | awk '/^Swap:/ {print $2 "M"}')"
 
   uptime_s="$(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0)"
   uptime_h="$((uptime_s / 3600))"
@@ -6734,14 +6726,8 @@ draw_dashboard() {
     health="GOOD"
   fi
 
-  local health_display
-  if [[ "${health}" == "GOOD" ]]; then
-    health_display="${GREEN}${BOLD}$(pulse_dot) SYSTEM STABLE${NC}"
-  elif [[ "${health}" == "CHECK" ]]; then
-    health_display="${YELLOW}${BOLD}● NEED CHECK${NC}"
-  else
-    health_display="${RED}${BOLD}● CRITICAL${NC}"
-  fi
+  local health_display="● NEED CHECK"
+  [[ "${health}" == "GOOD" ]] && health_display="● SYSTEM STABLE"
 
   c_ssh="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_sshs;" 2>/dev/null || echo 0)"
   c_vmess="$(sqlite3 "${DB_PATH}" "SELECT COUNT(*) FROM account_vmesses;" 2>/dev/null || echo 0)"
@@ -6757,63 +6743,58 @@ draw_dashboard() {
     cap_mode="MANUAL"
   fi
 
-  local xray_color ws_color lb_color zivpn_color udphc_color ssh_color
-  xray_color="$(status_word "$xray_on")"
-  ws_color="$(status_word "$ws_on")"
-  lb_color="$(status_word "$loadblc_on")"
-  zivpn_color="$(status_word "$zivpn_on")"
-  udphc_color="$(status_word "$udphc_on")"
-  ssh_color="$(status_word "$ssh_on")"
-
   # =========================
-  # Dashboard
+  # Output
   # =========================
-  printf "┌──────────────────────────────────────────────────────────────┐\n"
-  printf "│ %-60b │\n" "$(gradient_text 'SC 1FORCR NEXUS DASHBOARD')"
-  printf "├──────────────────────────────────────────────────────────────┤\n"
+  gradient_header
 
-  row "${WHITE}${BOLD}SYSTEM & NETWORK${NC}"
-  row "OS                : ${os_name}"
-  row "RAM               : ${ram_mb:-"-"}"
-  row "SWAP              : ${swap_mb:-"-"}"
-  row "UPTIME            : ${uptime_h} jam ${uptime_m} menit"
-  row "SPESIFIKASI       : ${cap_ram_gb} GB RAM / ${cap_cores} vCPU"
-  row "AUTO TUNING       : ${cap_mode} (tier ${cap_tier})"
-  row "ESTIMASI AKUN     : sekitar ${cap_est} user"
+  section "SYSTEM & NETWORK"
+  kv "OS" "$os_name"
+  kv "RAM" "${ram_used:-"-"} / ${ram_total:-"-"}"
+  kv "SWAP" "${swap_used:-"-"} / ${swap_total:-"-"}"
+  kv "UPTIME" "${uptime_h} jam ${uptime_m} menit"
+  kv "SPESIFIKASI" "${cap_ram_gb} GB RAM / ${cap_cores} vCPU"
+  kv "AUTO TUNING" "${cap_mode} (tier ${cap_tier})"
+  kv "ESTIMASI AKUN" "sekitar ${cap_est} user"
   hr
 
-  row "${WHITE}${BOLD}LOCATION & ISP${NC}"
-  row "IP PUBLIK         : ${ip}"
-  row "KOTA              : ${city}"
-  row "ISP               : ${isp}"
-  row "DOMAIN            : ${DOMAIN:-"-"}"
+  section "LOCATION & ISP"
+  kv "IP PUBLIK" "$ip"
+  kv "KOTA" "$city"
+  kv "ISP" "$isp"
+  kv "DOMAIN" "${DOMAIN:-"-"}"
   hr
 
-  row "${WHITE}${BOLD}TRAFFIC STATS${NC}"
-  row "BULAN INI         : ${VNSTAT_MONTH_TOTAL:-"-"} [${VNSTAT_MONTH_NAME:-"-"}]"
-  row2 "RX : ${VNSTAT_MONTH_RX:-"-"}" "TX : ${VNSTAT_MONTH_TX:-"-"}"
-  row "HARI INI          : ${VNSTAT_DAY_TOTAL:-"-"} [${VNSTAT_DAY_NAME:-"-"}]"
-  row2 "RX : ${VNSTAT_DAY_RX:-"-"}" "TX : ${VNSTAT_DAY_TX:-"-"}"
-  row "CURRENT RATE      : ${VNSTAT_RATE:-"-"}"
+  section "TRAFFIC STATS"
+  kv "BULAN INI" "${VNSTAT_MONTH_TOTAL:-"-"} [${VNSTAT_MONTH_NAME:-"-"}]"
+  row2_plain "RX : ${VNSTAT_MONTH_RX:-"-"}" "TX : ${VNSTAT_MONTH_TX:-"-"}"
+  kv "HARI INI" "${VNSTAT_DAY_TOTAL:-"-"} [${VNSTAT_DAY_NAME:-"-"}]"
+  row2_plain "RX : ${VNSTAT_DAY_RX:-"-"}" "TX : ${VNSTAT_DAY_TX:-"-"}"
+  kv "CURRENT RATE" "${VNSTAT_RATE:-"-"}"
   hr
 
-  row "${WHITE}${BOLD}SERVICES STATUS${NC}"
-  row2 "XRAY     : ${xray_color}" "SSH-WS   : ${ws_color}"
-  row2 "LOADBLC  : ${lb_color}" "SSH      : ${ssh_color}"
-  row2 "ZIVPN    : ${zivpn_color}" "UDPHC    : ${udphc_color}"
-  row "HEALTH            : ${health_display}"
+  section "SERVICES STATUS"
+  printf "│ %-14s : %b │ %-14s : %b │\n" "XRAY"    "$(status_word "$xray_on")"    "SSH-WS" "$(status_word "$ws_on")"
+  printf "│ %-14s : %b │ %-14s : %b │\n" "LOADBLC" "$(status_word "$loadblc_on")" "SSH"    "$(status_word "$ssh_on")"
+  printf "│ %-14s : %b │ %-14s : %b │\n" "ZIVPN"   "$(status_word "$zivpn_on")"   "UDPHC"  "$(status_word "$udphc_on")"
+
+  if [[ "${health}" == "GOOD" ]]; then
+    printf "│ %-18s : ${GREEN}${BOLD}● SYSTEM STABLE${NC}%-23s │\n" "HEALTH" ""
+  else
+    printf "│ %-18s : ${YELLOW}${BOLD}● NEED CHECK${NC}%-26s │\n" "HEALTH" ""
+  fi
   hr
 
-  row "${WHITE}${BOLD}ACCOUNT SUMMARY${NC}"
-  row2 "SSH / OpenVPN : ${c_ssh}" "VMESS : ${c_vmess}"
-  row2 "VLESS         : ${c_vless}" "TROJAN: ${c_trojan}"
+  section "ACCOUNT SUMMARY"
+  row2_plain "SSH / OpenVPN : ${c_ssh}" "VMESS : ${c_vmess}"
+  row2_plain "VLESS         : ${c_vless}" "TROJAN: ${c_trojan}"
   hr
 
-  row "${WHITE}${BOLD}VERSION & CLIENT${NC}"
-  row "VERSION           : ${SCRIPT_VERSION:-unknown}"
-  row "DISTRIBUSI        : Community / Open Source"
-  row "CLIENT NAME       : ${ip}"
-  row "EXPIRY            : Unlimited"
+  section "VERSION & CLIENT"
+  kv "VERSION" "${SCRIPT_VERSION:-unknown}"
+  kv "DISTRIBUSI" "Community / Open Source"
+  kv "CLIENT NAME" "$ip"
+  kv "EXPIRY" "Unlimited"
 
   printf "└──────────────────────────────────────────────────────────────┘\n"
   printf "${DIM}  ketik ${BOLD}menu${NC}${DIM} untuk membuka panel utama${NC}\n"
