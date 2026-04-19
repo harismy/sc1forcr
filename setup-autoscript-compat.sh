@@ -39,6 +39,7 @@ set -euo pipefail
 #   AUTO_BACKUP_KEEP_DAYS=7                      (opsional)
 #   ONLINE_NOTIFY_ENABLE=1                       (opsional, 1=kirim notifikasi akun online berkala)
 #   ONLINE_NOTIFY_INTERVAL_HOURS=3               (opsional, interval notifikasi online dalam jam)
+#   ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=300      (opsional, jendela realtime XRAY dalam detik)
 #   IPLIMIT_CHECK_INTERVAL_MINUTES=10            (opsional, interval checker iplimit dalam menit)
 #   IPLIMIT_LOCK_MINUTES=15                      (opsional, durasi lock sementara dalam menit)
 #   IPLIMIT_AUTO_TUNE=1                          (opsional, 1=otomatis tuning berbasis RAM/vCPU)
@@ -86,6 +87,7 @@ AUTO_BACKUP_DIR="${AUTO_BACKUP_DIR:-/root/backup-sc-1forcr}"
 AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS:-3}"
+ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-10}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
@@ -1211,6 +1213,7 @@ TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
 TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
 ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
 ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
+ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}
 EOF
 
   cat > "${APP_DIR}/api.js" <<'EOF'
@@ -1252,7 +1255,9 @@ function auth(req, res, next) {
   next();
 }
 function parseIntId(raw) {
-  const n = Number(String(raw ?? '').trim());
+  const s = String(raw ?? '').trim();
+  if (!s) return null;
+  const n = Number(s);
   return Number.isInteger(n) ? n : null;
 }
 function getOwnerInfo(req, body = {}) {
@@ -4623,7 +4628,9 @@ TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
+ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
+[[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
 
 if [[ "${ONLINE_NOTIFY_ENABLE}" != "1" ]]; then
   exit 0
@@ -4667,9 +4674,13 @@ ssh_cnt="$(echo "${ssh_users}" | awk 'NF{n++} END{print n+0}')"
 xray_users=""
 xray_cnt=0
 if [[ -f /var/log/xray/access.log ]]; then
+  xray_cutoff="$(date -d "-${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} seconds" '+%Y/%m/%d %H:%M:%S' 2>/dev/null || true)"
+  [[ -z "${xray_cutoff}" ]] && xray_cutoff="1970/01/01 00:00:00"
   xray_users="$(tail -n 12000 /var/log/xray/access.log 2>/dev/null \
-    | awk '
+    | awk -v cutoff="${xray_cutoff}" '
       {
+        ts = substr($0, 1, 19)
+        if (ts == "" || ts < cutoff) next
         u=""
         if (match($0, /email":"[^"]+"/)) {
           u=substr($0, RSTART, RLENGTH)
@@ -4732,31 +4743,56 @@ if [[ -f "${DB_PATH}" ]]; then
   acct_trojan="$(sqlite3 "${DB_PATH}" "SELECT COUNT(1) FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF';" 2>/dev/null || echo "-")"
 fi
 
-short_list() {
-  local data="$1" max="${2:-12}"
-  echo "${data}" | awk 'NF' | head -n "${max}" | awk 'BEGIN{first=1} {if(!first) printf ", "; printf "%s", $0; first=0} END{print ""}' || true
+count_lines() {
+  local data="$1"
+  echo "${data}" | awk 'NF{n++} END{print n+0}'
 }
 
-msg="SC 1FORCR ONLINE REPORT
-Domain: ${DOMAIN}
-Waktu: $(date '+%F %T')
-Interval: ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
+short_list() {
+  local data="$1" max="${2:-12}" total shown rest base
+  total="$(count_lines "${data}")"
+  [[ -z "${total}" || ! "${total}" =~ ^[0-9]+$ ]] && total="0"
+  shown="${max}"
+  if [[ "${shown}" -gt "${total}" ]]; then
+    shown="${total}"
+  fi
+  if [[ "${shown}" -le 0 ]]; then
+    echo "-"
+    return
+  fi
+  base="$(echo "${data}" | awk 'NF' | head -n "${shown}" | awk 'BEGIN{first=1} {if(!first) printf ", "; printf "%s", $0; first=0} END{print ""}')"
+  rest=$((total - shown))
+  if [[ "${rest}" -gt 0 ]]; then
+    echo "${base} (+${rest} lainnya)"
+  else
+    echo "${base}"
+  fi
+}
 
-Akun aktif DB:
-- SSH/ZIVPN: ${acct_ssh}
-- VMESS: ${acct_vmess}
-- VLESS: ${acct_vless}
-- TROJAN: ${acct_trojan}
+msg="SC 1FORCR | LAPORAN ONLINE
+Domain   : ${DOMAIN}
+Waktu    : $(date '+%F %T')
+Interval : ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
+Window   : ${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} detik (XRAY last seen)
 
-User terdeteksi online:
-- SSH shell: ${ssh_cnt}
-- XRAY (tail log): ${xray_cnt}
-- UDPHC (journal): ${udphc_cnt}
+RINGKASAN AKUN AKTIF (DB)
+- SSH/ZIVPN : ${acct_ssh}
+- VMESS     : ${acct_vmess}
+- VLESS     : ${acct_vless}
+- TROJAN    : ${acct_trojan}
 
-Detail:
-SSH : $(short_list "${ssh_users}" 12)
-XRAY: $(short_list "${xray_users}" 12)
-UDPHC: $(short_list "${udphc_users}" 12)"
+ONLINE TERDETEKSI
+- SSH shell : ${ssh_cnt}
+  User      : $(short_list "${ssh_users}" 10)
+- XRAY log  : ${xray_cnt}
+  User      : $(short_list "${xray_users}" 10)
+- UDPHC log : ${udphc_cnt}
+  User      : $(short_list "${udphc_users}" 10)
+
+Catatan:
+- SSH dari sesi shell aktif saat ini.
+- XRAY dihitung dari last seen pada jendela realtime.
+- UDPHC dihitung dari state connect/disconnect pada log."
 
 send_tg "${msg}"
 EOF
@@ -4829,6 +4865,7 @@ AUTO_BACKUP_DIR=${AUTO_BACKUP_DIR}
 AUTO_BACKUP_KEEP_DAYS=${AUTO_BACKUP_KEEP_DAYS}
 ONLINE_NOTIFY_ENABLE=${ONLINE_NOTIFY_ENABLE}
 ONLINE_NOTIFY_INTERVAL_HOURS=${ONLINE_NOTIFY_INTERVAL_HOURS}
+ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}
 IPLIMIT_CHECK_INTERVAL_MINUTES=${IPLIMIT_CHECK_INTERVAL_MINUTES}
 IPLIMIT_LOCK_MINUTES=${IPLIMIT_LOCK_MINUTES}
 IPLIMIT_AUTO_TUNE=${IPLIMIT_AUTO_TUNE}
@@ -4863,6 +4900,7 @@ UDPCUSTOM_DNAT_RANGE="${UDPCUSTOM_DNAT_RANGE:-}"
 UDPCUSTOM_DNAT_AUTO_RANGE="${UDPCUSTOM_DNAT_AUTO_RANGE:-6000:6999}"
 ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE:-1}"
 ONLINE_NOTIFY_INTERVAL_HOURS="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
+ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
 DROPBEAR_LOG_MAX_LINES="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9')"
 DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
@@ -4881,6 +4919,7 @@ xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-1}" | tr -cd '0-9')"
 [[ -z "${xray_min_hits_per_ip}" || "${xray_min_hits_per_ip}" -lt 1 ]] && xray_min_hits_per_ip="1"
 [[ "${ONLINE_NOTIFY_ENABLE}" != "0" ]] && ONLINE_NOTIFY_ENABLE="1"
 [[ -z "${ONLINE_NOTIFY_INTERVAL_HOURS}" || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -lt 1 || "${ONLINE_NOTIFY_INTERVAL_HOURS}" -gt 168 ]] && ONLINE_NOTIFY_INTERVAL_HOURS="3"
+[[ -z "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -lt 60 || "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" -gt 86400 ]] && ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="300"
 
 api_call() {
   local method="$1" path="$2" data="${3:-}"
@@ -5772,15 +5811,18 @@ set_iplimit_checker_config_menu() {
 }
 
 set_online_notify_config_menu() {
-  local current_enable current_interval enable_in interval_in
+  local current_enable current_interval current_window enable_in interval_in window_in
   current_enable="${ONLINE_NOTIFY_ENABLE:-1}"
   [[ "${current_enable}" != "0" ]] && current_enable="1"
   current_interval="$(echo "${ONLINE_NOTIFY_INTERVAL_HOURS:-3}" | tr -cd '0-9')"
+  current_window="$(echo "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS:-300}" | tr -cd '0-9')"
   [[ -z "${current_interval}" || "${current_interval}" -lt 1 || "${current_interval}" -gt 168 ]] && current_interval="3"
+  [[ -z "${current_window}" || "${current_window}" -lt 60 || "${current_window}" -gt 86400 ]] && current_window="300"
 
   echo "=== SETTING NOTIF AKUN ONLINE ==="
   echo "Status saat ini    : $([[ "${current_enable}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
   echo "Interval saat ini  : ${current_interval} jam"
+  echo "Window realtime    : ${current_window} detik (XRAY last seen)"
   echo
   echo "Kosongkan input untuk mempertahankan nilai lama."
   echo "Ketik 'batal' untuk kembali."
@@ -5809,12 +5851,25 @@ set_online_notify_config_menu() {
     return
   fi
 
+  if ! prompt_input window_in "Window realtime XRAY (detik) [${current_window}]: "; then
+    return
+  fi
+  [[ "${window_in,,}" == "batal" ]] && return
+  window_in="${window_in:-${current_window}}"
+  if [[ ! "${window_in}" =~ ^[0-9]+$ || "${window_in}" -lt 60 || "${window_in}" -gt 86400 ]]; then
+    echo "Window realtime harus angka 60-86400 detik."
+    return
+  fi
+
   ONLINE_NOTIFY_ENABLE="${enable_in}"
   ONLINE_NOTIFY_INTERVAL_HOURS="${interval_in}"
+  ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${window_in}"
   update_sc_env_var "ONLINE_NOTIFY_ENABLE" "${ONLINE_NOTIFY_ENABLE}"
   update_sc_env_var "ONLINE_NOTIFY_INTERVAL_HOURS" "${ONLINE_NOTIFY_INTERVAL_HOURS}"
+  update_sc_env_var "ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS" "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}"
   update_app_env_var "ONLINE_NOTIFY_ENABLE" "${ONLINE_NOTIFY_ENABLE}"
   update_app_env_var "ONLINE_NOTIFY_INTERVAL_HOURS" "${ONLINE_NOTIFY_INTERVAL_HOURS}"
+  update_app_env_var "ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS" "${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}"
   write_online_notify_timer_unit "${ONLINE_NOTIFY_INTERVAL_HOURS}"
 
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -5830,6 +5885,7 @@ set_online_notify_config_menu() {
   echo "Berhasil update notif akun online:"
   echo "- Status   : $([[ "${ONLINE_NOTIFY_ENABLE}" == "1" ]] && echo AKTIF || echo NONAKTIF)"
   echo "- Interval : ${ONLINE_NOTIFY_INTERVAL_HOURS} jam"
+  echo "- Window   : ${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} detik"
 }
 
 tools_menu() {
@@ -7772,6 +7828,7 @@ Time: $(date '+%F %T')"
     AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS}" \
     ONLINE_NOTIFY_ENABLE="${ONLINE_NOTIFY_ENABLE}" \
     ONLINE_NOTIFY_INTERVAL_HOURS="${ONLINE_NOTIFY_INTERVAL_HOURS}" \
+    ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS="${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}" \
     ACTIVE_UDP_BACKEND="${active_backend}" \
     bash "${tmp}"; then
     echo "Update script gagal dijalankan."
@@ -7826,7 +7883,7 @@ Version: ${new_ver}
 Time: ${ts_now}
 Checker IP Limit: ${IPLIMIT_CHECK_INTERVAL_MINUTES}m/${IPLIMIT_LOCK_MINUTES}m
 Auto Backup: ${AUTO_BACKUP_ENABLE}
-Online Notify: ${ONLINE_NOTIFY_ENABLE}/${ONLINE_NOTIFY_INTERVAL_HOURS}h"
+Online Notify: ${ONLINE_NOTIFY_ENABLE}/${ONLINE_NOTIFY_INTERVAL_HOURS}h window=${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS}s"
   telegram_notify "${update_note}"
 
   rm -f "${tmp}" "${banner_html}" "${banner_txt}" >/dev/null 2>&1 || true
