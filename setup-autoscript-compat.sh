@@ -40,16 +40,16 @@ set -euo pipefail
 #   IPLIMIT_CHECK_INTERVAL_MINUTES=10            (opsional, interval checker iplimit dalam menit)
 #   IPLIMIT_LOCK_MINUTES=15                      (opsional, durasi lock sementara dalam menit)
 #   IPLIMIT_AUTO_TUNE=1                          (opsional, 1=otomatis tuning berbasis RAM/vCPU)
-#   IPLIMIT_DEBUG=0                              (opsional, 0=hemat log, 1=debug detail)
+#   IPLIMIT_DEBUG=1                              (opsional, 0=hemat log, 1=debug detail)
 #   DROPBEAR_LOG_MAX_LINES=auto                  (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   DROPBEAR_RECENT_LOG_MAX_LINES=auto           (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   UDPHC_LOG_LINES_HISTORY=auto                 (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   UDPHC_LOG_LINES_REALTIME=auto                (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   UDPHC_LOG_LINES_CHECKER=auto                 (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   XRAY_BLOCK_TCP_PORTS=80,443                  (opsional, port TCP yang diblok saat lock tmp xray)
-#   XRAY_RECENT_WINDOW_MINUTES=30                (opsional, jendela menit log xray untuk hitung multi-login)
-#   XRAY_ACTIVE_WINDOW_SECONDS=120               (opsional, jendela detik untuk IP aktif xray)
-#   XRAY_MIN_HITS_PER_IP=2                       (opsional, minimal hit/log per IP pada jendela aktif)
+#   XRAY_RECENT_WINDOW_MINUTES=60                (opsional, jendela menit log xray untuk hitung multi-login)
+#   XRAY_ACTIVE_WINDOW_SECONDS=600               (opsional, jendela detik untuk IP aktif xray)
+#   XRAY_MIN_HITS_PER_IP=1                       (opsional, minimal hit/log per IP pada jendela aktif)
 #   DB_PATH=/usr/sbin/potatonc/potato.db
 #   APP_DIR=/opt/sc-1forcr
 
@@ -85,16 +85,16 @@ AUTO_BACKUP_KEEP_DAYS="${AUTO_BACKUP_KEEP_DAYS:-7}"
 IPLIMIT_CHECK_INTERVAL_MINUTES="${IPLIMIT_CHECK_INTERVAL_MINUTES:-10}"
 IPLIMIT_LOCK_MINUTES="${IPLIMIT_LOCK_MINUTES:-15}"
 IPLIMIT_AUTO_TUNE="${IPLIMIT_AUTO_TUNE:-1}"
-IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-}"
+IPLIMIT_DEBUG="${IPLIMIT_DEBUG:-1}"
 DROPBEAR_LOG_MAX_LINES="${DROPBEAR_LOG_MAX_LINES:-}"
 DROPBEAR_RECENT_LOG_MAX_LINES="${DROPBEAR_RECENT_LOG_MAX_LINES:-}"
 UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-}"
 UDPHC_LOG_LINES_REALTIME="${UDPHC_LOG_LINES_REALTIME:-}"
 UDPHC_LOG_LINES_CHECKER="${UDPHC_LOG_LINES_CHECKER:-}"
 XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
-XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-30}"
-XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-120}"
-XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-2}"
+XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-60}"
+XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-600}"
+XRAY_MIN_HITS_PER_IP="${XRAY_MIN_HITS_PER_IP:-1}"
 SSH_HC_AUTH_LOOKBACK_HOURS="${SSH_HC_AUTH_LOOKBACK_HOURS:-24}"
 
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
@@ -158,7 +158,7 @@ get_cpu_cores() {
 
 auto_tune_iplimit_vars() {
   local profile_debug profile_dropbear profile_recent profile_udphc_hist profile_udphc_rt profile_udphc_checker profile_users
-  profile_debug="0"
+  profile_debug="1"
   profile_dropbear="12000"
   profile_recent="5000"
   profile_udphc_hist="1200"
@@ -1276,6 +1276,20 @@ function ymdPlusDays(days, baseYmd = '') {
   d.setDate(d.getDate() + Number(days || 0));
   return ymdLocal(d);
 }
+function datetimeLocal(d) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  const ss = String(d.getSeconds()).padStart(2, '0');
+  return `${y}-${m}-${day} ${hh}:${mm}:${ss}`;
+}
+function dateExpPlusMinutes(minutes) {
+  const m = Number(minutes || 0);
+  const d = new Date(Date.now() + Math.max(1, m) * 60 * 1000);
+  return datetimeLocal(d);
+}
 function nowTime() {
   return new Date().toTimeString().slice(0, 8);
 }
@@ -1429,7 +1443,9 @@ async function syncSshBackendsFromDb() {
     const rows = await all(
       "SELECT username, password FROM account_sshs " +
       "WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' " +
-      "AND (TRIM(COALESCE(date_exp,''))='' OR date(date_exp) > date('now','localtime')) " +
+      "AND (TRIM(COALESCE(date_exp,''))='' " +
+      "OR (LENGTH(TRIM(COALESCE(date_exp,''))) > 10 AND datetime(date_exp) > datetime('now','localtime')) " +
+      "OR (LENGTH(TRIM(COALESCE(date_exp,''))) <= 10 AND date(date_exp) > date('now','localtime'))) " +
       "ORDER BY LOWER(username)"
     );
     const zivpnUsers = [];
@@ -1627,8 +1643,9 @@ async function createOrUpdateSshFromBody(req, body, forcedDays = null) {
   const limitip = Number(body?.limitip || 0);
   if (!username) throw new Error('username required');
   await ensureUsernameNotExists('account_sshs', username);
-  const expDate = ymdPlusDays(expDays);
-  ensureLinuxUser(username, password, expDate);
+  const expDate = isTrial ? dateExpPlusMinutes(60) : ymdPlusDays(expDays);
+  const linuxExpDate = isTrial ? ymdLocal(new Date(Date.now() + 60 * 60 * 1000)) : expDate;
+  ensureLinuxUser(username, password, linuxExpDate);
   await run(
     "INSERT INTO account_sshs(username,password,date_exp,status,quota,limitip,owner_telegram_id,owner_telegram_chat_id) VALUES(?,?,?,?,?,?,?,?)",
     [username, password, expDate, 'AKTIF', quota, limitip, owner.ownerTelegramId, owner.ownerTelegramChatId]
@@ -1769,7 +1786,7 @@ async function createXray(req, protocol, username, expDays, quota, limitip, tria
     finalUsername = await generateTrialUsername(protocolTable[protocol], 'trial');
   }
   if (!finalUsername) throw new Error('username required');
-  const expDate = ymdPlusDays(trial ? 1 : expDays);
+  const expDate = trial ? dateExpPlusMinutes(60) : ymdPlusDays(expDays);
   let data = null;
   if (protocol === 'vmess') {
     await ensureUsernameNotExists('account_vmesses', finalUsername);
@@ -2397,18 +2414,18 @@ const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443'
   .split(',')
   .map((v) => Number(String(v || '').trim()))
   .filter((n) => Number.isInteger(n) && n >= 1 && n <= 65535);
-const XRAY_RECENT_WINDOW_MINUTES_RAW = Number(process.env.XRAY_RECENT_WINDOW_MINUTES || (CHECK_INTERVAL_MINUTES * 3));
+const XRAY_RECENT_WINDOW_MINUTES_RAW = Number(process.env.XRAY_RECENT_WINDOW_MINUTES || 60);
 const XRAY_RECENT_WINDOW_MINUTES = Number.isFinite(XRAY_RECENT_WINDOW_MINUTES_RAW) && XRAY_RECENT_WINDOW_MINUTES_RAW >= 5
   ? Math.min(Math.floor(XRAY_RECENT_WINDOW_MINUTES_RAW), 1440)
-  : Math.max(10, CHECK_INTERVAL_MINUTES * 3);
-const XRAY_ACTIVE_WINDOW_SECONDS_RAW = Number(process.env.XRAY_ACTIVE_WINDOW_SECONDS || 120);
+  : 60;
+const XRAY_ACTIVE_WINDOW_SECONDS_RAW = Number(process.env.XRAY_ACTIVE_WINDOW_SECONDS || 600);
 const XRAY_ACTIVE_WINDOW_SECONDS = Number.isFinite(XRAY_ACTIVE_WINDOW_SECONDS_RAW) && XRAY_ACTIVE_WINDOW_SECONDS_RAW >= 30
   ? Math.min(Math.floor(XRAY_ACTIVE_WINDOW_SECONDS_RAW), 1800)
-  : 120;
-const XRAY_MIN_HITS_PER_IP_RAW = Number(process.env.XRAY_MIN_HITS_PER_IP || 2);
+  : 600;
+const XRAY_MIN_HITS_PER_IP_RAW = Number(process.env.XRAY_MIN_HITS_PER_IP || 1);
 const XRAY_MIN_HITS_PER_IP = Number.isFinite(XRAY_MIN_HITS_PER_IP_RAW) && XRAY_MIN_HITS_PER_IP_RAW >= 1
   ? Math.min(Math.floor(XRAY_MIN_HITS_PER_IP_RAW), 20)
-  : 2;
+  : 1;
 const XRAY_LOG_TAIL_LINES_RAW = Number(process.env.XRAY_LOG_TAIL_LINES || 8000);
 const XRAY_LOG_TAIL_LINES = Number.isFinite(XRAY_LOG_TAIL_LINES_RAW) && XRAY_LOG_TAIL_LINES_RAW >= 1000
   ? Math.min(Math.floor(XRAY_LOG_TAIL_LINES_RAW), 60000)
@@ -2426,7 +2443,7 @@ const UDPHC_LOG_LINES_CHECKER_RAW = Number(process.env.UDPHC_LOG_LINES_CHECKER |
 const UDPHC_LOG_LINES_CHECKER = Number.isFinite(UDPHC_LOG_LINES_CHECKER_RAW) && UDPHC_LOG_LINES_CHECKER_RAW >= 1000
   ? Math.min(Math.floor(UDPHC_LOG_LINES_CHECKER_RAW), 60000)
   : 6000;
-const IPLIMIT_DEBUG = String(process.env.IPLIMIT_DEBUG || '0').trim() === '1';
+const IPLIMIT_DEBUG = String(process.env.IPLIMIT_DEBUG || '1').trim() === '1';
 const UDPCUSTOM_LOG_UNITS = Array.from(new Set([
   UDPCUSTOM_SERVICE,
   'sc-1forcr-udpcustom',
@@ -3304,6 +3321,13 @@ function ymdLocalNow() {
 
 function isExpiredDate(dateExp, todayYmd = '') {
   const v = String(dateExp || '').trim();
+  if (!v) return false;
+  if (/^\d{4}-\d{2}-\d{2}[ T][0-9]{2}:[0-9]{2}(:[0-9]{2})?$/.test(v)) {
+    const iso = v.includes('T') ? v : v.replace(' ', 'T');
+    const ts = new Date(iso).getTime();
+    if (!Number.isFinite(ts)) return false;
+    return Date.now() >= ts;
+  }
   if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
   const today = String(todayYmd || ymdLocalNow()).trim();
   if (!/^\d{4}-\d{2}-\d{2}$/.test(today)) return false;
@@ -4482,17 +4506,17 @@ DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" |
 UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_REALTIME="$(echo "${UDPHC_LOG_LINES_REALTIME:-400}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_CHECKER="$(echo "${UDPHC_LOG_LINES_CHECKER:-6000}" | tr -cd '0-9')"
-xray_recent_window_min="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-30}" | tr -cd '0-9')"
-xray_active_window_sec="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-120}" | tr -cd '0-9')"
-xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-2}" | tr -cd '0-9')"
+xray_recent_window_min="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-60}" | tr -cd '0-9')"
+xray_active_window_sec="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-600}" | tr -cd '0-9')"
+xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-1}" | tr -cd '0-9')"
 [[ -z "${DROPBEAR_LOG_MAX_LINES}" || "${DROPBEAR_LOG_MAX_LINES}" -lt 2000 ]] && DROPBEAR_LOG_MAX_LINES="12000"
 [[ -z "${DROPBEAR_RECENT_LOG_MAX_LINES}" || "${DROPBEAR_RECENT_LOG_MAX_LINES}" -lt 500 ]] && DROPBEAR_RECENT_LOG_MAX_LINES="5000"
 [[ -z "${UDPHC_LOG_LINES_HISTORY}" || "${UDPHC_LOG_LINES_HISTORY}" -lt 200 ]] && UDPHC_LOG_LINES_HISTORY="1200"
 [[ -z "${UDPHC_LOG_LINES_REALTIME}" || "${UDPHC_LOG_LINES_REALTIME}" -lt 100 ]] && UDPHC_LOG_LINES_REALTIME="400"
 [[ -z "${UDPHC_LOG_LINES_CHECKER}" || "${UDPHC_LOG_LINES_CHECKER}" -lt 1000 ]] && UDPHC_LOG_LINES_CHECKER="6000"
-[[ -z "${xray_recent_window_min}" || "${xray_recent_window_min}" -lt 5 ]] && xray_recent_window_min="30"
-[[ -z "${xray_active_window_sec}" || "${xray_active_window_sec}" -lt 30 ]] && xray_active_window_sec="120"
-[[ -z "${xray_min_hits_per_ip}" || "${xray_min_hits_per_ip}" -lt 1 ]] && xray_min_hits_per_ip="2"
+[[ -z "${xray_recent_window_min}" || "${xray_recent_window_min}" -lt 5 ]] && xray_recent_window_min="60"
+[[ -z "${xray_active_window_sec}" || "${xray_active_window_sec}" -lt 30 ]] && xray_active_window_sec="600"
+[[ -z "${xray_min_hits_per_ip}" || "${xray_min_hits_per_ip}" -lt 1 ]] && xray_min_hits_per_ip="1"
 
 api_call() {
   local method="$1" path="$2" data="${3:-}"
