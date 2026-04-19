@@ -45,6 +45,7 @@ set -euo pipefail
 #   DROPBEAR_RECENT_LOG_MAX_LINES=auto           (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   UDPHC_LOG_LINES_HISTORY=auto                 (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   UDPHC_LOG_LINES_REALTIME=auto                (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
+#   UDPHC_LOG_LINES_CHECKER=auto                 (opsional, auto by specs jika IPLIMIT_AUTO_TUNE=1)
 #   XRAY_BLOCK_TCP_PORTS=80,443                  (opsional, port TCP yang diblok saat lock tmp xray)
 #   XRAY_RECENT_WINDOW_MINUTES=30                (opsional, jendela menit log xray untuk hitung multi-login)
 #   XRAY_ACTIVE_WINDOW_SECONDS=120               (opsional, jendela detik untuk IP aktif xray)
@@ -89,6 +90,7 @@ DROPBEAR_LOG_MAX_LINES="${DROPBEAR_LOG_MAX_LINES:-}"
 DROPBEAR_RECENT_LOG_MAX_LINES="${DROPBEAR_RECENT_LOG_MAX_LINES:-}"
 UDPHC_LOG_LINES_HISTORY="${UDPHC_LOG_LINES_HISTORY:-}"
 UDPHC_LOG_LINES_REALTIME="${UDPHC_LOG_LINES_REALTIME:-}"
+UDPHC_LOG_LINES_CHECKER="${UDPHC_LOG_LINES_CHECKER:-}"
 XRAY_BLOCK_TCP_PORTS="${XRAY_BLOCK_TCP_PORTS:-80,443}"
 XRAY_RECENT_WINDOW_MINUTES="${XRAY_RECENT_WINDOW_MINUTES:-30}"
 XRAY_ACTIVE_WINDOW_SECONDS="${XRAY_ACTIVE_WINDOW_SECONDS:-120}"
@@ -155,12 +157,13 @@ get_cpu_cores() {
 }
 
 auto_tune_iplimit_vars() {
-  local profile_debug profile_dropbear profile_recent profile_udphc_hist profile_udphc_rt profile_users
+  local profile_debug profile_dropbear profile_recent profile_udphc_hist profile_udphc_rt profile_udphc_checker profile_users
   profile_debug="0"
   profile_dropbear="12000"
   profile_recent="5000"
   profile_udphc_hist="1200"
   profile_udphc_rt="400"
+  profile_udphc_checker="6000"
   profile_users="80-100"
 
   if [[ "$(normalize_bool_01 "${IPLIMIT_AUTO_TUNE}")" == "1" ]]; then
@@ -180,18 +183,21 @@ auto_tune_iplimit_vars() {
       profile_recent="14000"
       profile_udphc_hist="3200"
       profile_udphc_rt="1000"
+      profile_udphc_checker="18000"
       profile_users="220-300"
     elif (( tier >= 4 )); then
       profile_dropbear="22000"
       profile_recent="9000"
       profile_udphc_hist="2200"
       profile_udphc_rt="700"
+      profile_udphc_checker="12000"
       profile_users="150-220"
     elif (( tier >= 2 )); then
       profile_dropbear="16000"
       profile_recent="6500"
       profile_udphc_hist="1600"
       profile_udphc_rt="500"
+      profile_udphc_checker="8000"
       profile_users="100-150"
     fi
     log "IPLIMIT auto-tune aktif: RAM=${ram_gb}GB vCPU=${cores} tier=${tier} target_user~${profile_users}"
@@ -202,16 +208,19 @@ auto_tune_iplimit_vars() {
   [[ -z "${DROPBEAR_RECENT_LOG_MAX_LINES}" ]] && DROPBEAR_RECENT_LOG_MAX_LINES="${profile_recent}"
   [[ -z "${UDPHC_LOG_LINES_HISTORY}" ]] && UDPHC_LOG_LINES_HISTORY="${profile_udphc_hist}"
   [[ -z "${UDPHC_LOG_LINES_REALTIME}" ]] && UDPHC_LOG_LINES_REALTIME="${profile_udphc_rt}"
+  [[ -z "${UDPHC_LOG_LINES_CHECKER}" ]] && UDPHC_LOG_LINES_CHECKER="${profile_udphc_checker}"
 
   IPLIMIT_DEBUG="$(normalize_bool_01 "${IPLIMIT_DEBUG}")"
   DROPBEAR_LOG_MAX_LINES="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9')"
   DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
   UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
   UDPHC_LOG_LINES_REALTIME="$(echo "${UDPHC_LOG_LINES_REALTIME:-400}" | tr -cd '0-9')"
+  UDPHC_LOG_LINES_CHECKER="$(echo "${UDPHC_LOG_LINES_CHECKER:-6000}" | tr -cd '0-9')"
   [[ -z "${DROPBEAR_LOG_MAX_LINES}" || "${DROPBEAR_LOG_MAX_LINES}" -lt 2000 ]] && DROPBEAR_LOG_MAX_LINES="12000"
   [[ -z "${DROPBEAR_RECENT_LOG_MAX_LINES}" || "${DROPBEAR_RECENT_LOG_MAX_LINES}" -lt 500 ]] && DROPBEAR_RECENT_LOG_MAX_LINES="5000"
   [[ -z "${UDPHC_LOG_LINES_HISTORY}" || "${UDPHC_LOG_LINES_HISTORY}" -lt 200 ]] && UDPHC_LOG_LINES_HISTORY="1200"
   [[ -z "${UDPHC_LOG_LINES_REALTIME}" || "${UDPHC_LOG_LINES_REALTIME}" -lt 100 ]] && UDPHC_LOG_LINES_REALTIME="400"
+  [[ -z "${UDPHC_LOG_LINES_CHECKER}" || "${UDPHC_LOG_LINES_CHECKER}" -lt 1000 ]] && UDPHC_LOG_LINES_CHECKER="6000"
   return 0
 }
 
@@ -1188,6 +1197,7 @@ DROPBEAR_LOG_MAX_LINES=${DROPBEAR_LOG_MAX_LINES}
 DROPBEAR_RECENT_LOG_MAX_LINES=${DROPBEAR_RECENT_LOG_MAX_LINES}
 UDPHC_LOG_LINES_HISTORY=${UDPHC_LOG_LINES_HISTORY}
 UDPHC_LOG_LINES_REALTIME=${UDPHC_LOG_LINES_REALTIME}
+UDPHC_LOG_LINES_CHECKER=${UDPHC_LOG_LINES_CHECKER}
 XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
 XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
@@ -2382,6 +2392,7 @@ const CHECK_INTERVAL_MINUTES = Number.isFinite(CHECK_INTERVAL_MINUTES_RAW) && CH
 const LOCK_MINUTES_RAW = Number(process.env.IPLIMIT_LOCK_MINUTES || 15);
 const LOCK_MINUTES = Number.isFinite(LOCK_MINUTES_RAW) && LOCK_MINUTES_RAW > 0 ? Math.floor(LOCK_MINUTES_RAW) : 15;
 const LOCK_SECONDS = LOCK_MINUTES * 60;
+const LOCK_RECHECK_GRACE_SECONDS = Math.max(180, CHECK_INTERVAL_MINUTES * 120);
 const XRAY_BLOCK_TCP_PORTS = String(process.env.XRAY_BLOCK_TCP_PORTS || '80,443')
   .split(',')
   .map((v) => Number(String(v || '').trim()))
@@ -2411,6 +2422,10 @@ const DROPBEAR_RECENT_LOG_MAX_LINES_RAW = Number(process.env.DROPBEAR_RECENT_LOG
 const DROPBEAR_RECENT_LOG_MAX_LINES = Number.isFinite(DROPBEAR_RECENT_LOG_MAX_LINES_RAW) && DROPBEAR_RECENT_LOG_MAX_LINES_RAW >= 500
   ? Math.min(Math.floor(DROPBEAR_RECENT_LOG_MAX_LINES_RAW), 30000)
   : 5000;
+const UDPHC_LOG_LINES_CHECKER_RAW = Number(process.env.UDPHC_LOG_LINES_CHECKER || 6000);
+const UDPHC_LOG_LINES_CHECKER = Number.isFinite(UDPHC_LOG_LINES_CHECKER_RAW) && UDPHC_LOG_LINES_CHECKER_RAW >= 1000
+  ? Math.min(Math.floor(UDPHC_LOG_LINES_CHECKER_RAW), 60000)
+  : 6000;
 const IPLIMIT_DEBUG = String(process.env.IPLIMIT_DEBUG || '0').trim() === '1';
 const UDPCUSTOM_LOG_UNITS = Array.from(new Set([
   UDPCUSTOM_SERVICE,
@@ -2805,7 +2820,7 @@ function parseSshAndUdpUsage() {
     try {
       udphcLog = execFileSync(
         'journalctl',
-        ['-u', unit, '-n', '25000', '--no-pager'],
+        ['-u', unit, '-n', String(UDPHC_LOG_LINES_CHECKER), '--no-pager'],
         { encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 }
       );
     } catch (_) {}
@@ -3310,6 +3325,17 @@ async function ensureTables() {
     ip TEXT NOT NULL,
     PRIMARY KEY (account_type, username, ip)
   )`);
+  await run(`CREATE TABLE IF NOT EXISTS temp_ip_lock_grace (
+    account_type TEXT NOT NULL,
+    username TEXT NOT NULL,
+    grace_until INTEGER NOT NULL,
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (account_type, username)
+  )`);
+}
+
+async function cleanupExpiredGrace(nowTs) {
+  await run("DELETE FROM temp_ip_lock_grace WHERE grace_until <= ?", [nowTs]).catch(() => {});
 }
 
 async function enforceExpiredAccounts() {
@@ -3436,6 +3462,10 @@ async function unlockExpired(nowTs) {
     }
     await run("DELETE FROM temp_ip_lock_ips WHERE account_type=? AND username=?", [t, u]).catch(() => {});
     await run("DELETE FROM temp_ip_locks WHERE account_type=? AND username=?", [t, u]).catch(() => {});
+    await run(
+      "INSERT OR REPLACE INTO temp_ip_lock_grace(account_type, username, grace_until) VALUES(?, ?, ?)",
+      [t, u, nowTs + LOCK_RECHECK_GRACE_SECONDS]
+    ).catch(() => {});
   }
   return { zivpnChanged, udpcustomChanged, xrayChanged };
 }
@@ -3454,6 +3484,17 @@ async function lockIfExceeded(nowTs) {
   let zivpnChanged = false;
   let udpcustomChanged = false;
   let xrayChanged = false;
+  const graceRows = await all(
+    "SELECT account_type, username, grace_until FROM temp_ip_lock_grace WHERE grace_until > ?",
+    [nowTs]
+  ).catch(() => []);
+  const graceMap = new Map();
+  for (const g of graceRows) {
+    const t = String(g?.account_type || '').trim().toLowerCase();
+    const u = String(g?.username || '').trim().toLowerCase();
+    if (!t || !u) continue;
+    graceMap.set(`${t}|${u}`, Number(g?.grace_until || 0));
+  }
 
   const sshRows = await all("SELECT username, password, limitip FROM account_sshs WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF' AND CAST(COALESCE(limitip,0) AS INTEGER) > 0");
   for (const r of sshRows) {
@@ -3502,6 +3543,7 @@ async function lockIfExceeded(nowTs) {
       console.log(`[iplimit-debug][ssh] user=${user} lim=${lim} cntIp=${cntIp} cntSession=${cntSession} cntWsPorts=${cntWsPorts} cntUdphc=${cntUdphc} cntUdphcIp=${cntUdphcIp} cntProc=${cntProc} cntRecent=${cntRecent} cnt=${cnt}`);
     }
     if (cnt <= lim) continue;
+    if (graceMap.has(`ssh|${userKey}`)) continue;
     const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type='ssh' AND username=?", [user]);
     if (exists) continue;
 
@@ -3557,6 +3599,7 @@ async function lockIfExceeded(nowTs) {
         console.log(`[iplimit-debug][${item.type}] user=${user} lim=${lim} cnt=${cnt} ips=${ips}`);
       }
       if (cnt <= lim) continue;
+      if (graceMap.has(`${item.type}|${userKey}`)) continue;
       const exists = await get("SELECT 1 AS ok FROM temp_ip_locks WHERE account_type=? AND username=?", [item.type, user]);
       if (exists) continue;
       const lockIps = Array.from(lockIpSet);
@@ -3624,6 +3667,7 @@ async function rebuildXrayFromDb() {
 async function main() {
   const now = Math.floor(Date.now() / 1000);
   await ensureTables();
+  await cleanupExpiredGrace(now);
   const e = await enforceExpiredAccounts();
   const u = await unlockExpired(now);
   const l = await lockIfExceeded(now);
@@ -4409,6 +4453,7 @@ DROPBEAR_LOG_MAX_LINES=${DROPBEAR_LOG_MAX_LINES}
 DROPBEAR_RECENT_LOG_MAX_LINES=${DROPBEAR_RECENT_LOG_MAX_LINES}
 UDPHC_LOG_LINES_HISTORY=${UDPHC_LOG_LINES_HISTORY}
 UDPHC_LOG_LINES_REALTIME=${UDPHC_LOG_LINES_REALTIME}
+UDPHC_LOG_LINES_CHECKER=${UDPHC_LOG_LINES_CHECKER}
 XRAY_BLOCK_TCP_PORTS=${XRAY_BLOCK_TCP_PORTS}
 XRAY_RECENT_WINDOW_MINUTES=${XRAY_RECENT_WINDOW_MINUTES}
 XRAY_ACTIVE_WINDOW_SECONDS=${XRAY_ACTIVE_WINDOW_SECONDS}
@@ -4436,6 +4481,7 @@ DROPBEAR_LOG_MAX_LINES="$(echo "${DROPBEAR_LOG_MAX_LINES:-12000}" | tr -cd '0-9'
 DROPBEAR_RECENT_LOG_MAX_LINES="$(echo "${DROPBEAR_RECENT_LOG_MAX_LINES:-5000}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_HISTORY="$(echo "${UDPHC_LOG_LINES_HISTORY:-1200}" | tr -cd '0-9')"
 UDPHC_LOG_LINES_REALTIME="$(echo "${UDPHC_LOG_LINES_REALTIME:-400}" | tr -cd '0-9')"
+UDPHC_LOG_LINES_CHECKER="$(echo "${UDPHC_LOG_LINES_CHECKER:-6000}" | tr -cd '0-9')"
 xray_recent_window_min="$(echo "${XRAY_RECENT_WINDOW_MINUTES:-30}" | tr -cd '0-9')"
 xray_active_window_sec="$(echo "${XRAY_ACTIVE_WINDOW_SECONDS:-120}" | tr -cd '0-9')"
 xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-2}" | tr -cd '0-9')"
@@ -4443,6 +4489,7 @@ xray_min_hits_per_ip="$(echo "${XRAY_MIN_HITS_PER_IP:-2}" | tr -cd '0-9')"
 [[ -z "${DROPBEAR_RECENT_LOG_MAX_LINES}" || "${DROPBEAR_RECENT_LOG_MAX_LINES}" -lt 500 ]] && DROPBEAR_RECENT_LOG_MAX_LINES="5000"
 [[ -z "${UDPHC_LOG_LINES_HISTORY}" || "${UDPHC_LOG_LINES_HISTORY}" -lt 200 ]] && UDPHC_LOG_LINES_HISTORY="1200"
 [[ -z "${UDPHC_LOG_LINES_REALTIME}" || "${UDPHC_LOG_LINES_REALTIME}" -lt 100 ]] && UDPHC_LOG_LINES_REALTIME="400"
+[[ -z "${UDPHC_LOG_LINES_CHECKER}" || "${UDPHC_LOG_LINES_CHECKER}" -lt 1000 ]] && UDPHC_LOG_LINES_CHECKER="6000"
 [[ -z "${xray_recent_window_min}" || "${xray_recent_window_min}" -lt 5 ]] && xray_recent_window_min="30"
 [[ -z "${xray_active_window_sec}" || "${xray_active_window_sec}" -lt 30 ]] && xray_active_window_sec="120"
 [[ -z "${xray_min_hits_per_ip}" || "${xray_min_hits_per_ip}" -lt 1 ]] && xray_min_hits_per_ip="2"
@@ -5470,14 +5517,21 @@ switch_udp_to_udpcustom() {
 }
 
 restart_active_udp_backend() {
-  local udpcustom zstat ustat
+  local udpcustom zstat ustat preferred
   udpcustom="$(detect_udpcustom_service)"
+  preferred="$(echo "${ACTIVE_UDP_BACKEND:-zivpn}" | tr '[:upper:]' '[:lower:]')"
   zstat="$(systemctl is-active "${ZIVPN_SERVICE}" 2>/dev/null || true)"
   ustat="$(systemctl is-active "${udpcustom}" 2>/dev/null || true)"
   if [[ "${zstat}" == "active" && "${ustat}" == "active" ]]; then
-    systemctl disable --now "${udpcustom}" >/dev/null 2>&1 || true
-    systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
-    echo "Keduanya aktif, dipaksa single backend: ZIVPN aktif, UDPHC dimatikan."
+    if [[ "${preferred}" == "udpcustom" || "${preferred}" == "udp-custom" || "${preferred}" == "udphc" ]]; then
+      systemctl disable --now "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+      systemctl restart "${udpcustom}" >/dev/null 2>&1 || true
+      echo "Keduanya aktif, dipaksa single backend: UDPHC aktif, ZIVPN dimatikan."
+    else
+      systemctl disable --now "${udpcustom}" >/dev/null 2>&1 || true
+      systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+      echo "Keduanya aktif, dipaksa single backend: ZIVPN aktif, UDPHC dimatikan."
+    fi
     return
   fi
   if [[ "${zstat}" == "active" ]]; then
@@ -5490,7 +5544,15 @@ restart_active_udp_backend() {
     echo "Restart backend aktif: UDPHC."
     return
   fi
-  echo "Tidak ada backend UDP yang aktif."
+  if [[ "${preferred}" == "udpcustom" || "${preferred}" == "udp-custom" || "${preferred}" == "udphc" ]]; then
+    systemctl enable "${udpcustom}" >/dev/null 2>&1 || true
+    systemctl restart "${udpcustom}" >/dev/null 2>&1 || true
+    echo "Tidak ada backend aktif, menyalakan backend preferensi: UDPHC."
+  else
+    systemctl enable "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+    systemctl restart "${ZIVPN_SERVICE}" >/dev/null 2>&1 || true
+    echo "Tidak ada backend aktif, menyalakan backend preferensi: ZIVPN."
+  fi
 }
 
 restart_all_services() {
