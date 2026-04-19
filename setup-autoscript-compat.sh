@@ -6644,12 +6644,13 @@ draw_dashboard() {
   local YELLOW='\033[0;33m'
   local BLUE='\033[0;34m'
   local CYAN='\033[0;36m'
+  local MAGENTA='\033[0;35m'
   local BOLD='\033[1m'
   local NC='\033[0m'
   local CHECK="${YELLOW}CHECK${NC}"
   local GOOD="${GREEN}GOOD${NC}"
 
-  # Data collection
+  # Data collection (sama seperti kode asli)
   os_name="$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Unknown}")"
   ram_mb="$(free -m 2>/dev/null | awk '/^Mem:/ {print $3 "M"}')"
   swap_mb="$(free -m 2>/dev/null | awk '/^Swap:/ {print $3 "M"}')"
@@ -6690,45 +6691,78 @@ draw_dashboard() {
     cap_mode="MANUAL"
   fi
 
-  # Helper for separator (without right border)
-  hr() {
-    printf "├─────────────────────────────────────────────────\n"
+  # --- Helper untuk cetak border dan baris dengan lebar tetap (60 kolom) ---
+  local WIDTH=60
+  local BORDER_LEFT='│'
+  local BORDER_RIGHT='│'
+
+  # Cetak garis horizontal dengan karakter kiri, tengah, kanan
+  print_hr() {
+    local mid_char="${1:-─}"
+    printf "${mid_char}%$((WIDTH-2))s${mid_char}\n" | tr ' ' "${mid_char}"
   }
 
-  # Dashboard - no closing pipe on the right
-  printf "┌─────────────────────────────────────────────────\n"
-  printf "│${BOLD}             SC 1FORCR NEXUS DASHBOARD            ${NC}\n"
-  printf "├─────────────────────────────────────────────────\n"
+  # Cetak baris teks dengan padding kanan otomatis
+  print_row() {
+    local text="$1"
+    local text_len=$(echo -e "$text" | sed -E 's/\x1b\[[0-9;]*m//g' | wc -c)
+    local padding=$((WIDTH - 2 - text_len))
+    printf "${BORDER_LEFT}${text}%${padding}s${BORDER_RIGHT}\n"
+  }
 
-  # System & Network
-  printf "│ ${CYAN}${BOLD}■ SYSTEM & NETWORK${NC}${BOLD}${NC}                                  \n"
-  printf "│   OS                     : ${os_name}${NC}                              \n"
-  printf "│   RAM                    : ${ram_mb:-"-"}  │ SWAP : ${swap_mb:-"-"}${NC}                         \n"
-  printf "│   UPTIME                 : ${uptime_h}h ${uptime_m}m${NC}                                           \n"
-  printf "│   Spesifikasi server anda: ${cap_ram_gb} GB RAM / ${cap_cores} vCPU${NC}                    \n"
-  printf "│   Auto tuning SC         : ${cap_mode} (tier ${cap_tier})${NC}                               \n"
-  printf "│   Estimasi akun          : sekitar ${cap_est} user${NC}                              \n"
-  hr
-  printf "│ ${CYAN}${BOLD}■ LOCATION & ISP${NC}${BOLD}${NC}                                    \n"
-  printf "│   IP      : ${ip}${NC}                                                \n"
-  printf "│   CITY    : ${city}${NC}                                              \n"
-  printf "│   ISP     : ${isp}${NC}                                              \n"
-  printf "│   DOMAIN  : ${DOMAIN}${NC}                                           \n"
-  hr
+  # Cetak baris dengan dua kolom (label dan value) rata kiri dan kanan
+  print_pair() {
+    local label="$1"
+    local value="$2"
+    local label_len=$(echo -e "$label" | sed -E 's/\x1b\[[0-9;]*m//g' | wc -c)
+    local value_len=$(echo -e "$value" | sed -E 's/\x1b\[[0-9;]*m//g' | wc -c)
+    local total_len=$((label_len + value_len))
+    local padding=$((WIDTH - 2 - total_len))
+    printf "${BORDER_LEFT}${label}%${padding}s${value}${BORDER_RIGHT}\n"
+  }
 
-  # Traffic Stats
-  printf "│ ${CYAN}${BOLD}■ TRAFFIC STATS${NC}${BOLD}${NC}                                     \n"
-  printf "│   MONTH   : ${VNSTAT_MONTH_TOTAL}     [${VNSTAT_MONTH_NAME}]${NC}                 \n"
-  printf "│   RX      : ${VNSTAT_MONTH_RX}${NC}                                              \n"
-  printf "│   TX      : ${VNSTAT_MONTH_TX}${NC}                                              \n"
-  printf "│   DAY     : ${VNSTAT_DAY_TOTAL}     [${VNSTAT_DAY_NAME}]${NC}                    \n"
-  printf "│   RX      : ${VNSTAT_DAY_RX}${NC}                                               \n"
-  printf "│   TX      : ${VNSTAT_DAY_TX}${NC}                                               \n"
-  printf "│   CURRENT : ${VNSTAT_RATE}${NC}                                              \n"
-  hr
+  # Cetak baris dengan dua kolom yang dipisah "│" di tengah (seperti tabel)
+  print_split() {
+    local left="$1"
+    local right="$2"
+    local left_len=$(echo -e "$left" | sed -E 's/\x1b\[[0-9;]*m//g' | wc -c)
+    local right_len=$(echo -e "$right" | sed -E 's/\x1b\[[0-9;]*m//g' | wc -c)
+    local mid_space=$((WIDTH - 2 - left_len - right_len - 3))  # 3 = " │ "
+    printf "${BORDER_LEFT}${left}%${mid_space}s │ ${right}${BORDER_RIGHT}\n"
+  }
 
-  # Services Status (includes zivpn and udphc)
-  printf "│ ${CYAN}${BOLD}■ SERVICES STATUS${NC}${BOLD}${NC}                                   \n"
+  # --- Mulai mencetak dashboard ---
+  print_hr '┌'
+  print_row "${BOLD}${CYAN}            SC 1FORCR NEXUS DASHBOARD            ${NC}"
+  print_hr '├'
+
+  print_row "${CYAN}${BOLD}■ SYSTEM & NETWORK${NC}"
+  print_pair "  OS                     : " "${os_name}"
+  print_pair "  RAM                    : ${ram_mb:-'-'}  │ SWAP : ${swap_mb:-'-'}"
+  print_pair "  UPTIME                 : ${uptime_h}h ${uptime_m}m"
+  print_pair "  Spesifikasi server anda: ${cap_ram_gb} GB RAM / ${cap_cores} vCPU"
+  print_pair "  Auto tuning SC         : ${cap_mode} (tier ${cap_tier})"
+  print_pair "  Estimasi akun          : sekitar ${cap_est} user"
+  print_hr '├'
+
+  print_row "${CYAN}${BOLD}■ LOCATION & ISP${NC}"
+  print_pair "  IP      : " "${ip}"
+  print_pair "  CITY    : " "${city}"
+  print_pair "  ISP     : " "${isp}"
+  print_pair "  DOMAIN  : " "${DOMAIN}"
+  print_hr '├'
+
+  print_row "${CYAN}${BOLD}■ TRAFFIC STATS${NC}"
+  print_pair "  MONTH   : ${VNSTAT_MONTH_TOTAL}     [${VNSTAT_MONTH_NAME}]"
+  print_pair "  RX      : ${VNSTAT_MONTH_RX}"
+  print_pair "  TX      : ${VNSTAT_MONTH_TX}"
+  print_pair "  DAY     : ${VNSTAT_DAY_TOTAL}     [${VNSTAT_DAY_NAME}]"
+  print_pair "  RX      : ${VNSTAT_DAY_RX}"
+  print_pair "  TX      : ${VNSTAT_DAY_TX}"
+  print_pair "  CURRENT : ${VNSTAT_RATE}"
+  print_hr '├'
+
+  print_row "${CYAN}${BOLD}■ SERVICES STATUS${NC}"
   local xray_color="${GREEN}ON${NC}"; [[ "$xray_on" != "ON" ]] && xray_color="${RED}OFF${NC}"
   local ws_color="${GREEN}ON${NC}";   [[ "$ws_on" != "ON" ]] && ws_color="${RED}OFF${NC}"
   local lb_color="${GREEN}ON${NC}";   [[ "$loadblc_on" != "ON" ]] && lb_color="${RED}OFF${NC}"
@@ -6736,27 +6770,28 @@ draw_dashboard() {
   local udphc_color="${GREEN}ON${NC}"; [[ "$udphc_on" != "ON" ]] && udphc_color="${RED}OFF${NC}"
   local ssh_color="${GREEN}ON${NC}";   [[ "$ssh_on" != "ON" ]] && ssh_color="${RED}OFF${NC}"
 
-  printf "│   XRAY    : ${xray_color}   │ SSH-WS : ${ws_color}    │ LOADBLC : ${lb_color}   \n"
-  printf "│   ZIVPN   : ${zivpn_color}   │ UDPHC  : ${udphc_color}   │ SSH     : ${ssh_color}   \n"
-  printf "│   HEALTH  : ${health_display}${NC} │ \n"
-  hr
+  print_split "  XRAY    : ${xray_color}" "SSH-WS : ${ws_color}"
+  print_split "  ZIVPN   : ${zivpn_color}" "UDPHC  : ${udphc_color}"
+  print_split "  SSH     : ${ssh_color}"   "LOADBLC: ${lb_color}"
+  print_pair "  HEALTH  : ${health_display}"
+  print_hr '├'
 
-  # Account Summary
-  printf "│ ${CYAN}${BOLD}■ ACCOUNT SUMMARY${NC}${BOLD}${NC}                                   \n"
-  printf "│   SSH/OpenVPN : %-4s     │ VMESS : %-4s     \n" "${c_ssh}" "${c_vmess}"
-  printf "│   VLESS       : %-4s     │ TROJAN: %-4s     \n" "${c_vless}" "${c_trojan}"
-  hr
+  print_row "${CYAN}${BOLD}■ ACCOUNT SUMMARY${NC}"
+  print_split "  SSH/OpenVPN : ${c_ssh}" "VMESS : ${c_vmess}"
+  print_split "  VLESS       : ${c_vless}" "TROJAN: ${c_trojan}"
+  print_hr '├'
 
-  # Version & Client
-  printf "│ ${BLUE}${BOLD}■ VERSION & CLIENT${NC}${BOLD}${NC}                                  \n"
-  printf "│   Version     : ${SCRIPT_VERSION:-unknown}${NC}                                 \n"
-  printf "│   Distribusi  : Community / Open Source${NC}                                \n"
-  printf "│   Client Name : ${ip}${NC}                                                \n"
-  printf "│   Expiry In   : Unlimited${NC}                                              \n"
-  printf "└─────────────────────────────────────────────────\n"
-  printf " ─────────────────────────────────────────────────\n"
+  print_row "${BLUE}${BOLD}■ VERSION & CLIENT${NC}"
+  print_pair "  Version     : ${SCRIPT_VERSION:-unknown}"
+  print_pair "  Distribusi  : Community / Open Source"
+  print_pair "  Client Name : ${ip}"
+  print_pair "  Expiry In   : Unlimited"
+  print_hr '└'
+
+  # Footer dengan perintah menu
+  printf " ────────────────────────────────────────────────────────────\n"
   printf "           ${BOLD}to access use 'menu' command${NC}\n"
-  printf " ─────────────────────────────────────────────────\n"
+  printf " ────────────────────────────────────────────────────────────\n"
 }
 show_combined_online() {
   local mode tmp_count tmp_status tmp_ssh_pid_ip tmp_pid_user tmp_ssh_pair tmp_ssh_count tmp_ssh_proc_count tmp_ssh_count_merged tmp_ssh_count_logs tmp_udp_pair tmp_udp_count tmp_db_ports tmp_db_recent tmp_db_recent_loose udpcustom udp_ttl dropbear_main_port dropbear_alt_port hc_auth_lookback_h
