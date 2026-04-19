@@ -555,12 +555,12 @@ apply_system_optimizations() {
 
   if ! swapon --show | grep -q .; then
     if [[ ! -f /swapfile ]]; then
-      fallocate -l 1G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=1024
-      chmod 600 /swapfile
-      mkswap /swapfile >/dev/null
+      fallocate -l 1G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=1024 || true
+      chmod 600 /swapfile >/dev/null 2>&1 || true
+      mkswap /swapfile >/dev/null 2>&1 || true
     fi
     swapon /swapfile || true
-    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab || true
   fi
 
   cat > /etc/sysctl.d/99-sc-1forcr.conf <<'EOF'
