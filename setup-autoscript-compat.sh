@@ -4924,12 +4924,13 @@ Interval : ${ONLINE_NOTIFY_INTERVAL_HOURS} jam
 Window   : ${ONLINE_NOTIFY_ACTIVE_WINDOW_SECONDS} detik (XRAY last seen)
 
 RINGKASAN AKUN AKTIF 
-- SSH/ZIVPN : ${acct_ssh}
+- SSH/UDPHC : ${acct_ssh}
 - VMESS     : ${acct_vmess}
 - VLESS     : ${acct_vless}
 - TROJAN    : ${acct_trojan}
 
 ONLINE TERDETEKSI
+  ==============================================
 - SSH       : ${ssh_cnt}
   User      : $(short_list "${ssh_users}" 10)
   ==============================================
@@ -4938,7 +4939,8 @@ ONLINE TERDETEKSI
   ==============================================
 - UDPHC     : ${udphc_cnt}
   User      : $(short_list "${udphc_users}" 10)
-
+  ==============================================
+"
 
 send_tg "${msg}"
 EOF
