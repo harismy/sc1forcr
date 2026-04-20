@@ -15,6 +15,10 @@ set -euo pipefail
 #   DOMAIN=example.com
 #   EMAIL=admin@example.com
 #   API_AUTH_TOKEN=token-rahasia
+#   LICENSE_ENFORCE=1                            (opsional, 1=wajib validasi lisensi sebelum install)
+#   LICENSE_API_URL=https://license.example.com/api/v1/activate
+#   LICENSE_API_TOKEN=server-secret-token
+#   LICENSE_KEY=LSC-XXXX-XXXX-XXXX
 #   UPDATE_SCRIPT_URL=https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh
 #   ZIVPN_BIN_URL=https://.../zivpn-linux-amd64   (opsional)
 #   ZIVPN_RELEASE_TAG=udp-zivpn_1.4.9             (opsional, default dari repo zahidbd2/udp-zivpn)
@@ -59,6 +63,10 @@ set -euo pipefail
 DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-}"
 API_AUTH_TOKEN="${API_AUTH_TOKEN:-}"
+LICENSE_ENFORCE="${LICENSE_ENFORCE:-1}"
+LICENSE_API_URL="${LICENSE_API_URL:-}"
+LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}"
+LICENSE_KEY="${LICENSE_KEY:-}"
 SCRIPT_VERSION="${SCRIPT_VERSION:-V.1FSC}"
 UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL:-https://raw.githubusercontent.com/harismy/sc1forcr/main/setup-autoscript-compat.sh}"
 DB_PATH="${DB_PATH:-/usr/sbin/potatonc/potato.db}"
@@ -131,6 +139,129 @@ fi
 
 log() {
   echo "[autoscript-compat] $*"
+}
+
+detect_public_ipv4() {
+  local ip
+  ip=""
+  if command -v curl >/dev/null 2>&1; then
+    ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+    [[ -z "${ip}" ]] && ip="$(curl -4fsS --connect-timeout 5 --max-time 10 https://ifconfig.me/ip 2>/dev/null || true)"
+  elif command -v wget >/dev/null 2>&1; then
+    ip="$(wget -4qO- --timeout=10 https://api.ipify.org 2>/dev/null || true)"
+    [[ -z "${ip}" ]] && ip="$(wget -4qO- --timeout=10 https://ifconfig.me/ip 2>/dev/null || true)"
+  fi
+  ip="$(echo "${ip}" | tr -d '[:space:]')"
+  if [[ "${ip}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "${ip}"
+    return 0
+  fi
+  echo ""
+  return 0
+}
+
+license_check_enabled() {
+  local raw
+  raw="$(echo "${LICENSE_ENFORCE:-1}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+  case "${raw}" in
+    0|false|no|off) echo "0" ;;
+    *) echo "1" ;;
+  esac
+}
+
+enforce_install_license() {
+  local enabled vps_ip machine_id resp ok msg status expires bound_ip key_hash
+  enabled="$(license_check_enabled)"
+  if [[ "${enabled}" != "1" ]]; then
+    log "License gate nonaktif (LICENSE_ENFORCE=0)."
+    return 0
+  fi
+
+  if [[ -z "${LICENSE_API_URL}" ]]; then
+    echo "Install ditolak: LICENSE_API_URL belum diisi."
+    echo "Isi env LICENSE_API_URL dan LICENSE_API_TOKEN."
+    exit 1
+  fi
+  if [[ -z "${LICENSE_API_TOKEN}" ]]; then
+    echo "Install ditolak: LICENSE_API_TOKEN belum diisi."
+    exit 1
+  fi
+  if [[ -z "${LICENSE_KEY}" ]]; then
+    read -r -p "Masukkan LICENSE_KEY: " LICENSE_KEY
+  fi
+  if [[ -z "${LICENSE_KEY}" ]]; then
+    echo "Install ditolak: LICENSE_KEY wajib diisi."
+    exit 1
+  fi
+
+  vps_ip="$(detect_public_ipv4)"
+  if [[ -z "${vps_ip}" ]]; then
+    echo "Install ditolak: gagal deteksi IP publik VPS."
+    exit 1
+  fi
+  machine_id="$(cat /etc/machine-id 2>/dev/null | tr -d '[:space:]' || true)"
+
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "Install ditolak: butuh curl untuk validasi lisensi."
+    exit 1
+  fi
+
+  log "Validasi lisensi ke server..."
+  resp="$(
+    curl -fsS --retry 2 --retry-delay 1 --connect-timeout 8 --max-time 20 \
+      -X POST "${LICENSE_API_URL}" \
+      -H "Authorization: Bearer ${LICENSE_API_TOKEN}" \
+      -H "Accept: application/json" \
+      --data-urlencode "license_key=${LICENSE_KEY}" \
+      --data-urlencode "ip=${vps_ip}" \
+      --data-urlencode "domain=${DOMAIN}" \
+      --data-urlencode "machine_id=${machine_id}" \
+      --data-urlencode "script_version=${SCRIPT_VERSION}" \
+      2>/dev/null || true
+  )"
+  if [[ -z "${resp}" ]]; then
+    echo "Install ditolak: server lisensi tidak merespon."
+    exit 1
+  fi
+
+  ok="0"
+  msg="License rejected"
+  status="-"
+  expires="-"
+  bound_ip="${vps_ip}"
+  if command -v jq >/dev/null 2>&1; then
+    ok="$(echo "${resp}" | jq -r 'if (.ok == true or .allowed == true or ((.status // "")|ascii_downcase) == "active") then "1" else "0" end' 2>/dev/null || echo "0")"
+    msg="$(echo "${resp}" | jq -r '.message // .msg // .reason // "License rejected"' 2>/dev/null || echo "License rejected")"
+    status="$(echo "${resp}" | jq -r '.status // "-"' 2>/dev/null || echo "-")"
+    expires="$(echo "${resp}" | jq -r '.expires_at // .expired_at // .expired // "-"' 2>/dev/null || echo "-")"
+    bound_ip="$(echo "${resp}" | jq -r '.bound_ip // .ip // empty' 2>/dev/null || echo "${vps_ip}")"
+    [[ -z "${bound_ip}" ]] && bound_ip="${vps_ip}"
+  else
+    if echo "${resp}" | grep -qiE '"ok"[[:space:]]*:[[:space:]]*true|"allowed"[[:space:]]*:[[:space:]]*true|"status"[[:space:]]*:[[:space:]]*"active"'; then
+      ok="1"
+    fi
+    if echo "${resp}" | grep -qiE '"message"[[:space:]]*:'; then
+      msg="$(echo "${resp}" | sed -nE 's/.*"message"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' | head -n1)"
+      [[ -z "${msg}" ]] && msg="License rejected"
+    fi
+  fi
+
+  if [[ "${ok}" != "1" ]]; then
+    echo "Install ditolak: ${msg}"
+    exit 1
+  fi
+
+  key_hash="$(printf '%s' "${LICENSE_KEY}" | sha256sum | awk '{print $1}')"
+  cat > /etc/sc-1forcr-license <<EOF
+LICENSE_STATUS=${status}
+LICENSE_MESSAGE=${msg}
+LICENSE_BOUND_IP=${bound_ip}
+LICENSE_EXPIRES_AT=${expires}
+LICENSE_KEY_HASH=${key_hash}
+LICENSE_CHECK_AT=$(date '+%F %T')
+EOF
+  chmod 600 /etc/sc-1forcr-license >/dev/null 2>&1 || true
+  log "Lisensi valid untuk IP ${bound_ip}. Expired: ${expires}"
 }
 
 normalize_bool_01() {
@@ -1406,7 +1537,7 @@ function canValidateXrayConfig(tmpPath) {
   }
   return false;
 }
-function writeXrayConfigAndReload(cfg) {
+function writeXrayConfigAndReload(cfg, forceRestart = false) {
   const cfgDir = '/usr/local/etc/xray';
   const cfgPath = `${cfgDir}/config.json`;
   const tmpPath = `${cfgPath}.tmp`;
@@ -1422,6 +1553,21 @@ function writeXrayConfigAndReload(cfg) {
   }
 
   fs.renameSync(tmpPath, cfgPath);
+
+  // Kompatibilitas: beberapa image/service memakai /etc/xray/config.json.
+  // Mirror config ke path tersebut jika direktori ada.
+  try {
+    const legacyDir = '/etc/xray';
+    const legacyPath = `${legacyDir}/config.json`;
+    if (fs.existsSync(legacyDir)) {
+      fs.writeFileSync(legacyPath, JSON.stringify(cfg, null, 2));
+    }
+  } catch (_) {}
+
+  if (forceRestart) {
+    if (safeExec('systemctl', ['restart', 'xray'])) return true;
+    if (safeExec('service', ['xray', 'restart'])) return true;
+  }
   return reloadXrayServiceSafe();
 }
 function run(sql, params = []) {
@@ -2136,7 +2282,37 @@ async function delXray(table, username) {
 }
 async function setStatusXray(table, username, status) {
   await run(`UPDATE ${table} SET status=? WHERE LOWER(username)=LOWER(?)`, [status, username]);
-  await renderAndReloadXray();
+  // Lock/unlock manual harus memutus sesi lama juga.
+  // Render ulang config lalu paksa restart xray agar sesi lama benar-benar drop.
+  const vmessRows = await all("SELECT username, uuid FROM account_vmesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
+  const vlessRows = await all("SELECT username, uuid FROM account_vlesses WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
+  const trojanRows = await all("SELECT username, password FROM account_trojans WHERE UPPER(TRIM(COALESCE(status,'')))='AKTIF'");
+  const cfg = {
+    log: {
+      access: '/var/log/xray/access.log',
+      error: '/var/log/xray/error.log',
+      loglevel: 'warning'
+    },
+    inbounds: [
+      {
+        port: 10001, listen: '127.0.0.1', protocol: 'vmess',
+        settings: { clients: vmessRows.map((r) => ({ id: String(r.uuid || ''), alterId: 0, email: String(r.username || '') })) },
+        streamSettings: { network: 'ws', wsSettings: { path: '/vmess' } }
+      },
+      {
+        port: 10002, listen: '127.0.0.1', protocol: 'vless',
+        settings: { clients: vlessRows.map((r) => ({ id: String(r.uuid || ''), email: String(r.username || '') })), decryption: 'none' },
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/vless' } }
+      },
+      {
+        port: 10003, listen: '127.0.0.1', protocol: 'trojan',
+        settings: { clients: trojanRows.map((r) => ({ password: String(r.password || ''), email: String(r.username || '') })) },
+        streamSettings: { network: 'ws', security: 'none', wsSettings: { path: '/trojan' } }
+      }
+    ],
+    outbounds: [{ protocol: 'freedom', tag: 'direct' }]
+  };
+  writeXrayConfigAndReload(cfg, true);
   return { username };
 }
 
@@ -4996,6 +5172,10 @@ DOMAIN=${DOMAIN}
 EMAIL=${EMAIL}
 API_PORT=${API_PORT}
 AUTH_TOKEN=${API_AUTH_TOKEN}
+LICENSE_ENFORCE=${LICENSE_ENFORCE}
+LICENSE_API_URL=${LICENSE_API_URL}
+LICENSE_API_TOKEN=${LICENSE_API_TOKEN}
+LICENSE_KEY=${LICENSE_KEY}
 UPDATE_SCRIPT_URL=${UPDATE_SCRIPT_URL}
 DB_PATH=${DB_PATH}
 ZIVPN_SERVICE=${ZIVPN_SERVICE_NAME}
@@ -8012,6 +8192,10 @@ Time     : $(date '+%F %T')"
   if ! DOMAIN="${DOMAIN}" \
     EMAIL="${EMAIL:-}" \
     API_AUTH_TOKEN="${AUTH_TOKEN}" \
+    LICENSE_ENFORCE="${LICENSE_ENFORCE:-1}" \
+    LICENSE_API_URL="${LICENSE_API_URL:-}" \
+    LICENSE_API_TOKEN="${LICENSE_API_TOKEN:-}" \
+    LICENSE_KEY="${LICENSE_KEY:-}" \
     UPDATE_SCRIPT_URL="${UPDATE_SCRIPT_URL}" \
     DB_PATH="${DB_PATH}" \
     APP_DIR="/opt/sc-1forcr" \
@@ -8603,6 +8787,7 @@ open_menu_after_install() {
 main() {
   show_install_banner
   show_install_progress 0 "Tunggu dulu mas, proses baru mulai..."
+  enforce_install_license
 
   check_supported_os
   install_base_packages
@@ -8661,8 +8846,8 @@ curl -s -X POST "https://${DOMAIN}/vps/sshvpn" \\
   -d '{"username":"test123","password":"test123","expired":3,"limitip":"2","kuota":"0"}'
 
 Catatan:
-- SC 1FORCR Nexus ini bersifat gratis, bebas dipakai, dan open source.
-- Tidak ada lisensi komersial wajib; silakan modifikasi sesuai kebutuhan.
+- Installer sekarang memakai gate lisensi berbasis IP VPS.
+- Wajib registrasi dan pembayaran lisensi terlebih dahulu sebelum install.
 - Endpoint /vps/* sudah kompatibel pola bot 1FORCR (create/trial/renew/delete/lock/unlock).
 - WS paths aktif: /ssh-ws, /ws, /vmess, /vless, /trojan (port 80 & 443)
 - Dropbear aktif di port ${DROPBEAR_PORT} dan ${DROPBEAR_ALT_PORT}; ssh-ws bridge default ke ${DROPBEAR_PORT}
